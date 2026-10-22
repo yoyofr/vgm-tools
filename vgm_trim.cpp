@@ -10,6 +10,7 @@
 //   vgm_trim in.vgm --info
 //   vgm_trim in.vgm --activity
 #include <algorithm>
+#include <memory>
 #include <zlib.h>
 #include <array>
 #include <cmath>
@@ -1132,8 +1133,11 @@ struct NoteKey
 };
 struct NoteEvent { i64 t; NoteKey k; };
 
+struct Wav;
+static double audio_corr(const Wav& w, i64 a, i64 b, i64 n, i64 max_lag = 2000);
+
 static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool bounded, i64& r_start, i64& r_loop, i64& r_end,
-                      int window = 12, i64 pre = 2205)
+                      const Wav* wav = nullptr, int window = 12, i64 pre = 2205)
 {
 	const u8* d = vgm.data.data();
 	ES55xxState st(vgm.is_es5506);
@@ -1275,39 +1279,82 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 		printf("no repetition covers the song (best %.0f%%): repeated phrases only, no loop\n", 100 * best_cover);
 		return false;
 	}
-	// the song loop is the best covered period; a multiple of it covers (almost) as well but has
-	// fewer matching windows, a period shifted by one phrase covers a little less
-	const Cand* chosen = nullptr;
-	for (const Cand& c : cands)
-	{
-		if (c.cover < best_cover - 0.02) continue;
-		if (!chosen || c.windows > chosen->windows || (c.windows == chosen->windows && c.per < chosen->per)) chosen = &c;
-	}
-	i64 period = chosen->per;
-	std::vector<Pair> sel(chosen->windows);
-	printf("period %s (%.4f s): %.0f%% of the note-ons recur at that offset\n", fmt_pos(period).c_str(), (double)period / SAMPLE_RATE, 100 * chosen->cover);
-	size_t first = SIZE_MAX;
-	i64 dummy;
-	for (size_t i = 0; i < n; i++)
-	{
-		if (events[i].t < search_from) continue;
-		int hits = 0;
-		for (size_t m = i; m < std::min(i + 40, n); m++)
-			if (recurrence_at(m, period, dummy)) hits++;
-		if (hits >= 32)
+	// preference from the note-ons: the best covered period, then more matching windows, then
+	// shorter (a multiple of the loop covers as well with fewer windows, a period shifted by one
+	// phrase covers a little less); the rest by coverage
+	std::vector<const Cand*> order;
+	for (const Cand& c : cands) order.push_back(&c);
+	std::stable_sort(order.begin(), order.end(), [&](const Cand* a, const Cand* b) {
+		bool ga = a->cover >= best_cover - 0.02, gb = b->cover >= best_cover - 0.02;
+		if (ga != gb) return ga;
+		if (ga) return a->windows != b->windows ? a->windows > b->windows : a->per < b->per;
+		return a->cover > b->cover;
+	});
+	// first repeated note-on and its recurrence for a period
+	auto locate = [&](i64 period, i64& t1, i64& t2) -> bool {
+		size_t first = SIZE_MAX;
+		i64 dummy;
+		for (size_t i = 0; i < n; i++)
 		{
-			for (size_t m = i; m < n; m++)
-				if (recurrence_at(m, period, dummy)) { first = m; break; }
-			break;
+			if (events[i].t < search_from) continue;
+			int hits = 0;
+			for (size_t m = i; m < std::min(i + 40, n); m++)
+				if (recurrence_at(m, period, dummy)) hits++;
+			if (hits >= 32)
+			{
+				for (size_t m = i; m < n; m++)
+					if (recurrence_at(m, period, dummy)) { first = m; break; }
+				break;
+			}
+		}
+		if (first == SIZE_MAX) return false;
+		t1 = events[first].t;
+		recurrence_at(first, period, t2);
+		return true;
+	};
+	const Cand* chosen = nullptr;
+	i64 t1 = 0, t2 = 0;
+	if (wav)
+	{
+		// the rendered audio vetoes: the loop body must sound alike the second time (note-ons alone
+		// miss melodies played by pitch or volume changes on sustained voices, and a short capture
+		// may repeat only a riff). The waveform correlation is too sensitive to the effect DSP's
+		// modulation to rank candidates, so the note-on preference order is kept among the survivors
+		struct Scored { const Cand* c; i64 t1, t2; double corr; };
+		std::vector<Scored> scored;
+		std::string report;
+		for (const Cand* c : order)
+		{
+			i64 a, b;
+			if (!locate(c->per, a, b)) continue;
+			i64 len = std::min<i64>(std::min<i64>(b - a, search_to - b), 10 * SAMPLE_RATE);
+			if (len < SAMPLE_RATE) continue;   // the capture does not reach far enough into the second pass
+			double corr = audio_corr(*wav, a, b, len);
+			scored.push_back({c, a, b, corr});
+			char buf[48];
+			snprintf(buf, sizeof(buf), "%s%.1f s:%.2f", report.empty() ? "" : ", ", (double)c->per / SAMPLE_RATE, corr);
+			report += buf;
+		}
+		printf("audio correlation of the second pass per candidate: %s\n", report.c_str());
+		for (const Scored& sc : scored)
+			if (sc.corr >= 0.2) { chosen = sc.c; t1 = sc.t1; t2 = sc.t2; break; }
+		if (!chosen)
+		{
+			printf("no candidate sounds the same on its second pass (correlation < 0.2): no loop (capture too short for a full repetition?)\n");
+			return false;
 		}
 	}
-	if (first == SIZE_MAX) return false;
-	i64 t1 = events[first].t, t2;
-	recurrence_at(first, period, t2);
+	else
+	{
+		for (const Cand* c : order)
+			if (locate(c->per, t1, t2)) { chosen = c; break; }
+	}
+	if (!chosen) return false;
+	printf("period %s (%.4f s): %.0f%% of the note-ons recur at that offset\n", fmt_pos(chosen->per).c_str(), (double)chosen->per / SAMPLE_RATE, 100 * chosen->cover);
 	i64 t0 = t1;   // first note-on of the range: the intro before the loop body is kept
 	for (size_t i = 0; i < n; i++) if (events[i].t >= search_from) { t0 = events[i].t; break; }
 	printf("loop found: first note-on at %s, first repeated note-on at %s, recurs at %s, period %s (%.4f s), %zu matching windows\n",
-	       fmt_pos(t0).c_str(), fmt_pos(t1).c_str(), fmt_pos(t2).c_str(), fmt_pos(t2 - t1).c_str(), (double)(t2 - t1) / SAMPLE_RATE, sel.size());
+	       fmt_pos(t0).c_str(), fmt_pos(t1).c_str(), fmt_pos(t2).c_str(), fmt_pos(t2 - t1).c_str(), (double)(t2 - t1) / SAMPLE_RATE, chosen->windows);
 	r_start = std::max<i64>(0, t0 - pre);
 	r_loop = std::max<i64>(0, t1 - pre);
 	r_end = t2 - pre;
@@ -1421,6 +1468,30 @@ static std::vector<std::pair<i64, i64>> find_segments(const Wav& w, int silence_
 		if (s.second - s.first >= min_length)
 			out.push_back({(i64)(s.first * scale), (i64)(s.second * scale)});
 	return out;
+}
+
+// normalized correlation (left channel) between n samples at a and at b, b searched within
+// +-max_lag (coarse step 40, then fine); positions in 44.1 kHz samples
+static double audio_corr(const Wav& w, i64 a, i64 b, i64 n, i64 max_lag)
+{
+	double scale = (double)w.sr / SAMPLE_RATE;
+	i64 A = (i64)(a * scale), B = (i64)(b * scale), N = (i64)(n * scale), L = (i64)(max_lag * scale);
+	auto corr_at = [&](i64 lag) {
+		double xy = 0, xx = 0, yy = 0;
+		for (i64 i = 0; i < N; i++)
+		{
+			i64 ia = A + i, ib = B + lag + i;
+			if (ia < 0 || ib < 0 || ia >= (i64)w.frames || ib >= (i64)w.frames) continue;
+			double x = w.smp[ia * w.nch], y = w.smp[ib * w.nch];
+			xy += x * y; xx += x * x; yy += y * y;
+		}
+		return (xx > 0 && yy > 0) ? xy / sqrt(xx * yy) : 0.0;
+	};
+	i64 best = 0; double bestc = -2;
+	for (i64 lag = -L; lag <= L; lag += 40) { double c = corr_at(lag); if (c > bestc) { bestc = c; best = lag; } }
+	i64 center = best;
+	for (i64 lag = center - 40; lag <= center + 40; lag++) { double c = corr_at(lag); if (c > bestc) { bestc = c; best = lag; } }
+	return bestc;
 }
 
 static void print_loudness(const Wav& w, double step = 2.0)
@@ -1563,6 +1634,7 @@ int main(int argc, char** argv)
 
 	struct Job { i64 start, loop, end; bool has_loop; std::string output; bool explicit_start; };
 	std::vector<Job> jobs;
+	std::unique_ptr<Wav> render;   // rendered capture (--split wav), also used to verify the loop candidates
 	if (f_auto)
 	{
 		std::vector<std::pair<i64, i64>> segs;
@@ -1587,7 +1659,8 @@ int main(int argc, char** argv)
 			remove(tmpl);
 			std::string cmd = "\"" + vgm2wav + "\" --fade 0 \"" + input + "\" \"" + wav + "\" >/dev/null 2>&1";
 			int rc = system(cmd.c_str());
-			Wav w;
+			render.reset(new Wav());
+			Wav& w = *render;
 			if (rc != 0 || !read_wav(wav, w)) { remove(wav.c_str()); die("vgm2wav failed (" + vgm2wav + ")"); }
 			remove(wav.c_str());
 			segs = find_segments(w, silence, parse_pos(gap), parse_pos(min_length));
@@ -1620,7 +1693,7 @@ int main(int argc, char** argv)
 		if (f_find_loop)
 		{
 			i64 s, l, e;
-			if (!find_loop(vgm, job.start, job.end, true, s, l, e))
+			if (!find_loop(vgm, job.start, job.end, true, s, l, e, render.get()))
 			{
 				printf("%s: no loop found, written without loop\n", job.output.c_str());
 			}
