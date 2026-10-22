@@ -1,0 +1,11 @@
+# build output
+/vgm_trim
+*.o
+*.dSYM/
+# captures and renders
+*.vgm
+*.vgz
+*.wav
+*.zip
+__pycache__/
+.DS_Store

@@ -1,0 +1,1525 @@
+// vgm_trim - trim / loop / split / de-duplicate / ROM-optimise VGM logs; ES5505/ES5506 (+ ES5510 ESP)
+// extension aware.
+// Output ending in .vgz is gzip-compressed (zlib).
+//
+// build: c++ -O2 -std=c++17 -o vgm_trim vgm_trim.cpp -lz
+//
+// usage:
+//   vgm_trim in.vgm out.vgz --start 18.2s --end 1:05.5 [--loop 30.0s] [--cmp] [--sro]
+//   vgm_trim in.vgm out.vgz --auto --split log --track all --gap 5s --find-loop --cmp --sro
+//   vgm_trim in.vgm --info
+//   vgm_trim in.vgm --activity
+#include <algorithm>
+#include <zlib.h>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <unistd.h>
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef int64_t i64;
+typedef std::vector<u8> Bytes;
+
+static const i64 SAMPLE_RATE = 44100;
+static const int PAGE_REG = 15;
+
+// ---------------------------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------------------------
+static u32 le32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
+static void put_le32(u8* p, u32 v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+static void push_le32(Bytes& b, u32 v) { b.push_back(v); b.push_back(v >> 8); b.push_back(v >> 16); b.push_back(v >> 24); }
+static void push_be16(Bytes& b, u32 v) { b.push_back((v >> 8) & 0xFF); b.push_back(v & 0xFF); }
+
+[[noreturn]] static void die(const std::string& msg)
+{
+	fprintf(stderr, "%s\n", msg.c_str());
+	exit(1);
+}
+
+static std::string fmt_pos(i64 samples)
+{
+	double s = (double)samples / SAMPLE_RATE;
+	char buf[64];
+	snprintf(buf, sizeof(buf), "%d:%06.3f (%lld)", (int)floor(s / 60), fmod(s, 60.0), (long long)samples);
+	return buf;
+}
+
+// samples, "12.5s" or "m:ss.sss" -> samples
+static i64 parse_pos(const std::string& txt)
+{
+	size_t colon = txt.find(':');
+	if (colon != std::string::npos)
+		return (i64)llround((atoi(txt.substr(0, colon).c_str()) * 60 + atof(txt.substr(colon + 1).c_str())) * SAMPLE_RATE);
+	if (!txt.empty() && txt.back() == 's')
+		return (i64)llround(atof(txt.substr(0, txt.size() - 1).c_str()) * SAMPLE_RATE);
+	return atoll(txt.c_str());
+}
+
+static int cmd_length(u8 op)
+{
+	if (op == 0x30 || op == 0x3F || op == 0x4F || op == 0x50) return 2;
+	if (op >= 0x31 && op <= 0x3E) return 2;
+	if (op >= 0x40 && op <= 0x4E) return 3;
+	if (op >= 0x51 && op <= 0x5F) return 3;
+	if (op == 0x61) return 3;
+	if (op == 0x62 || op == 0x63 || op == 0x66) return 1;
+	if (op == 0x64) return 4;
+	if (op == 0x67 || op == 0x68) return 0;
+	if (op >= 0x70 && op <= 0x8F) return 1;
+	if (op >= 0x90 && op <= 0x95) { static const int l[6] = {5, 5, 6, 11, 2, 5}; return l[op - 0x90]; }
+	if (op >= 0xA0 && op <= 0xBF) return 3;
+	if (op >= 0xC0 && op <= 0xDF) return 4;
+	if (op >= 0xE0) return 5;
+	return 1;
+}
+
+static i64 wait_of(const u8* d, u8 op)
+{
+	if (op == 0x61) return d[1] | (d[2] << 8);
+	if (op == 0x62) return 735;
+	if (op == 0x63) return 882;
+	if (op >= 0x70 && op <= 0x7F) return (op & 15) + 1;
+	if (op >= 0x80 && op <= 0x8F) return op & 15;
+	return 0;
+}
+
+static void wait_cmd(Bytes& out, i64 n)
+{
+	while (n > 0)
+	{
+		if (n <= 16) { out.push_back(0x70 + n - 1); n = 0; }
+		else if (n == 735) { out.push_back(0x62); n = 0; }
+		else if (n == 882) { out.push_back(0x63); n = 0; }
+		else { i64 c = std::min<i64>(n, 0xFFFF); out.push_back(0x61); out.push_back(c & 0xFF); out.push_back(c >> 8); n -= c; }
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// VGM file model
+// ---------------------------------------------------------------------------------------------
+struct Cmd { size_t p; u8 op; size_t len; i64 t; };
+
+struct VGMFile
+{
+	Bytes data;
+	u32 version = 0, eof = 0, gd3 = 0, total = 0, loop_ofs = 0, loop_samples = 0, data_ofs = 0;
+	u32 es5506_clock = 0;
+	bool is_es5506 = false;
+
+	void load(const std::string& path)
+	{
+		FILE* f = fopen(path.c_str(), "rb");
+		if (!f) die("cannot open " + path);
+		fseek(f, 0, SEEK_END);
+		long n = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		data.resize(n);
+		if (n && fread(data.data(), 1, n, f) != (size_t)n) die("read error");
+		fclose(f);
+		if (n >= 2 && data[0] == 0x1f && data[1] == 0x8b)   // .vgz: gzip-compressed, inflate it
+		{
+			Bytes raw;
+			gzFile g = gzopen(path.c_str(), "rb");
+			if (!g) die("cannot open " + path);
+			Bytes buf(1 << 20);
+			for (;;)
+			{
+				int got = gzread(g, buf.data(), (unsigned)buf.size());
+				if (got < 0) die("gzip read error: " + path);
+				if (got == 0) break;
+				raw.insert(raw.end(), buf.begin(), buf.begin() + got);
+			}
+			gzclose(g);
+			data.swap(raw);
+			n = (long)data.size();
+		}
+		if (n < 0x40 || memcmp(data.data(), "Vgm ", 4) != 0) die("not a VGM file");
+		version = le32(&data[0x08]);
+		eof = le32(&data[0x04]) + 0x04;
+		gd3 = le32(&data[0x14]);
+		if (gd3) gd3 += 0x14;
+		total = le32(&data[0x18]);
+		u32 loop = le32(&data[0x1C]);
+		loop_ofs = loop ? loop + 0x1C : 0;
+		loop_samples = le32(&data[0x20]);
+		data_ofs = (version >= 0x150) ? le32(&data[0x34]) + 0x34 : 0x40;
+		es5506_clock = (data_ofs > 0xD3) ? le32(&data[0xD0]) : 0;
+		is_es5506 = (es5506_clock & 0x80000000) != 0;
+	}
+
+	// iterate the commands: f(cmd) returns false to stop
+	template <typename F> void commands(F f) const
+	{
+		size_t p = data_ofs, end = gd3 ? gd3 : eof;
+		if (end > data.size()) end = data.size();
+		i64 t = 0;
+		const u8* d = data.data();
+		while (p < end)
+		{
+			u8 op = d[p];
+			size_t len;
+			if (op == 0x67) len = 7 + (p + 7 <= end ? (le32(&d[p + 3]) & 0x7FFFFFFF) : 0);
+			else if (op == 0x68) len = 12;
+			else len = cmd_length(op);
+			if (!f(Cmd{p, op, len, t})) return;
+			t += wait_of(&d[p], op);
+			if (op == 0x66) return;
+			p += len;
+		}
+	}
+};
+
+// ---------------------------------------------------------------------------------------------
+// register model
+// ---------------------------------------------------------------------------------------------
+enum Group { GL = 0, GH = 1, GT = 2 };
+static inline int page_group(int page) { return page < 0x20 ? GL : (page < 0x40 ? GH : GT); }
+
+static const u32 ES5505_MASK_LOW[16] = {0x0FFF, 0xFFFE, 0x1FFF, 0xFFE0, 0x1FFF, 0xFFE0, 0xFFF0, 0xFFF0,
+                                        0xFF00, 0xFF00, 0x1FFF, 0xFFFF, 0x0000, 0x001F, 0x0000, 0x007F};
+static const u32 ES5505_MASK_HIGH[16] = {0x0FFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0, 0, 0, 0, 0x001F, 0x0000, 0x007F};
+// ES5505 test page: only registers 8, 13, 15 are listed, others default to "all bits"
+static const u32 ES5505_MASK_TEST[16] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                                         0xF807, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x001F, 0xFFFFFFFF, 0x007F};
+static const u32 ES5506_MASK_LOW[16] = {0xFFFF, 0x1FFFF, 0xFFFF, 0xFF00, 0xFFFF, 0xFF00, 0x1FF, 0xFFFF,
+                                        0xFF01, 0xFFFF, 0xFF01, 0x1F, 0x1F, 0, 0, 0x7F};
+static const u32 ES5506_MASK_HIGH[16] = {0xFFFF, 0xFFFFF800, 0xFFFFFF80, 0xFFFFFFFF, 0x3FFFF, 0x3FFFF, 0x3FFFF,
+                                         0x3FFFF, 0x3FFFF, 0x3FFFF, 0x7F, 0x7F, 0x7F, 0, 0, 0x7F};
+static const u32 ES5506_MASK_TEST[16] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                                         0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7F};
+// the emitter's ES5505 masks default to 0xFFFF for registers not listed on the test page
+static const u32 ES5505_EMIT_TEST[16] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+                                         0xF807, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x001F, 0xFFFF, 0x007F};
+
+// side effects: bit reg of SIDE_EFFECT[chip][group]
+static const u16 SIDE_EFFECT_5506[3] = {(1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 9),
+                                        (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9), 0};
+static const u16 SIDE_EFFECT_5505[3] = {(1 << 0) | (1 << 10) | (1 << 11),
+                                        (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6), 0};
+
+struct RegWrite
+{
+	int page, reg;
+	u32 value;
+	bool changed;
+	int lane;       // ES5505 single byte lane (0 = high, 1 = low), -1 = full
+	bool has_prev;
+	u32 prev;
+};
+
+struct Range { i64 first, last; };
+
+struct ES55xxState
+{
+	bool is_es5506;
+	int page = 0;
+	// per-page registers (CR of page p and p+0x20 share (p & 0x1F, 0)); globals per group
+	u32 regs[0x80][16];
+	bool known[0x80][16];
+	u32 gregs[3][16];
+	bool gknown[3][16];
+	int reg_count = 0;
+	// ES5506 byte lane latch per (page, reg)
+	u8 latch[0x80][16][4];
+	u8 latch_mask[0x80][16];
+	std::map<int, u32> voice_bank, region_window, region_alias;
+	int irq_autoack = -1;
+	std::map<int, u32> gains;
+	std::vector<std::array<u8, 3>> esp_cmds;
+	u32 running = 0;    // bit per voice
+	std::vector<Range> rom_used[4];
+
+	explicit ES55xxState(bool es5506) : is_es5506(es5506)
+	{
+		memset(known, 0, sizeof(known));
+		memset(gknown, 0, sizeof(gknown));
+		memset(regs, 0, sizeof(regs));
+		memset(gregs, 0, sizeof(gregs));
+		memset(latch_mask, 0, sizeof(latch_mask));
+	}
+
+	u32 mask(int page, int reg) const
+	{
+		int g = page_group(page);
+		if (is_es5506) return g == GL ? ES5506_MASK_LOW[reg] : (g == GH ? ES5506_MASK_HIGH[reg] : ES5506_MASK_TEST[reg]);
+		return g == GL ? ES5505_MASK_LOW[reg] : (g == GH ? ES5505_MASK_HIGH[reg] : ES5505_MASK_TEST[reg]);
+	}
+
+	bool is_global(int page, int reg) const
+	{
+		int g = page_group(page);
+		if (reg == PAGE_REG) return true;
+		if (is_es5506) return (g != GT && (reg == 11 || reg == 12)) || (g == GH && reg == 10);
+		return reg == 13 || (g == GT && reg == 8);
+	}
+
+	bool side_effect(int page, int reg) const
+	{
+		const u16* tbl = is_es5506 ? SIDE_EFFECT_5506 : SIDE_EFFECT_5505;
+		return (tbl[page_group(page)] >> reg) & 1;
+	}
+
+	// key resolution: returns pointers to the value / known flag
+	void slot(int page, int reg, u32*& val, bool*& kn)
+	{
+		if (is_global(page, reg)) { int g = page_group(page); val = &gregs[g][reg]; kn = &gknown[g][reg]; return; }
+		if (reg == 0 && page < 0x40) page &= 0x1F;
+		val = &regs[page][reg]; kn = &known[page][reg];
+	}
+	bool get(int page, int reg, u32& out)
+	{
+		if (reg == PAGE_REG) { out = page_; return true; }
+		u32* v; bool* k; slot(page, reg, v, k);
+		if (!*k) return false;
+		out = *v; return true;
+	}
+	int page_ = 0;   // alias of page kept in sync (see store)
+
+	// voice registers by (voice, reg) on the low page and (0x20+voice, reg) on the high page
+	bool lo(int voice, int reg, u32& out) { return get(voice, reg, out); }
+	bool hi(int voice, int reg, u32& out) { return get(0x20 + voice, reg, out); }
+
+	bool voice_range(int voice, int& region, i64& first, i64& last)
+	{
+		u32 control;
+		if (!lo(voice, 0, control)) return false;
+		i64 start, end, acc;
+		if (is_es5506)
+		{
+			u32 s, e, a;
+			if (!hi(voice, 1, s) || !hi(voice, 2, e)) return false;
+			start = s >> 11; end = e >> 11;
+			acc = hi(voice, 3, a) ? (i64)(a >> 11) : start;
+			region = (control >> 14) & 3;
+		}
+		else
+		{
+			u32 r2, r3, r4, r5, r10, r11;
+			if (!lo(voice, 2, r2) || !lo(voice, 3, r3) || !lo(voice, 4, r4) || !lo(voice, 5, r5)) return false;
+			start = (((i64)r2 << 16) | r3) >> 9;
+			end = (((i64)r4 << 16) | r5) >> 9;
+			acc = (lo(voice, 10, r10) && lo(voice, 11, r11)) ? ((((i64)r10 << 16) | r11) >> 9) : start;
+			region = (control >> 2) & 1;
+		}
+		auto al = region_alias.find(region);
+		if (al != region_alias.end()) region = al->second;
+		i64 base = 0;
+		auto w = region_window.find(region);
+		if (w != region_window.end()) base += (i64)w->second * 0x100000;
+		auto vb = voice_bank.find(voice);
+		if (vb != voice_bank.end()) base += (i64)vb->second * 0x100000;
+		first = base + std::min(start, std::min(end, acc));
+		last = base + std::max(start, std::max(end, acc)) + 1;
+		return true;
+	}
+
+	void note_rom_use(int voice)
+	{
+		int region; i64 first, last;
+		if (!voice_range(voice, region, first, last)) return;
+		if (region < 0 || region > 3) return;
+		std::vector<Range>& lst = rom_used[region];
+		if (!lst.empty() && lst.back().first == first && lst.back().last == last) return;
+		lst.push_back({first, last});
+	}
+
+	RegWrite store(int page, int reg, u32 value)
+	{
+		value &= mask(page, reg);
+		if (reg == PAGE_REG)
+		{
+			bool changed = page_ != (int)value;
+			page_ = value;
+			return RegWrite{page, reg, value, changed, -1, false, 0};
+		}
+		u32* v; bool* k; slot(page, reg, v, k);
+		bool had = *k;
+		u32 old = *v;
+		if (!had) reg_count++;
+		*v = value; *k = true;
+		if (page < 0x40)
+		{
+			int voice = page & 0x1F;
+			if (reg == 0)
+			{
+				if (value & 3) running &= ~(1u << voice);
+				else { running |= (1u << voice); note_rom_use(voice); }
+			}
+			else if ((running >> voice) & 1)
+				note_rom_use(voice);
+		}
+		return RegWrite{page, reg, value, !had || old != value, -1, had, old};
+	}
+
+	// 0xBE aa dd -> logical writes (0, 1); returns false when nothing is to be emitted
+	int write8(int aa, u8 dd, RegWrite& w)
+	{
+		if (aa >= 0x40)
+		{
+			int voice = aa & 0x1F;
+			voice_bank[voice] = dd;
+			if ((running >> voice) & 1) note_rom_use(voice);
+			return 0;
+		}
+		if (is_es5506)
+		{
+			int reg = aa >> 2, lane = aa & 3;
+			latch[page_][reg][lane] = dd;
+			latch_mask[page_][reg] |= 1 << lane;
+			if (lane == 3 && latch_mask[page_][reg] == 0xF)
+			{
+				const u8* l = latch[page_][reg];
+				latch_mask[page_][reg] = 0;
+				w = store(page_, reg, ((u32)l[0] << 24) | (l[1] << 16) | (l[2] << 8) | l[3]);
+				return 1;
+			}
+			return 0;
+		}
+		int reg = aa >> 1, lane = aa & 1;
+		u32 old = 0;
+		bool kn = get(page_, reg, old);
+		u32 value = lane == 0 ? ((old & 0x00FF) | ((u32)dd << 8)) : ((old & 0xFF00) | dd);
+		w = store(page_, reg, value);
+		if (!kn) w.changed = true;
+		w.lane = lane;
+		return 1;
+	}
+
+	// 0xD6 aa ddee (big endian)
+	int write16(int aa, u32 data, RegWrite& w)
+	{
+		if (aa >= 0x40)
+		{
+			int voice = aa & 0x1F;
+			voice_bank[voice] = data;
+			if ((running >> voice) & 1) note_rom_use(voice);
+			return 0;
+		}
+		if (is_es5506)
+		{
+			int reg = aa >> 2, half = (aa >> 1) & 1;
+			latch[page_][reg][half * 2] = data >> 8;
+			latch[page_][reg][half * 2 + 1] = data & 0xFF;
+			latch_mask[page_][reg] |= 3 << (half * 2);
+			if (half == 1 && latch_mask[page_][reg] == 0xF)
+			{
+				const u8* l = latch[page_][reg];
+				latch_mask[page_][reg] = 0;
+				w = store(page_, reg, ((u32)l[0] << 24) | (l[1] << 16) | (l[2] << 8) | l[3]);
+				return 1;
+			}
+			return 0;
+		}
+		w = store(page_, aa >> 1, data);
+		return 1;
+	}
+
+	bool ext(int sub, u8 aa, u8 dd)
+	{
+		bool changed;
+		if (sub == 0x00)
+		{
+			int voice = aa & 0x1F;
+			auto it = voice_bank.find(voice);
+			changed = it == voice_bank.end() || it->second != dd;
+			voice_bank[voice] = dd;
+			if ((running >> voice) & 1) note_rom_use(voice);
+		}
+		else if (sub == 0x01)
+		{
+			auto it = region_window.find(aa & 3);
+			changed = it == region_window.end() || it->second != dd;
+			region_window[aa & 3] = dd;
+			for (int v = 0; v < 32; v++)
+				if ((running >> v) & 1) note_rom_use(v);
+		}
+		else if (sub == 0x02)
+		{
+			auto it = region_alias.find(aa & 3);
+			changed = it == region_alias.end() || it->second != dd;
+			region_alias[aa & 3] = dd;
+		}
+		else if (sub == 0x04)
+		{
+			changed = irq_autoack != dd;
+			irq_autoack = dd;
+		}
+		else
+			changed = true;
+		return changed;
+	}
+
+	bool gain(u8 cc, u32 g)
+	{
+		auto it = gains.find(cc);
+		bool changed = it == gains.end() || it->second != g;
+		gains[cc] = g;
+		return changed;
+	}
+
+	// register image for the initialisation sequence (globals, then pages; control last per page)
+	std::vector<RegWrite> image() const
+	{
+		std::vector<RegWrite> writes;
+		// Python sorts the global keys ('G', group, reg) with group chars 'H' < 'L' < 'T'
+		static const int gorder[3] = {GH, GL, GT};
+		static const int gpage[3] = {0x00, 0x20, 0x40};   // page of group L, H, T
+		for (int gi = 0; gi < 3; gi++)
+		{
+			int g = gorder[gi];
+			for (int r = 0; r < 16; r++)
+				if (gknown[g][r] && r != PAGE_REG)
+					writes.push_back(RegWrite{gpage[g], r, gregs[g][r], true, -1, false, 0});
+		}
+		for (int page = 0; page < 0x80; page++)
+		{
+			for (int r = 1; r < 16; r++)
+				if (known[page][r])
+					writes.push_back(RegWrite{page, r, regs[page][r], true, -1, false, 0});
+			if (known[page][0])
+				writes.push_back(RegWrite{page, 0, regs[page][0], true, -1, false, 0});
+		}
+		return writes;
+	}
+};
+
+// ---------------------------------------------------------------------------------------------
+// command emitter
+// ---------------------------------------------------------------------------------------------
+struct Emitter
+{
+	bool is_es5506;
+	u8 cs;
+	int out_page = -1;
+	bool lane_opt = false;
+
+	Emitter(bool es5506, u8 cs_) : is_es5506(es5506), cs(cs_) {}
+
+	void page_cmd(Bytes& out, int page) const
+	{
+		out.push_back(0xBE);
+		out.push_back((is_es5506 ? 0x3F : 0x1F) | cs);
+		out.push_back(page);
+	}
+
+	static bool lane_trusted(int g, int reg, int lane)
+	{
+		if (reg == 0 && g != GT) return lane == 0;
+		return !((SIDE_EFFECT_5505[g] >> reg) & 1);
+	}
+
+	void reg(Bytes& out, const RegWrite& w)
+	{
+		if (w.reg == PAGE_REG) return;
+		if (out_page != w.page) { page_cmd(out, w.page); out_page = w.page; }
+		if (is_es5506)
+		{
+			int aa = w.reg << 2;
+			out.push_back(0xD6); out.push_back(aa | cs); push_be16(out, (w.value >> 16) & 0xFFFF);
+			out.push_back(0xD6); out.push_back((aa | 2) | cs); push_be16(out, w.value & 0xFFFF);
+			return;
+		}
+		int aa = w.reg << 1;
+		int g = page_group(w.page);
+		u32 mask = g == GL ? ES5505_MASK_LOW[w.reg] : (g == GH ? ES5505_MASK_HIGH[w.reg] : ES5505_EMIT_TEST[w.reg]);
+		if (w.lane >= 0)
+		{
+			u8 byte = w.lane == 0 ? (w.value >> 8) : (w.value & 0xFF);
+			out.push_back(0xBE); out.push_back((aa + w.lane) | cs); out.push_back(byte);
+		}
+		else if ((mask & 0x00FF) == 0)
+		{
+			out.push_back(0xBE); out.push_back(aa | cs); out.push_back((w.value >> 8) & 0xFF);
+		}
+		else if ((mask & 0xFF00) == 0)
+		{
+			out.push_back(0xBE); out.push_back((aa + 1) | cs); out.push_back(w.value & 0xFF);
+		}
+		else if (lane_opt && w.has_prev && lane_trusted(g, w.reg, 0) && ((w.prev ^ w.value) & mask & 0xFF00) == 0)
+		{
+			out.push_back(0xBE); out.push_back((aa + 1) | cs); out.push_back(w.value & 0xFF);
+		}
+		else if (lane_opt && w.has_prev && lane_trusted(g, w.reg, 1) && ((w.prev ^ w.value) & mask & 0x00FF) == 0)
+		{
+			out.push_back(0xBE); out.push_back(aa | cs); out.push_back((w.value >> 8) & 0xFF);
+		}
+		else
+		{
+			out.push_back(0xD6); out.push_back(aa | cs); push_be16(out, w.value & 0xFFFF);
+		}
+	}
+
+	void page_sync(Bytes& out, int page)
+	{
+		if (out_page != page) { out_page = page; page_cmd(out, page); }
+	}
+
+	void init(Bytes& out, const ES55xxState& st)
+	{
+		for (auto& kv : st.region_alias) { out.push_back(0xD7); out.push_back(0x02 | cs); out.push_back(kv.first); out.push_back(kv.second); }
+		for (auto& kv : st.region_window) { out.push_back(0xD7); out.push_back(0x01 | cs); out.push_back(kv.first); out.push_back(kv.second); }
+		for (auto& kv : st.voice_bank)
+		{
+			if (kv.second <= 0xFF) { out.push_back(0xD7); out.push_back(0x00 | cs); out.push_back(kv.first); out.push_back(kv.second); }
+			else { out.push_back(0xD6); out.push_back(0x40 | kv.first | cs); push_be16(out, kv.second); }
+		}
+		if (st.irq_autoack >= 0) { out.push_back(0xD7); out.push_back(0x04 | cs); out.push_back(0x00); out.push_back(st.irq_autoack); }
+		for (auto& c : st.esp_cmds) { out.push_back(0xD8); out.push_back(c[0] | cs); out.push_back(c[1]); out.push_back(c[2]); }
+		for (auto& kv : st.gains) { out.push_back(0xE3); out.push_back(0x00 | cs); out.push_back(kv.first); push_be16(out, kv.second); }
+		for (const RegWrite& w : st.image())
+			reg(out, w);
+		page_sync(out, st.page_);
+	}
+};
+
+// ---------------------------------------------------------------------------------------------
+// sample ROM blocks
+// ---------------------------------------------------------------------------------------------
+struct RomSet
+{
+	bool has[4] = {false, false, false, false};
+	Bytes region[4];
+
+	void add_block(u32 rom_size, u32 start, const u8* data, size_t len)
+	{
+		int r = (start >> 28) & 3;
+		bool is8 = (start >> 31) & 1;
+		size_t ofs = start & 0x0FFFFFFF;
+		Bytes conv;
+		if (is8)
+		{
+			rom_size *= 2; ofs *= 2;
+			conv.resize(len * 2);
+			for (size_t i = 0; i < len; i++) { conv[i * 2] = 0; conv[i * 2 + 1] = data[i]; }
+			data = conv.data(); len = conv.size();
+		}
+		if (!has[r] || region[r].size() != rom_size)
+		{
+			Bytes nb(rom_size, 0);
+			if (has[r]) memcpy(nb.data(), region[r].data(), std::min<size_t>(region[r].size(), rom_size));
+			region[r].swap(nb);
+			has[r] = true;
+		}
+		if (ofs < rom_size)
+			memcpy(&region[r][ofs], data, std::min<size_t>(len, rom_size - ofs));
+	}
+
+	// encode the data blocks; used == nullptr: everything
+	size_t blocks(Bytes& out, u8 cs, const std::vector<Range>* used, i64 margin_words, i64 merge_gap_words) const
+	{
+		size_t total = 0;
+		for (int r = 0; r < 4; r++)
+		{
+			if (!has[r]) continue;
+			const Bytes& buf = region[r];
+			std::vector<std::pair<i64, i64>> ranges;
+			if (!used)
+				ranges.push_back({0, (i64)buf.size()});
+			else
+			{
+				i64 words = buf.size() / 2;
+				std::vector<std::pair<i64, i64>> spans;
+				for (const Range& rg : used[r])
+					spans.push_back({std::max<i64>(0, rg.first - margin_words), std::min<i64>(words, rg.last + margin_words)});
+				std::sort(spans.begin(), spans.end());
+				for (auto& s : spans)
+				{
+					if (!ranges.empty() && s.first <= ranges.back().second + merge_gap_words)
+						ranges.back().second = std::max(ranges.back().second, s.second);
+					else
+						ranges.push_back(s);
+				}
+				for (auto& rg : ranges) { rg.first *= 2; rg.second *= 2; }
+			}
+			for (auto& rg : ranges)
+			{
+				i64 a = rg.first, b = rg.second;
+				if (b <= a) continue;
+				u32 plen = 8 + (u32)(b - a);
+				out.push_back(0x67); out.push_back(0x66); out.push_back(0x90);
+				push_le32(out, plen | (cs ? 0x80000000 : 0));
+				push_le32(out, buf.size());
+				push_le32(out, ((u32)r << 28) | (u32)a);
+				out.insert(out.end(), buf.begin() + a, buf.begin() + b);
+				total += b - a;
+			}
+		}
+		return total;
+	}
+};
+
+// ---------------------------------------------------------------------------------------------
+// ES5510 host interface: dead command elimination
+// ---------------------------------------------------------------------------------------------
+struct EspCmd { size_t tag; u8 sub, ofs, data; };
+static const u16 ESP_G = 0x007, ESP_I = 0x1F8;   // latch byte bits: g0-g2, i0-i5
+
+static u16 esp_defs(u8 ofs, u8 data)
+{
+	if (ofs <= 0x02) return 1 << ofs;
+	if (ofs >= 0x03 && ofs <= 0x08) return 1 << ofs;
+	if (ofs == 0x80)
+	{
+		u16 s = 0;
+		if (data < 0xA0) s |= ESP_I;
+		if (data < 0xC0 || data >= 0xEA) s |= ESP_G;
+		return s;
+	}
+	return 0;
+}
+static u16 esp_uses(u8 ofs, u8 data)
+{
+	if (ofs == 0xA0) return ESP_G;
+	if (ofs == 0xC0) return data < 0xA0 ? ESP_I : 0;
+	if (ofs == 0xE0) return ESP_G | (data < 0xA0 ? ESP_I : 0);
+	return 0;
+}
+
+// latch byte liveness, backwards over init + body: kept init list, dead body tags
+static void esp_liveness(std::vector<EspCmd>& init, const std::vector<EspCmd>& body, std::set<size_t>& dead_body)
+{
+	size_t n_init = init.size(), n = n_init + body.size();
+	std::vector<char> dead(n, 0);
+	u16 live = ESP_G | ESP_I;
+	for (size_t i = n; i-- > 0;)
+	{
+		const EspCmd& c = i < n_init ? init[i] : body[i - n_init];
+		if (c.sub != 0x00) continue;
+		live |= esp_uses(c.ofs, c.data);
+		u16 defs = esp_defs(c.ofs, c.data);
+		if (c.ofs <= 0x08 || c.ofs == 0x80)
+		{
+			if (!(defs & live)) { dead[i] = 1; continue; }
+			live &= ~defs;
+		}
+		else if (c.ofs == 0xC0 && c.data >= 0xA0)
+			dead[i] = 1;
+	}
+	std::vector<EspCmd> kept;
+	for (size_t i = 0; i < n_init; i++) if (!dead[i]) kept.push_back(init[i]);
+	for (size_t i = n_init; i < n; i++) if (dead[i]) dead_body.insert(body[i - n_init].tag);
+	init.swap(kept);
+}
+
+static void esp_optimise(std::vector<EspCmd>& init, const std::vector<EspCmd>& body, std::set<size_t>& dead_body)
+{
+	std::set<size_t> scratch;
+	esp_liveness(init, body, scratch);
+	// last store wins within the init block
+	std::vector<char> keep(init.size(), 1);
+	std::set<int> gpr_done, instr_done;
+	for (size_t i = init.size(); i-- > 0;)
+	{
+		const EspCmd& c = init[i];
+		if (c.sub != 0x00) continue;
+		if (c.ofs == 0x80)
+		{
+			if (c.data < 0xA0) instr_done.erase(c.data);
+			if (c.data < 0xC0) gpr_done.erase(c.data);
+		}
+		else if (c.ofs == 0xA0 && c.data < 0xC0)
+		{
+			if (gpr_done.count(c.data)) keep[i] = 0;
+			gpr_done.insert(c.data);
+		}
+		else if (c.ofs == 0xC0 && c.data < 0xA0)
+		{
+			if (instr_done.count(c.data)) keep[i] = 0;
+			instr_done.insert(c.data);
+		}
+		else if (c.ofs == 0xE0 && c.data < 0xC0)
+		{
+			if (gpr_done.count(c.data) && (c.data >= 0xA0 || instr_done.count(c.data))) keep[i] = 0;
+			gpr_done.insert(c.data);
+			if (c.data < 0xA0) instr_done.insert(c.data);
+		}
+	}
+	std::vector<EspCmd> kept;
+	for (size_t i = 0; i < init.size(); i++) if (keep[i]) kept.push_back(init[i]);
+	init.swap(kept);
+	esp_liveness(init, body, dead_body);
+}
+
+// ---------------------------------------------------------------------------------------------
+// trim
+// ---------------------------------------------------------------------------------------------
+struct TrimStats { i64 kept = 0, dropped = 0, skipped = 0; size_t rom_bytes = 0; };
+
+static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 end, bool do_cmp, bool do_sro, bool keep_gd3,
+                  i64 sro_margin, i64 sro_gap, TrimStats& stats)
+{
+	const u8* d = vgm.data.data();
+	ES55xxState states[2] = {ES55xxState(vgm.is_es5506), ES55xxState(vgm.is_es5506)};
+	Emitter emitters[2] = {Emitter(vgm.is_es5506, 0x00), Emitter(vgm.is_es5506, 0x80)};
+	RomSet roms[2];
+	Bytes other_blocks, body;
+	i64 loop_body_ofs = -1;
+	i64 pending_wait = 0;
+	bool init_emitted = false;
+	std::set<size_t> esp_dead;
+	std::vector<EspCmd> esp_init[2];
+
+	if (do_cmp)
+	{
+		emitters[0].lane_opt = emitters[1].lane_opt = true;
+		std::vector<EspCmd> body_cmds[2];
+		vgm.commands([&](const Cmd& c) {
+			if (c.op == 0xD8)
+			{
+				int ci = (d[c.p + 1] & 0x80) ? 1 : 0;
+				EspCmd e{c.p, (u8)(d[c.p + 1] & 0x7F), d[c.p + 2], d[c.p + 3]};
+				if (c.t < start) esp_init[ci].push_back(e);
+				else if (c.t < end) body_cmds[ci].push_back(e);
+			}
+			return true;
+		});
+		for (int ci = 0; ci < 2; ci++)
+			esp_optimise(esp_init[ci], body_cmds[ci], esp_dead);
+	}
+
+	auto flush_wait = [&]() { if (pending_wait) { wait_cmd(body, pending_wait); pending_wait = 0; } };
+	auto emit_init = [&]() {
+		if (init_emitted) return;
+		init_emitted = true;
+		for (int ci = 0; ci < 2; ci++)
+		{
+			ES55xxState& st = states[ci];
+			for (int r = 0; r < 4; r++) st.rom_used[r].clear();
+			for (int v = 0; v < 32; v++)
+				if ((st.running >> v) & 1) st.note_rom_use(v);
+			if (do_cmp)
+			{
+				st.esp_cmds.clear();
+				for (const EspCmd& e : esp_init[ci]) st.esp_cmds.push_back({e.sub, e.ofs, e.data});
+			}
+			if (st.reg_count || !st.esp_cmds.empty() || !st.gains.empty())
+				emitters[ci].init(body, st);
+		}
+	};
+	auto mark_loop = [&]() {
+		if (has_loop && loop_body_ofs < 0)
+		{
+			flush_wait();
+			loop_body_ofs = body.size();
+			emitters[0].out_page = emitters[1].out_page = -1;
+		}
+	};
+
+	vgm.commands([&](const Cmd& c) {
+		size_t p = c.p;
+		u8 op = c.op;
+		if (op == 0x66) return false;
+		if (op == 0x67)
+		{
+			if (d[p + 2] == 0x90 && c.len >= 15)
+			{
+				u32 size = le32(&d[p + 3]);
+				int ci = (size & 0x80000000) ? 1 : 0;
+				roms[ci].add_block(le32(&d[p + 7]), le32(&d[p + 11]), &d[p + 15], c.len - 15);
+			}
+			else
+				other_blocks.insert(other_blocks.end(), &d[p], &d[p + c.len]);
+			return true;
+		}
+		i64 w = wait_of(&d[p], op);
+		if (w)
+		{
+			i64 a = c.t, b = c.t + w;
+			if (b <= start || a >= end) return true;
+			emit_init();
+			a = std::max(a, start);
+			b = std::min(b, end);
+			if (has_loop && loop_body_ofs < 0 && a <= loop && loop < b)
+			{
+				pending_wait += loop - a;
+				mark_loop();
+				a = loop;
+			}
+			pending_wait += b - a;
+			return true;
+		}
+		int ci = (c.len > 1 && (d[p + 1] & 0x80)) ? 1 : 0;
+		ES55xxState& st = states[ci];
+		Emitter& em = emitters[ci];
+		RegWrite rw;
+		int nwrites = -1;      // -1: not a register write
+		bool raw_changed = true;
+		if (op == 0xBE)
+			nwrites = st.write8(d[p + 1] & 0x7F, d[p + 2], rw);
+		else if (op == 0xD6)
+			nwrites = st.write16(d[p + 1] & 0x7F, (d[p + 2] << 8) | d[p + 3], rw);
+		else if (op == 0xD7)
+			raw_changed = st.ext(d[p + 1] & 0x7F, d[p + 2], d[p + 3]) || (d[p + 1] & 0x7F) == 0x03;
+		else if (op == 0xD8)
+		{
+			st.esp_cmds.push_back({(u8)(d[p + 1] & 0x7F), d[p + 2], d[p + 3]});
+			raw_changed = esp_dead.count(p) == 0;
+		}
+		else if (op == 0xE3)
+			raw_changed = st.gain(d[p + 2], (d[p + 3] << 8) | d[p + 4]);
+		if (c.t < start) { stats.skipped++; return true; }
+		if (c.t >= end) return true;
+		emit_init();
+		if (has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
+		if (nwrites >= 0)
+		{
+			if (nwrites == 0)
+			{
+				if ((d[p + 1] & 0x7F) >= 0x40)
+				{
+					flush_wait();
+					body.insert(body.end(), &d[p], &d[p + c.len]);   // legacy voice bank write
+					stats.kept++;
+				}
+				return true;   // partial ES5506 latch
+			}
+			if (rw.reg == PAGE_REG) return true;
+			if (do_cmp && !rw.changed && !st.side_effect(rw.page, rw.reg)) { stats.dropped++; return true; }
+			flush_wait();
+			em.reg(body, rw);
+			stats.kept++;
+			return true;
+		}
+		if (do_cmp && !raw_changed) { stats.dropped++; return true; }
+		flush_wait();
+		body.insert(body.end(), &d[p], &d[p + c.len]);
+		stats.kept++;
+		return true;
+	});
+	flush_wait();
+	if (has_loop && loop_body_ofs < 0) loop_body_ofs = body.size();
+	body.push_back(0x66);
+
+	Bytes blocks(other_blocks);
+	stats.rom_bytes = 0;
+	for (int ci = 0; ci < 2; ci++)
+		stats.rom_bytes += roms[ci].blocks(blocks, ci ? 0x80 : 0x00, do_sro ? states[ci].rom_used : nullptr, sro_margin, sro_gap);
+
+	Bytes out(vgm.data.begin(), vgm.data.begin() + vgm.data_ofs);
+	// files using the ES55xx extension are VGM 1.72 with a 0x100-byte header; upgrade older captures
+	if (vgm.data_ofs >= 0xD4 && le32(&out[0xD0]) != 0) {
+		if (le32(&out[0x08]) < 0x172) put_le32(&out[0x08], 0x172);
+		if (out.size() < 0x100) { out.resize(0x100, 0); put_le32(&out[0x34], 0x100 - 0x34); }
+	}
+	size_t data_start = out.size();
+	put_le32(&out[0x18], (u32)(end - start));
+	if (has_loop)
+	{
+		put_le32(&out[0x1C], (u32)(data_start + blocks.size() + loop_body_ofs - 0x1C));
+		put_le32(&out[0x20], (u32)(end - loop));
+	}
+	else
+	{
+		put_le32(&out[0x1C], 0);
+		put_le32(&out[0x20], 0);
+	}
+	out.insert(out.end(), blocks.begin(), blocks.end());
+	out.insert(out.end(), body.begin(), body.end());
+	Bytes gd3;
+	if (keep_gd3 && vgm.gd3 && vgm.gd3 + 12 <= vgm.data.size())
+	{
+		u32 gd3_len = le32(&d[vgm.gd3 + 8]);
+		size_t e = std::min<size_t>(vgm.gd3 + 12 + gd3_len, vgm.data.size());
+		gd3.assign(&d[vgm.gd3], &d[e]);
+	}
+	put_le32(&out[0x14], gd3.empty() ? 0 : (u32)(out.size() - 0x14));
+	out.insert(out.end(), gd3.begin(), gd3.end());
+	put_le32(&out[0x04], (u32)(out.size() - 4));
+	return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// info / activity
+// ---------------------------------------------------------------------------------------------
+static void info(const VGMFile& vgm)
+{
+	std::map<int, i64> counts;
+	std::string blocks;
+	std::set<int> other;
+	vgm.commands([&](const Cmd& c) {
+		counts[c.op]++;
+		if (c.op == 0x67)
+		{
+			char buf[96];
+			snprintf(buf, sizeof(buf), "%stype %02X %zu bytes @%s", blocks.empty() ? "" : ", ", vgm.data[c.p + 2], c.len - 7, fmt_pos(c.t).c_str());
+			blocks += buf;
+		}
+		u8 op = c.op;
+		if ((op >= 0x50 && op <= 0x5F) || (op >= 0x30 && op <= 0x4E) ||
+		    (op >= 0xA0 && op <= 0xDF && op != 0xBE && op != 0xD6 && op != 0xD7 && op != 0xD8) || op == 0xE0 || op == 0xE1)
+			other.insert(op);
+		return true;
+	});
+	printf("version %X, total %s, loop %s\n", vgm.version, fmt_pos(vgm.total).c_str(), vgm.loop_ofs ? fmt_pos(vgm.loop_samples).c_str() : "none");
+	printf("ES5506 clock %08X (%s, %d pair(s))\n", vgm.es5506_clock, vgm.is_es5506 ? "ES5506" : "ES5505", vgm.data.size() > 0xD5 ? vgm.data[0xD5] : 0);
+	printf("data blocks: %s\n", blocks.c_str());
+	std::string cmds;
+	for (auto& kv : counts) { char buf[32]; snprintf(buf, sizeof(buf), "%s%02X:%lld", cmds.empty() ? "" : ", ", kv.first, (long long)kv.second); cmds += buf; }
+	printf("commands: %s\n", cmds.c_str());
+	if (!other.empty())
+	{
+		std::string s;
+		for (int o : other) { char buf[8]; snprintf(buf, sizeof(buf), "%s%02X", s.empty() ? "" : " ", o); s += buf; }
+		printf("WARNING: commands of other chips present (%s), their state is not re-created by trimming\n", s.c_str());
+	}
+}
+
+// gaps where no voice is audible (running with a non-zero volume)
+static std::vector<std::pair<i64, i64>> activity(const VGMFile& vgm, i64 min_gap, bool quiet)
+{
+	const u8* d = vgm.data.data();
+	ES55xxState states[2] = {ES55xxState(vgm.is_es5506), ES55xxState(vgm.is_es5506)};
+	std::map<i64, int> per_sec;
+	std::vector<std::pair<i64, i64>> gaps;
+	i64 gap_start = -1, last_t = 0;
+	vgm.commands([&](const Cmd& c) {
+		if (c.op == 0x66) return false;
+		int ci = (c.len > 1 && (d[c.p + 1] & 0x80)) ? 1 : 0;
+		RegWrite rw;
+		if (c.op == 0xBE) states[ci].write8(d[c.p + 1] & 0x7F, d[c.p + 2], rw);
+		else if (c.op == 0xD6) states[ci].write16(d[c.p + 1] & 0x7F, (d[c.p + 2] << 8) | d[c.p + 3], rw);
+		int n = 0;
+		for (int k = 0; k < 2; k++)
+		{
+			ES55xxState& st = states[k];
+			for (int v = 0; v < 32; v++)
+			{
+				if (!((st.running >> v) & 1)) continue;
+				u32 l = st.known[v][8] ? st.regs[v][8] : 0, r = st.known[v][9] ? st.regs[v][9] : 0;
+				if ((l | r) & 0xFF00) n++;
+			}
+		}
+		if (!quiet)
+		{
+			i64 sec = c.t / SAMPLE_RATE;
+			auto it = per_sec.find(sec);
+			if (it == per_sec.end()) per_sec[sec] = n; else it->second = std::max(it->second, n);
+		}
+		if (n == 0)
+		{
+			if (gap_start < 0) gap_start = c.t;
+		}
+		else
+		{
+			if (gap_start >= 0 && c.t - gap_start >= min_gap) gaps.push_back({gap_start, c.t});
+			gap_start = -1;
+		}
+		last_t = c.t;
+		return true;
+	});
+	if (gap_start >= 0 && last_t - gap_start >= min_gap) gaps.push_back({gap_start, last_t});
+	if (quiet) return gaps;
+	printf("running voices per second (max):\n");
+	int col = 0;
+	for (auto& kv : per_sec)
+	{
+		printf("%s%3lld:%2d", col == 0 ? "  " : " ", (long long)kv.first, kv.second);
+		if (++col == 12) { printf("\n"); col = 0; }
+	}
+	if (col) printf("\n");
+	printf("gaps with no running voice (>= %s):\n", fmt_pos(min_gap).c_str());
+	for (auto& g : gaps)
+		printf("  %s .. %s (%.2f s)\n", fmt_pos(g.first).c_str(), fmt_pos(g.second).c_str(), (double)(g.second - g.first) / SAMPLE_RATE);
+	return gaps;
+}
+
+// ---------------------------------------------------------------------------------------------
+// loop detection from the note-on sequence
+// ---------------------------------------------------------------------------------------------
+struct NoteKey
+{
+	i64 a, b, c, f;
+	bool operator==(const NoteKey& o) const { return a == o.a && b == o.b && c == o.c && f == o.f; }
+	bool operator<(const NoteKey& o) const
+	{
+		if (a != o.a) return a < o.a;
+		if (b != o.b) return b < o.b;
+		if (c != o.c) return c < o.c;
+		return f < o.f;
+	}
+};
+struct NoteEvent { i64 t; NoteKey k; };
+
+static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool bounded, i64& r_start, i64& r_loop, i64& r_end,
+                      int window = 12, i64 pre = 2205)
+{
+	const u8* d = vgm.data.data();
+	ES55xxState st(vgm.is_es5506);
+	std::vector<NoteEvent> events;
+	vgm.commands([&](const Cmd& c) {
+		if (c.op == 0x66 || (bounded && c.t >= search_to)) return false;
+		RegWrite w;
+		int n;
+		if (c.op == 0xBE) n = st.write8(d[c.p + 1] & 0x7F, d[c.p + 2], w);
+		else if (c.op == 0xD6) n = st.write16(d[c.p + 1] & 0x7F, (d[c.p + 2] << 8) | d[c.p + 3], w);
+		else return true;
+		if (n && w.reg == 0 && w.page < 0x40 && !(w.value & 3) && w.changed)
+		{
+			int v = w.page & 0x1F;
+			int region; i64 first, last;
+			if (st.voice_range(v, region, first, last))
+			{
+				u32 fc = 0;
+				st.get(v, 1, fc);
+				events.push_back({c.t, NoteKey{region, first, last, fc}});
+			}
+		}
+		return true;
+	});
+	size_t n = events.size();
+	if (n < (size_t)window * 2) return false;
+
+	auto window_hash = [&](size_t i) {
+		uint64_t h = 1469598103934665603ULL;
+		for (int k = 0; k < window; k++)
+		{
+			const NoteKey& key = events[i + k].k;
+			i64 parts[4] = {key.a, key.b, key.c, key.f};
+			for (i64 v : parts) { h ^= (uint64_t)v; h *= 1099511628211ULL; }
+		}
+		return h;
+	};
+	auto window_equal = [&](size_t i, size_t j) {
+		for (int k = 0; k < window; k++) if (!(events[i + k].k == events[j + k].k)) return false;
+		return true;
+	};
+	std::unordered_map<uint64_t, std::vector<size_t>> index;
+	for (size_t i = 0; i + window < n; i++)
+		if (events[i].t >= search_from)
+			index[window_hash(i)].push_back(i);
+	std::map<i64, i64> periods;         // bucket (0.5 s) -> count
+	std::vector<i64> period_order;      // first-seen order of the buckets
+	struct Pair { size_t i, j; i64 dt; };
+	std::vector<Pair> pairs;
+	for (size_t j = 0; j + window < n; j++)
+	{
+		auto it = index.find(window_hash(j));
+		if (it == index.end()) continue;
+		for (size_t i : it->second)
+		{
+			if (i < j && window_equal(i, j))
+			{
+				i64 dt = events[j].t - events[i].t;
+				if (dt > 5 * SAMPLE_RATE)
+				{
+					i64 b = dt / (SAMPLE_RATE / 2);
+					if (!periods.count(b)) period_order.push_back(b);
+					periods[b]++;
+					pairs.push_back({i, j, dt});
+				}
+			}
+		}
+	}
+	if (pairs.empty()) return false;
+	std::map<NoteKey, std::vector<i64>> by_key;
+	for (const NoteEvent& e : events) by_key[e.k].push_back(e.t);
+	const i64 tol = (i64)(0.03 * SAMPLE_RATE);
+	auto recurrence_at = [&](size_t i, i64 per, i64& out) {
+		const NoteEvent& e = events[i];
+		const std::vector<i64>& ts = by_key[e.k];
+		auto it = std::lower_bound(ts.begin(), ts.end(), e.t + per - tol);
+		if (it != ts.end() && *it <= e.t + per + tol) { out = *it; return true; }
+		return false;
+	};
+	// every well-supported 0.5 s bucket is a candidate (musical phrases repeat too, and a capture
+	// stopped shortly after the loop gives the real period only a few windows); the decisive
+	// criterion is the share of ALL note-ons of the first pass that recur at the exact offset
+	std::vector<i64> by_count(period_order);
+	std::stable_sort(by_count.begin(), by_count.end(), [&](i64 x, i64 y) { return periods[x] > periods[y]; });
+	struct Cand { i64 per; double cover; size_t windows; };
+	std::vector<Cand> cands;
+	for (size_t bi = 0; bi < by_count.size() && bi < 12; bi++)
+	{
+		i64 bucket = by_count[bi];
+		std::vector<Pair> sel_b;
+		for (const Pair& pr : pairs)
+			if (std::llabs(pr.dt / (SAMPLE_RATE / 2) - bucket) <= 1) sel_b.push_back(pr);
+		std::map<i64, i64> fine;
+		std::vector<i64> fine_order;
+		size_t first_i = SIZE_MAX;
+		for (const Pair& pr : sel_b)
+		{
+			i64 b = pr.dt / (SAMPLE_RATE / 100);
+			if (!fine.count(b)) fine_order.push_back(b);
+			fine[b]++;
+			first_i = std::min(first_i, pr.i);
+		}
+		std::stable_sort(fine_order.begin(), fine_order.end(), [&](i64 x, i64 y) { return fine[x] > fine[y]; });
+		double best_cover = -1;
+		i64 best_per = 0;
+		for (size_t k = 0; k < fine_order.size() && k < 6; k++)
+		{
+			std::vector<i64> near;
+			for (const Pair& pr : sel_b)
+				if (std::llabs(pr.dt / (SAMPLE_RATE / 100) - fine_order[k]) <= 1) near.push_back(pr.dt);
+			std::sort(near.begin(), near.end());
+			i64 per = near[near.size() / 2];
+			i64 span = 0, hits = 0, dummy;
+			for (size_t m = first_i; m < n; m++)
+			{
+				if (events[m].t + per + tol < events[n - 1].t)
+				{
+					span++;
+					if (recurrence_at(m, per, dummy)) hits++;
+				}
+			}
+			double cover = (double)hits / std::max<i64>(1, span);
+			if (best_cover < 0 || cover > best_cover) { best_cover = cover; best_per = per; }
+		}
+		cands.push_back({best_per, best_cover, sel_b.size()});
+	}
+	std::string cand;
+	for (const Cand& c : cands)
+	{
+		char buf[64];
+		snprintf(buf, sizeof(buf), "%s%.1f s:%zu:%.0f%%", cand.empty() ? "" : ", ", (double)c.per / SAMPLE_RATE, c.windows, 100 * c.cover);
+		cand += buf;
+	}
+	printf("repetition candidates (period, matching windows, note-on recurrence): %s\n", cand.c_str());
+	double best_cover = -1;
+	for (const Cand& c : cands) best_cover = std::max(best_cover, c.cover);
+	if (best_cover < 0.6)
+	{
+		printf("no repetition covers the song (best %.0f%%): repeated phrases only, no loop\n", 100 * best_cover);
+		return false;
+	}
+	// the song loop is the best covered period; a multiple of it covers (almost) as well but has
+	// fewer matching windows, a period shifted by one phrase covers a little less
+	const Cand* chosen = nullptr;
+	for (const Cand& c : cands)
+	{
+		if (c.cover < best_cover - 0.02) continue;
+		if (!chosen || c.windows > chosen->windows || (c.windows == chosen->windows && c.per < chosen->per)) chosen = &c;
+	}
+	i64 period = chosen->per;
+	std::vector<Pair> sel(chosen->windows);
+	printf("period %s (%.4f s): %.0f%% of the note-ons recur at that offset\n", fmt_pos(period).c_str(), (double)period / SAMPLE_RATE, 100 * chosen->cover);
+	size_t first = SIZE_MAX;
+	i64 dummy;
+	for (size_t i = 0; i < n; i++)
+	{
+		if (events[i].t < search_from) continue;
+		int hits = 0;
+		for (size_t m = i; m < std::min(i + 40, n); m++)
+			if (recurrence_at(m, period, dummy)) hits++;
+		if (hits >= 32)
+		{
+			for (size_t m = i; m < n; m++)
+				if (recurrence_at(m, period, dummy)) { first = m; break; }
+			break;
+		}
+	}
+	if (first == SIZE_MAX) return false;
+	i64 t1 = events[first].t, t2;
+	recurrence_at(first, period, t2);
+	printf("loop found: first repeated note-on at %s, recurs at %s, period %s (%.4f s), %zu matching windows\n",
+	       fmt_pos(t1).c_str(), fmt_pos(t2).c_str(), fmt_pos(t2 - t1).c_str(), (double)(t2 - t1) / SAMPLE_RATE, sel.size());
+	r_start = std::max<i64>(0, t1 - pre);
+	r_loop = r_start;
+	r_end = t2 - pre;
+	return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// WAV based track splitting
+// ---------------------------------------------------------------------------------------------
+struct Wav { int sr = 0, nch = 0; std::vector<int16_t> smp; size_t frames = 0; };
+
+static bool read_wav(const std::string& path, Wav& w)
+{
+	FILE* f = fopen(path.c_str(), "rb");
+	if (!f) return false;
+	u8 hdr[12];
+	if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "RIFF", 4) || memcmp(hdr + 8, "WAVE", 4)) { fclose(f); return false; }
+	int bits = 16;
+	for (;;)
+	{
+		u8 ch[8];
+		if (fread(ch, 1, 8, f) != 8) { fclose(f); return false; }
+		u32 size = le32(ch + 4);
+		if (!memcmp(ch, "fmt ", 4))
+		{
+			Bytes fmt(size);
+			if (fread(fmt.data(), 1, size, f) != size) { fclose(f); return false; }
+			w.nch = fmt[2] | (fmt[3] << 8);
+			w.sr = le32(&fmt[4]);
+			bits = fmt[14] | (fmt[15] << 8);
+		}
+		else if (!memcmp(ch, "data", 4))
+		{
+			if (bits != 16 || w.nch == 0) { fclose(f); return false; }
+			w.smp.resize(size / 2);
+			size_t got = fread(w.smp.data(), 1, size, f);
+			w.smp.resize(got / 2);
+			w.frames = w.smp.size() / w.nch;
+			break;
+		}
+		else
+			fseek(f, size + (size & 1), SEEK_CUR);
+	}
+	fclose(f);
+	return true;
+}
+
+static std::vector<std::pair<i64, i64>> find_segments(const Wav& w, int silence_peak, i64 min_silence, i64 min_length)
+{
+	size_t win = w.sr / 100;
+	std::vector<std::pair<i64, i64>> segs;
+	bool in_seg = false;
+	size_t seg_start = 0, seg_last = 0, silent_run = 0, idx = 0;
+	for (size_t i = 0; i < w.frames; i += win, idx++)
+	{
+		size_t e = std::min(w.frames, i + win);
+		int peak = 0;
+		for (size_t s = i * w.nch; s < e * w.nch; s++) peak = std::max(peak, abs((int)w.smp[s]));
+		bool loud = peak > silence_peak;
+		if (loud)
+		{
+			if (!in_seg) { in_seg = true; seg_start = idx; }
+			silent_run = 0;
+			seg_last = idx;
+		}
+		else if (in_seg)
+		{
+			silent_run++;
+			if ((i64)(silent_run * win) >= min_silence)
+			{
+				segs.push_back({(i64)(seg_start * win), (i64)((seg_last + 1) * win)});
+				in_seg = false;
+			}
+		}
+	}
+	if (in_seg) segs.push_back({(i64)(seg_start * win), (i64)((seg_last + 1) * win)});
+	double scale = (double)SAMPLE_RATE / w.sr;
+	std::vector<std::pair<i64, i64>> out;
+	for (auto& s : segs)
+		if (s.second - s.first >= min_length)
+			out.push_back({(i64)(s.first * scale), (i64)(s.second * scale)});
+	return out;
+}
+
+static void print_loudness(const Wav& w, double step = 2.0)
+{
+	size_t win = (size_t)(w.sr * step);
+	printf("RMS level (left channel) every %.0f s:\n", step);
+	int col = 0;
+	for (size_t i = 0; i + win <= w.frames; i += win)
+	{
+		double acc = 0;
+		for (size_t s = i; s < i + win; s++) { double v = w.smp[s * w.nch]; acc += v * v; }
+		printf("%s%4zu:%5.0f", col == 0 ? "  " : " ", i / w.sr, sqrt(acc / win));
+		if (++col == 10) { printf("\n"); col = 0; }
+	}
+	if (col) printf("\n");
+}
+
+// ---------------------------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------------------------
+static bool ends_with_nocase(const std::string& s, const char* suffix)
+{
+	size_t n = strlen(suffix);
+	if (s.size() < n) return false;
+	for (size_t i = 0; i < n; i++) if (tolower((unsigned char)s[s.size() - n + i]) != suffix[i]) return false;
+	return true;
+}
+
+// .vgz output is gzip-compressed (level 9, no name/mtime in the gzip header)
+static void write_output(const std::string& path, const Bytes& out)
+{
+	if (ends_with_nocase(path, ".vgz"))
+	{
+		gzFile g = gzopen(path.c_str(), "wb9");
+		if (!g) die("cannot write " + path);
+		size_t pos = 0;
+		while (pos < out.size())
+		{
+			unsigned chunk = (unsigned)std::min<size_t>(out.size() - pos, 1u << 28);
+			if (gzwrite(g, out.data() + pos, chunk) != (int)chunk) die("gzip write failed: " + path);
+			pos += chunk;
+		}
+		if (gzclose(g) != Z_OK) die("gzip close failed: " + path);
+		return;
+	}
+	FILE* f = fopen(path.c_str(), "wb");
+	if (!f) die("cannot write " + path);
+	fwrite(out.data(), 1, out.size(), f);
+	fclose(f);
+}
+
+static std::string track_name(const std::string& output, int n)
+{
+	char num[8];
+	snprintf(num, sizeof(num), "%02d", n);
+	size_t ph = output.find("{n}");
+	if (ph != std::string::npos) return output.substr(0, ph) + num + output.substr(ph + 3);
+	size_t dot = output.rfind('.');
+	size_t slash = output.find_last_of("/\\");
+	if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+		return output.substr(0, dot) + "_" + num + output.substr(dot);
+	return output + "_" + num;
+}
+
+static void usage()
+{
+	fprintf(stderr,
+	        "usage: vgm_trim input [output] [options]\n"
+	        "  output ending in .vgz is written gzip-compressed; with --track all, tracks are output_NN.vgm/.vgz\n"
+	        "  --info                 print file information and exit\n"
+	        "  --activity             print the running-voice timeline and the silent gaps (from the log) and exit\n"
+	        "  --start P --end P      trim range (samples, \"12.5s\" or \"m:ss.sss\")\n"
+	        "  --loop P               loop point\n"
+	        "  --find-loop            locate the loop from the note-on sequence (within --start/--end)\n"
+	        "  --cmp                  drop register writes that do not change the chip state\n"
+	        "  --sro                  keep only the sample ROM ranges that are played\n"
+	        "  --sro-margin N         --sro: margin in words around each used range (default 256)\n"
+	        "  --sro-gap N            --sro: merge used ranges closer than this many words (default 0)\n"
+	        "  --gd3 keep|drop        keep the GD3 tag (default keep)\n"
+	        "  --auto                 split the capture into tracks separated by silence\n"
+	        "  --split wav|log        --auto: from the rendered audio (needs vgm2wav) or from the log (default wav)\n"
+	        "  --track N|all|0        --auto: track to extract (default 1), all = every track to output_NN, 0 = list only\n"
+	        "  --vgm2wav PATH         vgm2wav tool (default: vgm2wav)\n"
+	        "  --silence N            --auto: peak level treated as silence (default 4)\n"
+	        "  --gap P                --auto / --activity: minimum silence between two tracks (default 1.0s)\n"
+	        "  --pre P --post P       --auto: silence kept before / after each track (default 0.05s / 0.3s)\n"
+	        "  --min-length P         --auto: ignore segments shorter than this (default 0.5s)\n");
+	exit(1);
+}
+
+int main(int argc, char** argv)
+{
+	std::string input, output, start_s, end_s, loop_s, gd3 = "keep", split = "wav", track = "1", vgm2wav = "vgm2wav";
+	std::string gap = "1.0s", pre = "0.05s", post = "0.3s", min_length = "0.5s";
+	bool f_info = false, f_activity = false, f_find_loop = false, f_cmp = false, f_sro = false, f_auto = false;
+	i64 sro_margin = 256, sro_gap = 0;
+	int silence = 4;
+	std::vector<std::string> positional;
+	for (int i = 1; i < argc; i++)
+	{
+		std::string a = argv[i];
+		auto value = [&](std::string& dst) {
+			size_t eq = a.find('=');
+			if (eq != std::string::npos) dst = a.substr(eq + 1);
+			else if (i + 1 < argc) dst = argv[++i];
+			else usage();
+		};
+		std::string name = a.substr(0, a.find('='));
+		if (name == "--info") f_info = true;
+		else if (name == "--activity") f_activity = true;
+		else if (name == "--find-loop") f_find_loop = true;
+		else if (name == "--cmp") f_cmp = true;
+		else if (name == "--sro") f_sro = true;
+		else if (name == "--auto") f_auto = true;
+		else if (name == "--start") value(start_s);
+		else if (name == "--end") value(end_s);
+		else if (name == "--loop") value(loop_s);
+		else if (name == "--gd3") value(gd3);
+		else if (name == "--split") value(split);
+		else if (name == "--track") value(track);
+		else if (name == "--vgm2wav") value(vgm2wav);
+		else if (name == "--gap") value(gap);
+		else if (name == "--pre") value(pre);
+		else if (name == "--post") value(post);
+		else if (name == "--min-length") value(min_length);
+		else if (name == "--sro-margin") { std::string v; value(v); sro_margin = atoll(v.c_str()); }
+		else if (name == "--sro-gap") { std::string v; value(v); sro_gap = atoll(v.c_str()); }
+		else if (name == "--silence") { std::string v; value(v); silence = atoi(v.c_str()); }
+		else if (name.rfind("--", 0) == 0) { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); }
+		else positional.push_back(a);
+	}
+	if (positional.empty()) usage();
+	input = positional[0];
+	if (positional.size() > 1) output = positional[1];
+
+	VGMFile vgm;
+	vgm.load(input);
+	if (f_activity) { activity(vgm, parse_pos(gap), false); return 0; }
+	if (f_info || output.empty()) { info(vgm); return 0; }
+
+	struct Job { i64 start, loop, end; bool has_loop; std::string output; };
+	std::vector<Job> jobs;
+	if (f_auto)
+	{
+		std::vector<std::pair<i64, i64>> segs;
+		if (split == "log")
+		{
+			auto gaps = activity(vgm, parse_pos(gap), true);
+			i64 pos = 0, minlen = parse_pos(min_length);
+			for (auto& g : gaps)
+			{
+				if (g.first - pos >= minlen) segs.push_back({pos, g.first});
+				pos = g.second;
+			}
+			if ((i64)vgm.total - pos >= minlen) segs.push_back({pos, (i64)vgm.total});
+		}
+		else
+		{
+			char tmpl[] = "/tmp/es55xx_XXXXXX";
+			int fd = mkstemp(tmpl);
+			if (fd < 0) die("cannot create a temporary file");
+			close(fd);
+			std::string wav = std::string(tmpl) + ".wav";
+			remove(tmpl);
+			std::string cmd = "\"" + vgm2wav + "\" --fade 0 \"" + input + "\" \"" + wav + "\" >/dev/null 2>&1";
+			int rc = system(cmd.c_str());
+			Wav w;
+			if (rc != 0 || !read_wav(wav, w)) { remove(wav.c_str()); die("vgm2wav failed (" + vgm2wav + ")"); }
+			remove(wav.c_str());
+			segs = find_segments(w, silence, parse_pos(gap), parse_pos(min_length));
+			if (track == "0") print_loudness(w);
+		}
+		if (segs.empty()) die("no non-silent segment found");
+		for (size_t i = 0; i < segs.size(); i++)
+			printf("track %zu: %s .. %s (%.1f s)\n", i + 1, fmt_pos(segs[i].first).c_str(), fmt_pos(segs[i].second).c_str(),
+			       (double)(segs[i].second - segs[i].first) / SAMPLE_RATE);
+		std::vector<size_t> wanted;
+		if (track == "all")
+			for (size_t i = 0; i < segs.size(); i++) wanted.push_back(i);
+		else
+		{
+			int n = atoi(track.c_str());
+			if (n < 1 || n > (int)segs.size()) return 0;
+			wanted.push_back(n - 1);
+		}
+		for (size_t i : wanted)
+			jobs.push_back({std::max<i64>(0, segs[i].first - parse_pos(pre)), 0, std::min<i64>(vgm.total, segs[i].second + parse_pos(post)), false,
+			                track == "all" ? track_name(output, (int)i + 1) : output});
+	}
+	else
+		jobs.push_back({start_s.empty() ? 0 : parse_pos(start_s), loop_s.empty() ? 0 : parse_pos(loop_s),
+		                end_s.empty() ? (i64)vgm.total : parse_pos(end_s), !loop_s.empty(), output});
+
+	for (Job& job : jobs)
+	{
+		if (job.end > (i64)vgm.total) job.end = vgm.total;
+		if (f_find_loop)
+		{
+			i64 s, l, e;
+			if (!find_loop(vgm, job.start, job.end, true, s, l, e))
+			{
+				printf("%s: no loop found, written without loop\n", job.output.c_str());
+			}
+			else { job.start = s; job.loop = l; job.end = std::min(e, job.end); job.has_loop = true; }
+		}
+		if (job.has_loop && !(job.start <= job.loop && job.loop < job.end)) die("loop point must be within [start, end)");
+		TrimStats stats;
+		Bytes out = trim(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats);
+		write_output(job.output, out);
+		printf("%s -> %s: %s .. %s%s, %lld writes kept, %lld dropped (--cmp), %lld commands before start, ROM data %zu bytes; %zu -> %zu bytes\n",
+		       input.c_str(), job.output.c_str(), fmt_pos(job.start).c_str(), fmt_pos(job.end).c_str(),
+		       job.has_loop ? (", loop at " + fmt_pos(job.loop)).c_str() : "",
+		       (long long)stats.kept, (long long)stats.dropped, (long long)stats.skipped, stats.rom_bytes, vgm.data.size(), out.size());
+	}
+	return 0;
+}

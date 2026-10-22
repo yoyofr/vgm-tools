@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GD3 Tag Editor</title>
+<style>
+/* layout: file list on the left, tag form on the right; one column under 760px */
+:root {
+  --bg: #f6f5f2; --panel: #ffffff; --fg: #1d1c1a; --muted: #6b6762; --line: #d9d5ce;
+  --accent: #b5542a; --accent-fg: #ffffff; --ok: #2f7d4f; --warn: #a3650f; --field: #fbfaf8;
+  --font: -apple-system, "Segoe UI", "Helvetica Neue", "Hiragino Sans", "Noto Sans JP", "Yu Gothic", sans-serif;
+  --mono: "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #1b1a18; --panel: #242320; --fg: #ece9e3; --muted: #9c978f; --line: #3b3935;
+  --accent: #e07a4a; --accent-fg: #1b1a18; --ok: #6fc28e; --warn: #e2a84a; --field: #1f1e1b; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #1b1a18; --panel: #242320; --fg: #ece9e3; --muted: #9c978f; --line: #3b3935;
+  --accent: #e07a4a; --accent-fg: #1b1a18; --ok: #6fc28e; --warn: #e2a84a; --field: #1f1e1b; color-scheme: dark }
+* { box-sizing: border-box }
+html, body { height: 100% }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--font);
+  padding-block: 16px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)) }
+h1 { font-size: 18px; margin: 0; font-weight: 600 }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 14px }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center }
+button { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg); cursor: pointer }
+button:hover { border-color: var(--accent) }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600 }
+button:disabled { opacity: .45; cursor: default }
+main { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; min-height: 0 }
+@media (max-width: 760px) { main { grid-template-columns: 1fr } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-width: 0 }
+#files { padding: 6px; max-height: 70vh; overflow: auto }
+.file { display: flex; gap: 8px; align-items: baseline; padding: 7px 8px; border-radius: 6px; cursor: pointer }
+.file:hover { background: var(--field) }
+.file.active { background: var(--accent); color: var(--accent-fg) }
+.file .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.file .flag { font-size: 11px; font-family: var(--mono) }
+.file .rm { border: 0; background: none; color: inherit; opacity: .55; padding: 0 4px; font-size: 14px; line-height: 1; cursor: pointer }
+.file .rm:hover { opacity: 1; color: var(--warn) }
+.file.active .rm:hover { color: var(--accent-fg) }
+.file.dirty .name::after { content: " •"; color: var(--warn) }
+.file.active.dirty .name::after { color: var(--accent-fg) }
+.empty { padding: 24px 12px; color: var(--muted); text-align: center }
+.drop { border: 2px dashed var(--line); border-radius: 8px; padding: 14px; text-align: center; color: var(--muted); margin: 6px }
+.drop.over { border-color: var(--accent); color: var(--accent) }
+#form { padding: 16px; display: grid; gap: 12px }
+.row { display: grid; grid-template-columns: 130px minmax(0, 1fr) minmax(0, 1fr) auto; gap: 8px; align-items: center }
+@media (max-width: 760px) { .row { grid-template-columns: 1fr; } .row label { margin-top: 6px } }
+.row label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em }
+.row.single { grid-template-columns: 130px minmax(0, 1fr) auto }
+@media (max-width: 760px) { .row.single { grid-template-columns: 1fr } }
+input[type=text], textarea { width: 100%; font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--fg) }
+input[lang=ja] { font-family: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", "Meiryo", var(--font) }
+textarea { min-height: 90px; resize: vertical }
+.head { display: grid; grid-template-columns: 130px 1fr 1fr auto; gap: 8px; color: var(--muted); font-size: 12px }
+@media (max-width: 760px) { .head { display: none } }
+.all { font-size: 12px; padding: 4px 8px; white-space: nowrap }
+#info { font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 10px 16px; border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 6px 18px; font-variant-numeric: tabular-nums }
+#status { color: var(--muted); font-size: 13px; min-height: 1.4em }
+.ok { color: var(--ok) } .warn { color: var(--warn) }
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--fg); padding: 0; width: min(760px, calc(100vw - 32px)); max-height: calc(100vh - 32px) }
+dialog::backdrop { background: rgba(0,0,0,.45) }
+dialog form { display: grid; gap: 10px; padding: 18px }
+dialog h2 { margin: 0 0 4px; font-size: 16px }
+.prow { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 8px; align-items: center }
+@media (max-width: 560px) { .prow { grid-template-columns: 1fr } }
+.prow label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em }
+.prow textarea { min-height: 60px }
+.pfoot { display: flex; gap: 8px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 6px }
+.pfoot .msg { flex: 1; min-width: 0; font-size: 12px; color: var(--muted) }
+.pngbox { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
+.pngbox img { height: 40px; border: 1px solid var(--line); border-radius: 4px; image-rendering: pixelated }
+.prow label.chk { display: flex; gap: 6px; align-items: center; font-size: 13px; text-transform: none; letter-spacing: 0; color: var(--fg) }
+kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>GD3 Tag Editor</h1>
+    <div id="status">Ouvre des fichiers .vgm ou .vgz. Les tags japonais sont en UTF-16, saisie directe.</div>
+  </div>
+  <div class="toolbar">
+    <button id="open">Ouvrir…</button>
+    <input id="picker" type="file" accept=".vgm,.vgz,.gz" multiple hidden>
+    <button id="save" class="primary" disabled>Enregistrer</button>
+    <button id="saveAll" disabled>Tout enregistrer</button>
+    <button id="clear" disabled>Vider la liste</button>
+    <button id="pack" disabled>Générer le pack…</button>
+  </div>
+</header>
+<main>
+  <section class="panel">
+    <div id="files"><div class="empty">Aucun fichier</div></div>
+    <div class="drop" id="drop">Glisser des fichiers ou des dossiers ici</div>
+  </section>
+  <section class="panel">
+    <div id="form">
+      <div class="head"><span></span><span>English</span><span>日本語</span><span></span></div>
+      <div class="row"><label for="trackE">Titre</label><input type="text" id="trackE" data-i="0"><input type="text" id="trackJ" data-i="1" lang="ja"><span></span></div>
+      <div class="row"><label for="gameE">Jeu</label><input type="text" id="gameE" data-i="2"><input type="text" id="gameJ" data-i="3" lang="ja"><button class="all" data-all="2,3">→ tous</button></div>
+      <div class="row"><label for="systemE">Système</label><input type="text" id="systemE" data-i="4"><input type="text" id="systemJ" data-i="5" lang="ja"><button class="all" data-all="4,5">→ tous</button></div>
+      <div class="row"><label for="authorE">Compositeur</label><input type="text" id="authorE" data-i="6"><input type="text" id="authorJ" data-i="7" lang="ja"><button class="all" data-all="6,7">→ tous</button></div>
+      <div class="row single"><label for="date">Date (AAAA/MM/JJ)</label><input type="text" id="date" data-i="8" placeholder="1994/12/15"><button class="all" data-all="8">→ tous</button></div>
+      <div class="row single"><label for="creator">Rippé par</label><input type="text" id="creator" data-i="9"><button class="all" data-all="9">→ tous</button></div>
+      <div class="row single"><label for="notes">Notes</label><textarea id="notes" data-i="10"></textarea><button class="all" data-all="10">→ tous</button></div>
+    </div>
+    <div id="info"></div>
+  </section>
+</main>
+<dialog id="packDlg">
+  <form method="dialog" id="packForm">
+    <h2>Pack VGM (zip + m3u + txt + png)</h2>
+    <div class="prow"><label for="p_game">Nom du jeu</label><input type="text" id="p_game"></div>
+    <div class="prow"><label for="p_system">Système</label><input type="text" id="p_system"></div>
+    <div class="prow"><label for="p_hw">Matériel audio</label><input type="text" id="p_hw"></div>
+    <div class="prow"><label for="p_author">Compositeur</label><input type="text" id="p_author"></div>
+    <div class="prow"><label for="p_dev">Développeur</label><input type="text" id="p_dev"></div>
+    <div class="prow"><label for="p_pub">Éditeur</label><input type="text" id="p_pub"></div>
+    <div class="prow"><label for="p_date">Date de sortie</label><input type="text" id="p_date" placeholder="1994-09-19"></div>
+    <div class="prow"><label for="p_creator">Pack créé par</label><input type="text" id="p_creator"></div>
+    <div class="prow"><label for="p_version">Version du pack</label><input type="text" id="p_version" value="1.00"></div>
+    <div class="prow"><label for="p_notes">Notes</label><textarea id="p_notes"></textarea></div>
+    <div class="prow"><label for="p_history">Historique</label><textarea id="p_history"></textarea></div>
+    <div class="prow"><label>Image PNG</label><div class="pngbox"><img id="p_pngimg" alt="" hidden><span id="p_pngname">aucune</span><button type="button" id="p_pngpick">Choisir…</button><input id="p_pngfile" type="file" accept=".png" hidden></div></div>
+    <div class="prow"><label>Pistes</label><label class="chk"><input type="checkbox" id="p_rename" checked> Nommer les fichiers « NN Titre.vgz » d'après le tag titre</label></div>
+    <div class="pfoot"><span class="msg" id="p_msg"></span><button type="button" id="p_cancel">Annuler</button><button type="button" class="primary" id="p_go">Générer le zip</button></div>
+  </form>
+</dialog>
+<script>
+'use strict';
+const FIELDS = 11;
+const files = [];          // {name, bytes (Uint8Array, uncompressed), gz, tags: string[11], dirty, handle}
+let current = -1;
+const $ = id => document.getElementById(id);
+const inputs = [...document.querySelectorAll('[data-i]')];
+
+function le32(b, o) { return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0; }
+function putLe32(b, o, v) { b[o] = v & 255; b[o + 1] = (v >>> 8) & 255; b[o + 2] = (v >>> 16) & 255; b[o + 3] = (v >>> 24) & 255; }
+
+function parseGd3(bytes) {
+  const tags = Array(FIELDS).fill('');
+  const rel = le32(bytes, 0x14);
+  if (!rel) return { tags, ofs: 0, len: 0 };
+  const ofs = rel + 0x14;
+  if (ofs + 12 > bytes.length || String.fromCharCode(...bytes.subarray(ofs, ofs + 4)) !== 'Gd3 ') return { tags, ofs: 0, len: 0 };
+  const len = le32(bytes, ofs + 8);
+  const text = new TextDecoder('utf-16le').decode(bytes.subarray(ofs + 12, Math.min(bytes.length, ofs + 12 + len)));
+  const parts = text.split('\0');
+  for (let i = 0; i < FIELDS; i++) tags[i] = parts[i] || '';
+  return { tags, ofs, len: 12 + len };
+}
+
+function encodeGd3(tags) {
+  const text = tags.map(t => (t || '').replace(/\r\n/g, '\n')).join('\0') + '\0';
+  const out = new Uint8Array(12 + text.length * 2);
+  out.set([0x47, 0x64, 0x33, 0x20]);      // 'Gd3 '
+  putLe32(out, 4, 0x100);
+  putLe32(out, 8, text.length * 2);
+  for (let i = 0; i < text.length; i++) { const c = text.charCodeAt(i); out[12 + i * 2] = c & 255; out[13 + i * 2] = c >> 8; }
+  return out;
+}
+
+// rebuild the file: GD3 removed if it sits at the end, new GD3 appended, header offsets updated
+function rebuild(f) {
+  const g = parseGd3(f.bytes);
+  let body = f.bytes;
+  const eof = le32(body, 4) + 4;
+  if (g.ofs && g.ofs + g.len >= Math.min(eof, body.length) - 1) body = body.subarray(0, g.ofs);
+  else if (g.ofs) body = body.subarray(0, Math.min(eof, body.length));
+  const gd3 = encodeGd3(f.tags);
+  const out = new Uint8Array(body.length + gd3.length);
+  out.set(body); out.set(gd3, body.length);
+  putLe32(out, 0x14, body.length - 0x14);
+  putLe32(out, 0x04, out.length - 4);
+  return out;
+}
+
+function fmtTime(samples) { const s = samples / 44100; return Math.floor(s / 60) + ':' + (s % 60).toFixed(2).padStart(5, '0'); }
+
+async function readFile(file, handle) {
+  let bytes = new Uint8Array(await file.arrayBuffer());
+  const gz = bytes[0] === 0x1f && bytes[1] === 0x8b, raw = gz ? bytes : null;
+  if (gz) {
+    const ds = new DecompressionStream('gzip');
+    const blob = new Blob([bytes]).stream().pipeThrough(ds);
+    bytes = new Uint8Array(await new Response(blob).arrayBuffer());
+  }
+  if (bytes.length < 0x40 || String.fromCharCode(...bytes.subarray(0, 4)) !== 'Vgm ') throw new Error(file.name + ' : pas un fichier VGM');
+  const g = parseGd3(bytes);
+  return { name: file.name, size: file.size, bytes, gz, raw, tags: g.tags, dirty: false, handle, hadGd3: !!g.ofs };
+}
+
+async function addFiles(list, handles) {
+  const errors = [];
+  let skipped = 0;
+  for (let i = 0; i < list.length; i++) {
+    if (files.some(f => f.name === list[i].name && f.size === list[i].size)) { skipped++; continue; }
+    try { files.push(await readFile(list[i], handles ? handles[i] : null)); }
+    catch (e) { errors.push(e.message); }
+  }
+  if (current < 0 && files.length) select(0); else renderList();
+  setStatus((errors.length ? errors.join(' · ') : files.length + ' fichier(s) chargé(s)') + (skipped ? ' · ' + skipped + ' déjà dans la liste' : ''), errors.length ? 'warn' : 'ok');
+}
+
+function setStatus(msg, cls) { const s = $('status'); s.textContent = msg; s.className = cls || ''; }
+document.addEventListener('click', e => { if (!e.target.closest('.rm, #clear')) { pendingRemove.clear(); pendingClear = false; } }, true);
+
+function renderList() {
+  const box = $('files');
+  box.innerHTML = '';
+  if (!files.length) { box.innerHTML = '<div class="empty">Aucun fichier</div>'; return; }
+  files.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'file' + (i === current ? ' active' : '') + (f.dirty ? ' dirty' : '');
+    div.innerHTML = '<span class="name"></span><span class="flag"></span><button class="rm" title="Retirer de la liste">×</button>';
+    div.querySelector('.name').textContent = f.name;
+    div.querySelector('.flag').textContent = (f.gz ? 'vgz' : 'vgm') + (f.hadGd3 ? '' : ' no-tag');
+    div.onclick = () => select(i);
+    div.querySelector('.rm').onclick = e => { e.stopPropagation(); removeFile(i); };
+    box.appendChild(div);
+  });
+  $('save').disabled = current < 0;
+  $('saveAll').disabled = !files.some(f => f.dirty);
+  $('clear').disabled = !files.length;
+  $('pack').disabled = !files.length;
+}
+
+function clearForm() {
+  current = -1;
+  inputs.forEach(inp => { inp.value = ''; });
+  $('info').innerHTML = '';
+  renderList();
+}
+
+// remove one file from the list (unsaved edits are dropped; the file on disk is untouched)
+function removeFile(i) {
+  const f = files[i];
+  if (f.dirty && !pendingRemove.has(f)) {
+    pendingRemove.add(f);
+    setStatus(f.name + ' a des modifications non enregistrées : cliquer × à nouveau pour retirer quand même', 'warn');
+    return;
+  }
+  pendingRemove.delete(f);
+  files.splice(i, 1);
+  if (!files.length) clearForm();
+  else if (current === i) select(Math.min(i, files.length - 1));
+  else { if (current > i) current--; renderList(); }
+  setStatus(f.name + ' retiré de la liste', 'ok');
+}
+const pendingRemove = new Set();
+
+$('clear').onclick = () => {
+  const dirty = files.filter(f => f.dirty).length;
+  if (dirty && !pendingClear) {
+    pendingClear = true;
+    setStatus(dirty + ' fichier(s) non enregistré(s) : cliquer « Vider la liste » à nouveau pour confirmer', 'warn');
+    return;
+  }
+  pendingClear = false;
+  files.length = 0;
+  clearForm();
+  setStatus('Liste vidée', 'ok');
+};
+let pendingClear = false;
+
+function select(i) {
+  current = i;
+  const f = files[i];
+  inputs.forEach(inp => { inp.value = f.tags[+inp.dataset.i] || ''; });
+  const b = f.bytes;
+  const ver = le32(b, 8), total = le32(b, 0x18), loop = le32(b, 0x20);
+  const clk = b.length > 0xD3 ? le32(b, 0xD0) : 0;
+  const info = ['VGM ' + (ver >> 8).toString(16) + '.' + (ver & 255).toString(16).padStart(2, '0'),
+    'durée ' + fmtTime(total), loop ? 'boucle ' + fmtTime(loop) : 'sans boucle',
+    (b.length / 1048576).toFixed(2) + ' Mo'];
+  if (clk) info.push((clk & 0x80000000 ? 'ES5506' : 'ES5505') + ' ' + ((clk & 0x3FFFFFFF) / 1e6).toFixed(3) + ' MHz');
+  $('info').innerHTML = info.map(t => '<span></span>').join('');
+  [...$('info').children].forEach((el, k) => el.textContent = info[k]);
+  renderList();
+}
+
+inputs.forEach(inp => inp.addEventListener('input', () => {
+  if (current < 0) return;
+  const f = files[current];
+  f.tags[+inp.dataset.i] = inp.value;
+  if (!f.dirty) { f.dirty = true; renderList(); }
+}));
+
+document.querySelectorAll('[data-all]').forEach(btn => btn.onclick = () => {
+  if (current < 0) return;
+  const idx = btn.dataset.all.split(',').map(Number);
+  files.forEach((f, i) => { if (i === current) return; idx.forEach(k => { if (f.tags[k] !== files[current].tags[k]) { f.tags[k] = files[current].tags[k]; f.dirty = true; } }); });
+  renderList();
+  setStatus('Champ copié dans ' + (files.length - 1) + ' autre(s) fichier(s)', 'ok');
+});
+
+async function saveFile(f) {
+  let out = rebuild(f);
+  if (f.gz) {
+    const cs = new CompressionStream('gzip');
+    out = new Uint8Array(await new Response(new Blob([out]).stream().pipeThrough(cs)).arrayBuffer());
+  }
+  if (f.handle) {
+    const w = await f.handle.createWritable();
+    await w.write(out); await w.close();
+  } else {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([out], { type: 'application/octet-stream' }));
+    a.download = f.name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+  f.bytes = rebuild(f);
+  f.raw = f.gz ? out : null;
+  f.hadGd3 = true;
+  f.dirty = false;
+}
+
+$('save').onclick = async () => {
+  if (current < 0) return;
+  try { await saveFile(files[current]); renderList(); setStatus(files[current].name + (files[current].handle ? ' enregistré sur place' : ' téléchargé'), 'ok'); }
+  catch (e) { setStatus('Échec : ' + e.message, 'warn'); }
+};
+$('saveAll').onclick = async () => {
+  let n = 0;
+  for (const f of files) if (f.dirty) { try { await saveFile(f); n++; } catch (e) { setStatus('Échec ' + f.name + ' : ' + e.message, 'warn'); return; } }
+  renderList(); setStatus(n + ' fichier(s) enregistré(s)', 'ok');
+};
+
+// open: File System Access API when available (saves in place), else a classic file input (download on save)
+$('open').onclick = async () => {
+  if (window.showOpenFilePicker) {
+    try {
+      const handles = await window.showOpenFilePicker({ multiple: true, types: [{ description: 'VGM', accept: { 'application/octet-stream': ['.vgm', '.vgz'] } }] });
+      const list = [];
+      for (const h of handles) list.push(await h.getFile());
+      await addFiles(list, handles);
+    } catch (e) { if (e.name !== 'AbortError') setStatus(e.message, 'warn'); }
+  } else $('picker').click();
+};
+$('picker').onchange = () => addFiles([...$('picker').files]);
+const drop = $('drop');
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+const isVgm = name => /\.(vgm|vgz)$/i.test(name);
+const pngCandidates = [];   // png handles seen in dropped folders (last one wins as the pack image)
+// collect .vgm/.vgz files under a directory handle, recursively, sorted by name
+async function walkDir(dir, out) {
+  const entries = [];
+  for await (const h of dir.values()) entries.push(h);
+  entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  for (const h of entries) {
+    if (h.kind === 'directory') await walkDir(h, out);
+    else if (isVgm(h.name)) out.push(h);
+    else if (/\.png$/i.test(h.name)) pngCandidates.push(h);
+  }
+}
+drop.ondrop = async e => {
+  e.preventDefault(); drop.classList.remove('over');
+  const items = [...e.dataTransfer.items];
+  if (items.length && items[0].getAsFileSystemHandle) {
+    // the DataTransfer is cleared after the first await: request every handle synchronously first
+    const got = await Promise.all(items.filter(it => it.kind === 'file').map(it => it.getAsFileSystemHandle().catch(() => null)));
+    const handles = [];
+    for (const h of got) {
+      if (!h) continue;
+      if (h.kind === 'directory') await walkDir(h, handles);
+      else handles.push(h);
+    }
+    const list = [];
+    for (const h of handles) list.push(await h.getFile());
+    await addFiles(list, handles);
+  } else await addFiles([...e.dataTransfer.files].filter(f => isVgm(f.name)));
+};
+// the whole page accepts drops; the dashed box is the visual hint
+document.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+document.addEventListener('dragleave', e => { if (!e.relatedTarget) drop.classList.remove('over'); });
+document.addEventListener('drop', e => { if (!drop.contains(e.target)) drop.ondrop(e); });
+
+// ---------------------------------------------------------------- pack generator (vgmrips layout)
+
+// chips by header clock offset (bit 30 = second chip)
+const CHIPS = [[0x0C, 'SN76489'], [0x10, 'YM2413'], [0x2C, 'YM2612'], [0x30, 'YM2151'], [0x38, 'SegaPCM'], [0x40, 'RF5C68'],
+  [0x44, 'YM2203'], [0x48, 'YM2608'], [0x4C, 'YM2610'], [0x50, 'YM3812'], [0x54, 'YM3526'], [0x58, 'Y8950'], [0x5C, 'YMF262'],
+  [0x60, 'YMF278B'], [0x64, 'YMF271'], [0x68, 'YMZ280B'], [0x6C, 'RF5C164'], [0x70, 'PWM'], [0x74, 'AY8910'], [0x80, 'GB DMG'],
+  [0x84, 'NES APU'], [0x88, 'MultiPCM'], [0x8C, 'uPD7759'], [0x90, 'OKIM6258'], [0x98, 'OKIM6295'], [0x9C, 'K051649'],
+  [0xA0, 'K054539'], [0xA4, 'HuC6280'], [0xA8, 'C140'], [0xAC, 'K053260'], [0xB0, 'Pokey'], [0xB4, 'QSound'], [0xB8, 'SCSP'],
+  [0xC0, 'WonderSwan'], [0xC4, 'VSU'], [0xC8, 'SAA1099'], [0xCC, 'ES5503'], [0xD0, 'ES5505'], [0xD8, 'X1-010'], [0xDC, 'C352'],
+  [0xE0, 'GA20'], [0xE4, 'Mikey']];
+function chipsOf(b) {
+  const dataOfs = le32(b, 0x34) + 0x34, hdrEnd = Math.min(dataOfs, b.length), out = [];
+  for (const [o, n] of CHIPS) {
+    if (o + 4 > hdrEnd) continue;
+    const v = le32(b, o);
+    if (!(v & 0x3FFFFFFF)) continue;
+    let name = n;
+    if (o === 0xD0) name = v & 0x80000000 ? 'ES5506' : 'ES5505';
+    if (o === 0x8C && (v & 0x80000000)) name = 'uPD7759';
+    if (o === 0x0C && b.length > 0x2B && le32(b, 0x28)) name = 'SN76489';
+    out.push((v & 0x40000000 ? '2x ' : '') + name);
+  }
+  return out;
+}
+const fsSafe = t => t.replace(/[\/\\:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim();
+const packBase = game => fsSafe(game.replace(/:\s*/g, ' - ')).replace(/ - - /g, ' - ');
+const zipName = (game, sys) => (packBase(game) + '_(' + packBase(sys) + ')').replace(/ /g, '_') + '.zip';
+const mmss = sec => { sec = Math.round(sec); const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0'); };
+// wrap text at `width` chars on spaces; following lines get `indent`
+function wrap(text, width, indent) {
+  const out = [];
+  for (const para of text.split(/\r?\n/)) {
+    let line = '';
+    for (const w of para.split(' ')) {
+      if (line && (line.length + 1 + w.length) > width) { out.push(line); line = indent + w; }
+      else line = line ? line + ' ' + w : w;
+    }
+    out.push(line);
+  }
+  return out;
+}
+function trackEntryName(f, i, rename) {
+  const nn = String(i + 1).padStart(files.length >= 100 ? 3 : 2, '0');
+  const title = (f.tags[0] || '').trim();
+  if (rename && title) return nn + ' ' + fsSafe(title) + '.vgz';
+  return f.name.replace(/\.(vgm|vgz)$/i, '') + '.vgz';
+}
+// name column + total (ends col 40) + loop (ends col 47); a 7-char loop (over an hour) shifts total left by one
+function timeRow(name, tot, lp) {
+  if (lp === '-') return name.padEnd(35) + tot.padStart(5) + '   -';
+  if (lp.length >= 7) return name.padEnd(34) + tot.padStart(5) + ' ' + lp;
+  return name.padEnd(35) + tot.padStart(5) + lp.padStart(7);
+}
+function buildTxt(p, tracks) {
+  const L = [];
+  const field = (label, value) => { if (!value) return; const w = wrap(value, 26, ''); L.push(label.padEnd(21) + w[0]); for (const x of w.slice(1)) L.push(' '.repeat(21) + x); };
+  L.push('*'.repeat(47), '* VGM music package'.padEnd(46) + '*', '* http://vgmrips.net/'.padEnd(46) + '*', '*'.repeat(47));
+  field('Game name:', p.game); field('System:', p.system); field('Music hardware:', p.hw); L.push('');
+  field('Music author:', p.author); field('Game developer:', p.dev); field('Game publisher:', p.pub); field('Game release date:', p.date); L.push('');
+  field('Package created by:', p.creator); field('Package version:', p.version); L.push('');
+  L.push('Song list, in approximate game order:', 'Song name'.padEnd(36) + 'Length:', ' '.repeat(36) + 'Total  Loop');
+  let sumTotal = 0, sumLoop = 0;
+  for (const t of tracks) {
+    const w = wrap(t.label, 34, '   ');
+    for (const x of w.slice(0, -1)) L.push(x);
+    L.push(timeRow(w[w.length - 1], mmss(t.total), t.loop ? mmss(t.loop) : '-'));
+    sumTotal += t.total; sumLoop += t.total + (t.loop || 0);
+  }
+  L.push('', timeRow('Total Length', mmss(sumTotal), mmss(sumLoop)), '', '');
+  if (p.notes.trim()) { L.push('Notes:'); L.push(...wrap(p.notes.trim(), 47, '')); L.push('', ''); }
+  L.push('Package history:'); L.push(...wrap(p.history.trim(), 47, '     ')); L.push('');
+  return L.join('\r\n');
+}
+// ---- stored zip writer
+const CRC = new Uint32Array(256).map((_, n) => { for (let k = 0; k < 8; k++) n = n & 1 ? 0xEDB88320 ^ (n >>> 1) : n >>> 1; return n; });
+function crc32(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function makeZip(entries) {   // [{name, data: Uint8Array}]
+  const enc = new TextEncoder(), now = new Date();
+  const dtime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+  const ddate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  const parts = [], central = []; let ofs = 0;
+  const u16 = v => [v & 255, (v >>> 8) & 255], u32 = v => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255];
+  for (const e of entries) {
+    const name = enc.encode(e.name), crc = crc32(e.data), n = e.data.length;
+    const common = [...u16(20), ...u16(0x800), ...u16(0), ...u16(dtime), ...u16(ddate), ...u32(crc), ...u32(n), ...u32(n), ...u16(name.length)];
+    const local = new Uint8Array([...u32(0x04034b50), ...common, ...u16(0), ...name]);
+    central.push(new Uint8Array([...u32(0x02014b50), ...u16(20), ...common, ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(ofs), ...name]));
+    parts.push(local, e.data); ofs += local.length + n;
+  }
+  const cdSize = central.reduce((a, c) => a + c.length, 0);
+  const eocd = new Uint8Array([...u32(0x06054b50), ...u16(0), ...u16(0), ...u16(entries.length), ...u16(entries.length), ...u32(cdSize), ...u32(ofs), ...u16(0)]);
+  return new Blob([...parts, ...central, eocd], { type: 'application/zip' });
+}
+async function gzipBytes(bytes) {
+  const cs = new CompressionStream('gzip');
+  return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(cs)).arrayBuffer());
+}
+async function saveBlob(blob, name) {
+  if (window.showSaveFilePicker) {
+    const h = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: 'Zip', accept: { 'application/zip': ['.zip'] } }] });
+    const w = await h.createWritable(); await w.write(blob); await w.close(); return 'enregistré';
+  }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000); return 'téléchargé';
+}
+
+let packPng = null;   // {name, bytes}
+const pv = id => $(id).value.trim();
+async function setPng(file) {
+  packPng = { name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) };
+  $('p_pngname').textContent = file.name + ' (' + (packPng.bytes.length / 1024).toFixed(1) + ' Ko)';
+  const img = $('p_pngimg'); img.src = URL.createObjectURL(new Blob([packPng.bytes], { type: 'image/png' })); img.hidden = false;
+}
+$('pack').onclick = async () => {
+  if (!files.length) return;
+  const t = files[0].tags;
+  const today = new Date().toISOString().slice(0, 10);
+  if (!pv('p_game')) $('p_game').value = t[2] || '';
+  if (!pv('p_system')) $('p_system').value = t[4] || '';
+  if (!pv('p_hw')) $('p_hw').value = [...new Set(files.flatMap(f => chipsOf(f.bytes)))].join(', ');
+  if (!pv('p_author')) $('p_author').value = t[6] || '';
+  if (!pv('p_date')) $('p_date').value = (t[8] || '').replace(/\//g, '-');
+  if (!pv('p_creator')) $('p_creator').value = t[9] || '';
+  if (!pv('p_notes')) $('p_notes').value = (t[10] || '').split('\n').find(l => /MAME/.test(l)) ? 'This pack was made using MAME 0.288 VGM mod\n(ES5505/ES5506/ES5510 custom build).' : '';
+  if (!pv('p_history')) $('p_history').value = (pv('p_version') || '1.00') + ' ' + today + ' ' + (pv('p_creator') || t[9] || '') + ': Initial release.';
+  if (!packPng && pngCandidates.length) { try { await setPng(await pngCandidates[pngCandidates.length - 1].getFile()); } catch (e) {} }
+  $('p_msg').textContent = files.length + ' piste(s) dans l\'ordre de la liste';
+  $('packDlg').showModal();
+};
+$('p_cancel').onclick = () => $('packDlg').close();
+$('p_pngpick').onclick = async () => {
+  if (window.showOpenFilePicker) {
+    try { const [h] = await window.showOpenFilePicker({ types: [{ description: 'PNG', accept: { 'image/png': ['.png'] } }] }); await setPng(await h.getFile()); }
+    catch (e) { if (e.name !== 'AbortError') $('p_msg').textContent = e.message; }
+  } else $('p_pngfile').click();
+};
+$('p_pngfile').onchange = () => { if ($('p_pngfile').files[0]) setPng($('p_pngfile').files[0]); };
+$('p_go').onclick = async () => {
+  const p = { game: pv('p_game'), system: pv('p_system'), hw: pv('p_hw'), author: pv('p_author'), dev: pv('p_dev'), pub: pv('p_pub'),
+    date: pv('p_date'), creator: pv('p_creator'), version: pv('p_version'), notes: $('p_notes').value, history: $('p_history').value };
+  if (!p.game) { $('p_msg').textContent = 'Nom du jeu requis'; return; }
+  const rename = $('p_rename').checked, base = packBase(p.game), msg = $('p_msg');
+  $('p_go').disabled = true;
+  try {
+    const entries = [], tracks = [], names = new Set();
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      let name = trackEntryName(f, i, rename);
+      if (names.has(name)) name = name.replace(/\.vgz$/, ' (' + (i + 1) + ').vgz');
+      names.add(name);
+      msg.textContent = 'Compression ' + (i + 1) + '/' + files.length + ' : ' + name;
+      entries.push({ name, data: f.raw && !f.dirty ? f.raw : await gzipBytes(f.bytes) });   // keep the original vgz bytes when untouched
+      tracks.push({ label: name.replace(/\.vgz$/, ''), total: le32(f.bytes, 0x18) / 44100, loop: le32(f.bytes, 0x20) / 44100 });
+    }
+    const enc = new TextEncoder();
+    entries.push({ name: base + '.m3u', data: enc.encode(entries.map(e => e.name).join('\r\n') + '\r\n') });
+    if (packPng) entries.push({ name: base + '.png', data: packPng.bytes });
+    entries.push({ name: base + '.txt', data: enc.encode(buildTxt(p, tracks)) });
+    const blob = makeZip(entries), zn = zipName(p.game, p.system);
+    msg.textContent = 'Écriture de ' + zn + ' (' + (blob.size / 1048576).toFixed(2) + ' Mo)…';
+    const how = await saveBlob(blob, zn);
+    msg.textContent = zn + ' ' + how + (packPng ? '' : ' (sans png)');
+    setStatus('Pack ' + zn + ' ' + how, 'ok');
+  } catch (e) { if (e.name !== 'AbortError') msg.textContent = 'Échec : ' + e.message; else msg.textContent = 'Annulé'; }
+  $('p_go').disabled = false;
+};
+
+document.addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); $('save').click(); } });
+</script>
+</body>
+</html>
