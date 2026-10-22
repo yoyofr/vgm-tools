@@ -926,16 +926,12 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			bool tail[32] = {};
 			for (int v = 0; v < 32; v++)
 				tail[v] = vol(sh, v) > 0x10 && vol(st, v) <= 0x10 && !same_note(v);   // <= 16/255: idle level drivers leave on unused voices
-			ES55xxState before = st;
+			// every register gets the value left by the skipped repetition (a later key-on may rely
+			// on START/END/FC already being set); a tail voice is written stopped
 			for (const RegWrite& w0 : sh.image())
 			{
 				RegWrite w = w0;
-				if (w.page < 0x40 && tail[w.page & 0x1F] && !st.is_global(w.page, w.reg))
-				{
-					if (w.reg != 0 || !((st.running >> (w.page & 0x1F)) & 1)) continue;
-					u32 cr; st.get(w.page, 0, cr);
-					w.value = cr | 3;   // stop it
-				}
+				if (w.reg == 0 && w.page < 0x40 && tail[w.page & 0x1F]) w.value |= 3;
 				u32 cur; bool kn = st.get(w.page, w.reg, cur);
 				if (kn && cur == w.value) continue;
 				emitters[ci].reg(body, w);
@@ -957,10 +953,6 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			for (int v = 0; v < 32; v++)
 			{
 				if (!tail[v]) continue;
-				for (int page : {v, 0x20 + v})
-					for (int r = 0; r < 16; r++)
-						if (!st.is_global(page, r)) { st.regs[page][r] = before.regs[page][r]; st.known[page][r] = before.known[page][r]; }
-				st.running &= ~(1u << v);
 				u32 cr; if (st.get(v, 0, cr)) st.store(v, 0, cr | 3);
 			}
 		}
@@ -1476,16 +1468,18 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 	printf("loop found: first note-on at %s, first repeated note-on at %s, recurs at %s, period %s (%.4f s), %zu matching windows\n",
 	       fmt_pos(t0).c_str(), fmt_pos(t1).c_str(), fmt_pos(t2).c_str(), fmt_pos(t2 - t1).c_str(), (double)(t2 - t1) / SAMPLE_RATE, chosen->windows);
 	lr.start = std::max<i64>(0, t0 - pre);
+	// the loop length is the median period of all recurring note-ons (sample exact when the
+	// driver is frame locked), not the recurrence of one note, which may carry its own jitter
+	i64 period = chosen->per;
+	if (std::llabs((t2 - t1) - period) > SAMPLE_RATE / 1000)
+		printf("note: the first repeated note recurs %.1f ms off the median period, loop length taken from the median\n", (double)((t2 - t1) - period) * 1000 / SAMPLE_RATE);
 	// two constructions: loop body = first repetition (file = intro + 1 repetition), or = second
-	// repetition when the capture holds it (the first one is played once before it, as in the game)
-	i64 period = t2 - t1, t3 = t2 + period;
-	for (size_t m = 0; m < n; m++)
-		if (events[m].t == t2 && events[m].k == events[first_of(t1)].k) { i64 r; if (recurrence_at(m, period, r)) t3 = r; break; }
+	// repetition when the capture holds it (the first one is left out of the stream)
 	lr.loop1 = std::max<i64>(0, t1 - pre);
-	lr.end1 = t2 - pre;
-	lr.has2 = t3 + pre <= search_to;
-	lr.loop2 = std::max<i64>(0, t2 - pre);
-	lr.end2 = t3 - pre;
+	lr.end1 = t1 + period - pre;
+	lr.has2 = t1 + 2 * period + pre <= search_to;
+	lr.loop2 = std::max<i64>(0, t1 + period - pre);
+	lr.end2 = t1 + 2 * period - pre;
 	return true;
 }
 
