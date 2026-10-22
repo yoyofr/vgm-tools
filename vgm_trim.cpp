@@ -788,6 +788,29 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			esp_optimise(esp_init[ci], body_cmds[ci], esp_dead);
 	}
 
+	// A looping file re-enters the loop body with the state of the END of the body, not the state
+	// of the first pass. Writes inside the body may only be dropped when they are redundant in
+	// both passes, so the second pass is tracked from the end-of-range state (vgm_cmp does the same).
+	std::vector<ES55xxState> st_end;
+	std::vector<ES55xxState> st2;      // second-pass state, valid once inside the loop body
+	bool track2 = false;
+	if (has_loop)
+	{
+		st_end.assign({ES55xxState(vgm.is_es5506), ES55xxState(vgm.is_es5506)});
+		vgm.commands([&](const Cmd& c) {
+			if (c.op == 0x66 || c.t >= end) return false;
+			size_t p = c.p;
+			if (c.len < 2) return true;
+			ES55xxState& st = st_end[(d[p + 1] & 0x80) ? 1 : 0];
+			RegWrite rw;
+			if (c.op == 0xBE) st.write8(d[p + 1] & 0x7F, d[p + 2], rw);
+			else if (c.op == 0xD6) st.write16(d[p + 1] & 0x7F, (d[p + 2] << 8) | d[p + 3], rw);
+			else if (c.op == 0xD7) st.ext(d[p + 1] & 0x7F, d[p + 2], d[p + 3]);
+			else if (c.op == 0xE3) st.gain(d[p + 2], (d[p + 3] << 8) | d[p + 4]);
+			return true;
+		});
+	}
+
 	auto flush_wait = [&]() { if (pending_wait) { wait_cmd(body, pending_wait); pending_wait = 0; } };
 	auto emit_init = [&]() {
 		if (init_emitted) return;
@@ -807,12 +830,43 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 				emitters[ci].init(body, st);
 		}
 	};
+	// voices whose state at the loop point (first pass) differs from the state at the end of the
+	// loop body (what the second pass starts with)
+	auto loop_report = [&]() {
+		for (int ci = 0; ci < 2; ci++)
+		{
+			ES55xxState& a = states[ci];
+			ES55xxState& b = st_end[ci];
+			if (!a.reg_count && !b.reg_count) continue;
+			int sustained = 0, stopped = 0, changed = 0;
+			for (int v = 0; v < 32; v++)
+			{
+				bool r1 = (a.running >> v) & 1, r2 = (b.running >> v) & 1;
+				if (r1 && !r2) { sustained++; continue; }
+				if (!r1 && r2) { stopped++; continue; }
+				if (!r1) continue;
+				bool diff = false;
+				for (int pg = 0; pg < 2 && !diff; pg++)
+					for (int r = 0; r < 16; r++)
+					{
+						u32 x, y; bool kx = a.get(pg * 0x20 + v, r, x), ky = b.get(pg * 0x20 + v, r, y);
+						if (kx != ky || (kx && x != y)) { diff = true; break; }
+					}
+				if (diff) { changed++; }
+			}
+			if (sustained || stopped || changed)
+				printf("loop point, chip %d: voice state differs between the loop point and the end of the loop body "
+				       "(%d voices still playing at the loop point only, %d at the end only, %d with other parameters); "
+				       "the second pass converges as the driver re-keys them\n", ci + 1, sustained, stopped, changed);
+		}
+	};
 	auto mark_loop = [&]() {
 		if (has_loop && loop_body_ofs < 0)
 		{
 			flush_wait();
 			loop_body_ofs = body.size();
 			emitters[0].out_page = emitters[1].out_page = -1;
+			if (!st_end.empty()) { st2 = st_end; track2 = do_cmp; loop_report(); }
 		}
 	};
 
@@ -852,22 +906,49 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 		int ci = (c.len > 1 && (d[p + 1] & 0x80)) ? 1 : 0;
 		ES55xxState& st = states[ci];
 		Emitter& em = emitters[ci];
-		RegWrite rw;
+		RegWrite rw, rw2;
 		int nwrites = -1;      // -1: not a register write
 		bool raw_changed = true;
+		bool in_body = track2 && c.t >= start && c.t < end;
 		if (op == 0xBE)
+		{
 			nwrites = st.write8(d[p + 1] & 0x7F, d[p + 2], rw);
+			if (in_body) st2[ci].write8(d[p + 1] & 0x7F, d[p + 2], rw2);
+		}
 		else if (op == 0xD6)
+		{
 			nwrites = st.write16(d[p + 1] & 0x7F, (d[p + 2] << 8) | d[p + 3], rw);
+			if (in_body) st2[ci].write16(d[p + 1] & 0x7F, (d[p + 2] << 8) | d[p + 3], rw2);
+		}
 		else if (op == 0xD7)
+		{
 			raw_changed = st.ext(d[p + 1] & 0x7F, d[p + 2], d[p + 3]) || (d[p + 1] & 0x7F) == 0x03;
+			if (in_body) raw_changed |= st2[ci].ext(d[p + 1] & 0x7F, d[p + 2], d[p + 3]);
+		}
 		else if (op == 0xD8)
 		{
 			st.esp_cmds.push_back({(u8)(d[p + 1] & 0x7F), d[p + 2], d[p + 3]});
 			raw_changed = esp_dead.count(p) == 0;
 		}
 		else if (op == 0xE3)
+		{
 			raw_changed = st.gain(d[p + 2], (d[p + 3] << 8) | d[p + 4]);
+			if (in_body) raw_changed |= st2[ci].gain(d[p + 2], (d[p + 3] << 8) | d[p + 4]);
+		}
+		if (in_body && nwrites > 0 && rw.reg != PAGE_REG)
+		{
+			// keep the write when it changes the register in the second pass; a byte-lane write
+			// becomes a full write when the other lane differs in the second pass (if that lane is
+			// host-owned); lane_opt may only skip a lane that is equal in both passes
+			if (rw2.changed) rw.changed = true;
+			if (!rw2.has_prev || rw2.prev != rw.prev) rw.has_prev = false;
+			if (rw.lane >= 0)
+			{
+				u32 om = (rw.lane == 0 ? 0x00FF : 0xFF00) & st.mask(rw.page, rw.reg);
+				bool other_differs = !rw2.has_prev || ((rw2.prev ^ rw.value) & om) != 0;
+				if (other_differs && Emitter::lane_trusted(page_group(rw.page), rw.reg, 1 - rw.lane)) rw.lane = -1;
+			}
+		}
 		if (c.t < start) { stats.skipped++; return true; }
 		if (c.t >= end) return true;
 		emit_init();
@@ -1223,10 +1304,12 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 	if (first == SIZE_MAX) return false;
 	i64 t1 = events[first].t, t2;
 	recurrence_at(first, period, t2);
-	printf("loop found: first repeated note-on at %s, recurs at %s, period %s (%.4f s), %zu matching windows\n",
-	       fmt_pos(t1).c_str(), fmt_pos(t2).c_str(), fmt_pos(t2 - t1).c_str(), (double)(t2 - t1) / SAMPLE_RATE, sel.size());
-	r_start = std::max<i64>(0, t1 - pre);
-	r_loop = r_start;
+	i64 t0 = t1;   // first note-on of the range: the intro before the loop body is kept
+	for (size_t i = 0; i < n; i++) if (events[i].t >= search_from) { t0 = events[i].t; break; }
+	printf("loop found: first note-on at %s, first repeated note-on at %s, recurs at %s, period %s (%.4f s), %zu matching windows\n",
+	       fmt_pos(t0).c_str(), fmt_pos(t1).c_str(), fmt_pos(t2).c_str(), fmt_pos(t2 - t1).c_str(), (double)(t2 - t1) / SAMPLE_RATE, sel.size());
+	r_start = std::max<i64>(0, t0 - pre);
+	r_loop = std::max<i64>(0, t1 - pre);
 	r_end = t2 - pre;
 	return true;
 }
@@ -1447,7 +1530,7 @@ int main(int argc, char** argv)
 	if (f_activity) { activity(vgm, parse_pos(gap), false); return 0; }
 	if (f_info || output.empty()) { info(vgm); return 0; }
 
-	struct Job { i64 start, loop, end; bool has_loop; std::string output; };
+	struct Job { i64 start, loop, end; bool has_loop; std::string output; bool explicit_start; };
 	std::vector<Job> jobs;
 	if (f_auto)
 	{
@@ -1494,11 +1577,11 @@ int main(int argc, char** argv)
 		}
 		for (size_t i : wanted)
 			jobs.push_back({std::max<i64>(0, segs[i].first - parse_pos(pre)), 0, std::min<i64>(vgm.total, segs[i].second + parse_pos(post)), false,
-			                track == "all" ? track_name(output, (int)i + 1) : output});
+			                track == "all" ? track_name(output, (int)i + 1) : output, true});
 	}
 	else
 		jobs.push_back({start_s.empty() ? 0 : parse_pos(start_s), loop_s.empty() ? 0 : parse_pos(loop_s),
-		                end_s.empty() ? (i64)vgm.total : parse_pos(end_s), !loop_s.empty(), output});
+		                end_s.empty() ? (i64)vgm.total : parse_pos(end_s), !loop_s.empty(), output, !start_s.empty()});
 
 	for (Job& job : jobs)
 	{
@@ -1510,7 +1593,12 @@ int main(int argc, char** argv)
 			{
 				printf("%s: no loop found, written without loop\n", job.output.c_str());
 			}
-			else { job.start = s; job.loop = l; job.end = std::min(e, job.end); job.has_loop = true; }
+			else
+			{
+				// an explicit start (--start or a detected segment) is kept; otherwise start at the first note-on
+				if (!job.explicit_start) job.start = s;
+				job.loop = std::max(l, job.start); job.end = std::min(e, job.end); job.has_loop = true;
+			}
 		}
 		if (job.has_loop && !(job.start <= job.loop && job.loop < job.end)) die("loop point must be within [start, end)");
 		TrimStats stats;
