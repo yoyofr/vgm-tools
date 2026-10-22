@@ -757,9 +757,16 @@ static void esp_optimise(std::vector<EspCmd>& init, const std::vector<EspCmd>& b
 // ---------------------------------------------------------------------------------------------
 struct TrimStats { i64 kept = 0, dropped = 0, skipped = 0; size_t rom_bytes = 0; };
 
+// skip_from..skip_to: commands of that range are not emitted (the first repetition of a song whose
+// loop body is taken from the second one); the state they leave is re-created at the splice, except
+// the key-ons of voices that only play there
 static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 end, bool do_cmp, bool do_sro, bool keep_gd3,
-                  i64 sro_margin, i64 sro_gap, TrimStats& stats)
+                  i64 sro_margin, i64 sro_gap, TrimStats& stats, i64 skip_from = 0, i64 skip_to = 0)
 {
+	const bool skip = skip_to > skip_from;
+	ES55xxState shadow[2] = {ES55xxState(vgm.is_es5506), ES55xxState(vgm.is_es5506)};
+	bool shadow_init = false;
+	std::vector<EspCmd> esp_splice[2];
 	const u8* d = vgm.data.data();
 	ES55xxState states[2] = {ES55xxState(vgm.is_es5506), ES55xxState(vgm.is_es5506)};
 	Emitter emitters[2] = {Emitter(vgm.is_es5506, 0x00), Emitter(vgm.is_es5506, 0x80)};
@@ -771,22 +778,27 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 	std::set<size_t> esp_dead;
 	std::vector<EspCmd> esp_init[2];
 
-	if (do_cmp)
+	if (do_cmp || skip)
 	{
-		emitters[0].lane_opt = emitters[1].lane_opt = true;
-		std::vector<EspCmd> body_cmds[2];
+		if (do_cmp) emitters[0].lane_opt = emitters[1].lane_opt = true;
+		std::vector<EspCmd> body_cmds[2], after_cmds[2];
 		vgm.commands([&](const Cmd& c) {
 			if (c.op == 0xD8)
 			{
 				int ci = (d[c.p + 1] & 0x80) ? 1 : 0;
 				EspCmd e{c.p, (u8)(d[c.p + 1] & 0x7F), d[c.p + 2], d[c.p + 3]};
 				if (c.t < start) esp_init[ci].push_back(e);
-				else if (c.t < end) body_cmds[ci].push_back(e);
+				else if (c.t >= end) return false;
+				else if (skip && c.t >= skip_from && c.t < skip_to) esp_splice[ci].push_back(e);
+				else { body_cmds[ci].push_back(e); if (skip && c.t >= skip_to) after_cmds[ci].push_back(e); }
 			}
 			return true;
 		});
 		for (int ci = 0; ci < 2; ci++)
-			esp_optimise(esp_init[ci], body_cmds[ci], esp_dead);
+		{
+			if (do_cmp) esp_optimise(esp_init[ci], body_cmds[ci], esp_dead);
+			if (skip) { std::set<size_t> scratch; esp_optimise(esp_splice[ci], after_cmds[ci], scratch); }
+		}
 	}
 
 	// A looping file re-enters the loop body with the state of the END of the body, not the state
@@ -795,6 +807,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 	std::vector<ES55xxState> st_end;
 	std::vector<ES55xxState> st2;      // second-pass state, valid once inside the loop body
 	bool track2 = false;
+	bool keyed_in_body[2][32] = {};    // voice keyed on inside the loop body (after the skipped part)
 	if (has_loop)
 	{
 		st_end.assign({ES55xxState(vgm.is_es5506), ES55xxState(vgm.is_es5506)});
@@ -802,10 +815,13 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			if (c.op == 0x66 || c.t >= end) return false;
 			size_t p = c.p;
 			if (c.len < 2) return true;
-			ES55xxState& st = st_end[(d[p + 1] & 0x80) ? 1 : 0];
+			int ci = (d[p + 1] & 0x80) ? 1 : 0;
+			ES55xxState& st = st_end[ci];
 			RegWrite rw;
-			if (c.op == 0xBE) st.write8(d[p + 1] & 0x7F, d[p + 2], rw);
-			else if (c.op == 0xD6) st.write16(d[p + 1] & 0x7F, (d[p + 2] << 8) | d[p + 3], rw);
+			int n = 0;
+			if (c.op == 0xBE) n = st.write8(d[p + 1] & 0x7F, d[p + 2], rw);
+			else if (c.op == 0xD6) n = st.write16(d[p + 1] & 0x7F, (d[p + 2] << 8) | d[p + 3], rw);
+			if (n && rw.reg == 0 && rw.page < 0x40 && !(rw.value & 3) && c.t >= loop) keyed_in_body[ci][rw.page & 0x1F] = true;
 			else if (c.op == 0xD7) st.ext(d[p + 1] & 0x7F, d[p + 2], d[p + 3]);
 			else if (c.op == 0xE3) st.gain(d[p + 2], (d[p + 3] << 8) | d[p + 4]);
 			return true;
@@ -861,10 +877,99 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 				       "the second pass converges as the driver re-keys them\n", ci + 1, sustained, stopped, changed);
 		}
 	};
+	// re-create, before the loop point, the state left by the skipped repetition: registers that
+	// differ, board state, ESP host writes; a voice that only plays in the skipped part stays stopped
+	auto emit_splice = [&]() {
+		if (!shadow_init) return;
+		for (int ci = 0; ci < 2; ci++)
+		{
+			ES55xxState& st = states[ci];
+			const ES55xxState& sh = shadow[ci];
+			if (!sh.reg_count && sh.esp_cmds.empty()) continue;
+			// a voice that only plays in the skipped repetition stays stopped, unless it is still
+			// playing the same note at the end of the loop body (a layer that is never re-keyed:
+			// it belongs to the loop's steady state and is keyed here)
+			auto same_note = [&](int v) {
+				if (st_end.empty() || !((st_end[ci].running >> v) & 1) || keyed_in_body[ci][v]) return false;
+				const int lo_regs[2] = {2, 4}, hi_regs[2] = {1, 2};   // ES5505 START/END hi words, ES5506 START/END
+				for (int k = 0; k < 2; k++)
+				{
+					int page = vgm.is_es5506 ? 0x20 + v : v, reg = vgm.is_es5506 ? hi_regs[k] : lo_regs[k];
+					u32 a, b; bool ka = const_cast<ES55xxState&>(sh).get(page, reg, a), kb = st_end[ci].get(page, reg, b);
+					if (ka != kb || (ka && a != b)) return false;
+				}
+				return true;
+			};
+			// same note in the emitted state and in the skipped repetition's end state?
+			auto note_equal = [&](int v) {
+				const int lo_regs[2] = {2, 4}, hi_regs[2] = {1, 2};
+				for (int k = 0; k < 2; k++)
+				{
+					int page = vgm.is_es5506 ? 0x20 + v : v, reg = vgm.is_es5506 ? hi_regs[k] : lo_regs[k];
+					u32 a, b; bool ka = const_cast<ES55xxState&>(sh).get(page, reg, a), kb = st.get(page, reg, b);
+					if (ka != kb || (ka && a != b)) return false;
+				}
+				return true;
+			};
+			// tail voices: audible at the end of the skipped repetition but silent in the emitted
+			// stream (stopped, or running at zero volume as drivers leave idle voices). They are
+			// stopped here so that the volume refreshes of the loop body keep them silent in the
+			// first pass, as in the game's first repetition; the loop pass has them from the end
+			// state. A layer still playing the same note at the end of the loop body is keyed instead.
+			auto vol = [&](const ES55xxState& x, int v) -> int {
+				if (!((x.running >> v) & 1)) return 0;
+				ES55xxState& y = const_cast<ES55xxState&>(x);
+				u32 l = 0, r = 0;
+				if (vgm.is_es5506) { y.get(v, 2, l); y.get(v, 4, r); return std::max(l >> 8, r >> 8); }
+				y.get(v, 8, l); y.get(v, 9, r); return std::max(l >> 8, r >> 8);
+			};
+			bool tail[32] = {};
+			for (int v = 0; v < 32; v++)
+				tail[v] = vol(sh, v) > 0x10 && vol(st, v) <= 0x10 && !same_note(v);   // <= 16/255: idle level drivers leave on unused voices
+			ES55xxState before = st;
+			for (const RegWrite& w0 : sh.image())
+			{
+				RegWrite w = w0;
+				if (w.page < 0x40 && tail[w.page & 0x1F] && !st.is_global(w.page, w.reg))
+				{
+					if (w.reg != 0 || !((st.running >> (w.page & 0x1F)) & 1)) continue;
+					u32 cr; st.get(w.page, 0, cr);
+					w.value = cr | 3;   // stop it
+				}
+				u32 cur; bool kn = st.get(w.page, w.reg, cur);
+				if (kn && cur == w.value) continue;
+				emitters[ci].reg(body, w);
+			}
+			u8 cs = ci ? 0x80 : 0x00;
+			for (auto& kv : sh.region_alias) { auto it = st.region_alias.find(kv.first); if (it == st.region_alias.end() || it->second != kv.second) { body.insert(body.end(), {0xD7, u8(0x02 | cs), u8(kv.first), u8(kv.second)}); } }
+			for (auto& kv : sh.region_window) { auto it = st.region_window.find(kv.first); if (it == st.region_window.end() || it->second != kv.second) { body.insert(body.end(), {0xD7, u8(0x01 | cs), u8(kv.first), u8(kv.second)}); } }
+			for (auto& kv : sh.voice_bank)
+			{
+				auto it = st.voice_bank.find(kv.first);
+				if (it != st.voice_bank.end() && it->second == kv.second) continue;
+				if (kv.second <= 0xFF) body.insert(body.end(), {0xD7, u8(0x00 | cs), u8(kv.first), u8(kv.second)});
+				else { body.push_back(0xD6); body.push_back(u8(0x40 | kv.first | cs)); push_be16(body, kv.second); }
+			}
+			if (sh.irq_autoack >= 0 && sh.irq_autoack != st.irq_autoack) body.insert(body.end(), {0xD7, u8(0x04 | cs), 0x00, u8(sh.irq_autoack)});
+			for (auto& kv : sh.gains) { auto it = st.gains.find(kv.first); if (it == st.gains.end() || it->second != kv.second) { body.push_back(0xE3); body.push_back(cs); body.push_back(u8(kv.first)); push_be16(body, kv.second); } }
+			for (const EspCmd& e : esp_splice[ci]) body.insert(body.end(), &d[e.tag], &d[e.tag + 4]);
+			st = sh;
+			for (int v = 0; v < 32; v++)
+			{
+				if (!tail[v]) continue;
+				for (int page : {v, 0x20 + v})
+					for (int r = 0; r < 16; r++)
+						if (!st.is_global(page, r)) { st.regs[page][r] = before.regs[page][r]; st.known[page][r] = before.known[page][r]; }
+				st.running &= ~(1u << v);
+				u32 cr; if (st.get(v, 0, cr)) st.store(v, 0, cr | 3);
+			}
+		}
+	};
 	auto mark_loop = [&]() {
 		if (has_loop && loop_body_ofs < 0)
 		{
 			flush_wait();
+			if (skip) emit_splice();
 			loop_body_ofs = body.size();
 			emitters[0].out_page = emitters[1].out_page = -1;
 			if (!st_end.empty()) { st2 = st_end; track2 = do_cmp; loop_report(); }
@@ -895,17 +1000,29 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			emit_init();
 			a = std::max(a, start);
 			b = std::min(b, end);
-			if (has_loop && loop_body_ofs < 0 && a <= loop && loop < b)
+			auto add_span = [&](i64 sa, i64 sb) {
+				if (has_loop && loop_body_ofs < 0 && sa <= loop && loop < sb)
+				{
+					pending_wait += loop - sa;
+					mark_loop();
+					sa = loop;
+				}
+				pending_wait += sb - sa;
+			};
+			if (skip)
 			{
-				pending_wait += loop - a;
-				mark_loop();
-				a = loop;
+				if (b > skip_from && !shadow_init) { shadow[0] = states[0]; shadow[1] = states[1]; shadow_init = true; }
+				if (std::min(b, skip_from) > a) add_span(a, std::min(b, skip_from));
+				if (b > std::max(a, skip_to)) add_span(std::max(a, skip_to), b);
 			}
-			pending_wait += b - a;
+			else
+				add_span(a, b);
 			return true;
 		}
 		int ci = (c.len > 1 && (d[p + 1] & 0x80)) ? 1 : 0;
-		ES55xxState& st = states[ci];
+		const bool in_skip = skip && c.t >= skip_from && c.t < skip_to;
+		if (in_skip && !shadow_init) { shadow[0] = states[0]; shadow[1] = states[1]; shadow_init = true; }
+		ES55xxState& st = in_skip ? shadow[ci] : states[ci];
 		Emitter& em = emitters[ci];
 		RegWrite rw, rw2;
 		int nwrites = -1;      // -1: not a register write
@@ -950,7 +1067,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 				if (other_differs && Emitter::lane_trusted(page_group(rw.page), rw.reg, 1 - rw.lane)) rw.lane = -1;
 			}
 		}
-		if (c.t < start) { stats.skipped++; return true; }
+		if (c.t < start || in_skip) { stats.skipped++; return true; }
 		if (c.t >= end) return true;
 		emit_init();
 		if (has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
@@ -995,7 +1112,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 		if (out.size() < 0x100) { out.resize(0x100, 0); put_le32(&out[0x34], 0x100 - 0x34); }
 	}
 	size_t data_start = out.size();
-	put_le32(&out[0x18], (u32)(end - start));
+	put_le32(&out[0x18], (u32)(end - start - (skip ? skip_to - skip_from : 0)));
 	if (has_loop)
 	{
 		put_le32(&out[0x1C], (u32)(data_start + blocks.size() + loop_body_ofs - 0x1C));
@@ -1626,8 +1743,8 @@ static void usage()
 	        "  --start P --end P      trim range (samples, \"12.5s\" or \"m:ss.sss\")\n"
 	        "  --loop P               loop point\n"
 	        "  --find-loop            locate the loop from the note-on sequence (within --start/--end)\n"
-	        "  --loop-pass N          --find-loop: 1 = loop body is the 1st repetition (file = intro + 1 repetition), 2 = the 2nd one\n"
-	        "                         (seamless, file = intro + 2 repetitions); default: 2 only when the loop re-entry would cut voices\n"
+	        "  --loop-pass N          --find-loop: 1 = loop body is the 1st repetition, 2 = the 2nd one (seamless loop, the 1st is\n"
+	        "                         left out, file = intro + 1 repetition); default: 2 only when the loop re-entry would cut voices\n"
 	        "  --cmp                  drop register writes that do not change the chip state\n"
 	        "  --sro                  keep only the sample ROM ranges that are played\n"
 	        "  --sro-margin N         --sro: margin in words around each used range (default 256)\n"
@@ -1695,7 +1812,7 @@ int main(int argc, char** argv)
 	if (f_activity) { activity(vgm, parse_pos(gap), false); return 0; }
 	if (f_info || output.empty()) { info(vgm); return 0; }
 
-	struct Job { i64 start, loop, end; bool has_loop; std::string output; bool explicit_start; };
+	struct Job { i64 start, loop, end; bool has_loop; std::string output; bool explicit_start; i64 skip_from = 0, skip_to = 0; };
 	std::vector<Job> jobs;
 	std::unique_ptr<Wav> render;   // rendered capture (--split wav), also used to verify the loop candidates
 	if (f_auto)
@@ -1771,7 +1888,7 @@ int main(int argc, char** argv)
 					{
 						pass = 2;
 						printf("loop re-entry would cut %d voice(s) still sounding at the end of the first repetition: "
-						       "looping on the second repetition (file = intro + 2 repetitions)\n", cut);
+						       "taking the loop body from the second repetition\n", cut);
 					}
 					else
 					{
@@ -1786,7 +1903,12 @@ int main(int argc, char** argv)
 					pass = 1;
 					printf("warning: capture too short to loop on the second repetition (needs %s): looping on the first one\n", fmt_pos(lr.end2 + 2205).c_str());
 				}
-				if (pass == 2) { l = lr.loop2; e = lr.end2; printf("loop body = second repetition %s .. %s\n", fmt_pos(l).c_str(), fmt_pos(e).c_str()); }
+				if (pass == 2)
+				{
+					l = lr.loop2; e = lr.end2; job.skip_from = lr.loop1; job.skip_to = lr.loop2;
+					printf("loop body = second repetition %s .. %s, the first one (%s .. %s) is left out: the file plays intro + one repetition\n",
+					       fmt_pos(l).c_str(), fmt_pos(e).c_str(), fmt_pos(lr.loop1).c_str(), fmt_pos(lr.loop2).c_str());
+				}
 				else { l = lr.loop1; e = lr.end1; }
 			}
 			if (!found)
@@ -1802,7 +1924,7 @@ int main(int argc, char** argv)
 		}
 		if (job.has_loop && !(job.start <= job.loop && job.loop < job.end)) die("loop point must be within [start, end)");
 		TrimStats stats;
-		Bytes out = trim(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats);
+		Bytes out = trim(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats, job.skip_from, job.skip_to);
 		write_output(job.output, out);
 		printf("%s -> %s: %s .. %s%s, %lld writes kept, %lld dropped (--cmp), %lld commands before start, ROM data %zu bytes; %zu -> %zu bytes\n",
 		       input.c_str(), job.output.c_str(), fmt_pos(job.start).c_str(), fmt_pos(job.end).c_str(),
