@@ -240,6 +240,66 @@ struct ES55xxState
 	std::vector<std::array<u8, 3>> esp_cmds;
 	u32 running = 0;    // bit per voice
 	std::vector<Range> rom_used[4];
+	// playback position of each voice in host accumulator units, advanced from the host FC at
+	// the chip sample rate (clock / (16 * (ACT + 1))), so that the state at any time can be
+	// re-created with the sample where it actually is
+	i64 now = 0;
+	u32 clock = 0;
+	double pos[32] = {};
+	i64 pos_t[32] = {};
+	bool pos_ok[32] = {};
+
+	double chip_rate()
+	{
+		u32 act = 0;
+		if (is_es5506) { if (!gknown[GL][11] || !(act = gregs[GL][11])) act = gknown[GH][11] ? gregs[GH][11] : 0x1F; }
+		else { if (!gknown[GL][13] || !(act = gregs[GL][13])) act = gknown[GH][13] ? gregs[GH][13] : 0x1F; }
+		return clock ? (double)clock / (16.0 * ((act & 0x1F) + 1)) : 29761.0;
+	}
+	u32 fc_of(int v) { u32 f = 0; get(v, 1, f); return is_es5506 ? (f & 0x1FFFF) : (f & 0xFFFE); }
+	u32 start_of(int v) { u32 h = 0, l = 0; if (is_es5506) { get(0x20 + v, 1, h); return h; } get(v, 2, h); get(v, 3, l); return ((h & 0x1FFF) << 16) | (l & 0xFFFF); }
+	u32 end_of(int v) { u32 h = 0, l = 0; if (is_es5506) { get(0x20 + v, 2, h); return h; } get(v, 4, h); get(v, 5, l); return ((h & 0x1FFF) << 16) | (l & 0xFFFF); }
+	u32 acc_of(int v) { u32 h = 0, l = 0; if (is_es5506) { get(0x20 + v, 3, h); return h; } get(v, 10, h); get(v, 11, l); return ((h & 0x1FFF) << 16) | (l & 0xFFFF); }
+	// move voice v from its last known position to time t (host units: FC/2 per chip sample)
+	void advance(int v, i64 t)
+	{
+		if (!pos_ok[v] || !((running >> v) & 1) || t <= pos_t[v]) { pos_t[v] = t; return; }
+		u32 cr = 0; get(v, 0, cr);
+		double step = (double)fc_of(v) * 0.5 * ((double)(t - pos_t[v]) * chip_rate() / SAMPLE_RATE);
+		double st_ = start_of(v), en = end_of(v), L = en - st_;
+		int mode = cr & 0x18;   // LPE 0x08, BLE 0x10
+		bool dir = (cr & 0x40) != 0;   // DIR: the chip flips it at each end of a bi-directional loop
+		double p = pos[v];
+		if (L <= 0) { p += dir ? -step : step; pos[v] = std::max(st_, std::min(en, p)); pos_t[v] = t; return; }
+		if (mode == 0x08)   // uni-directional loop
+		{
+			p += dir ? -step : step;
+			if (p > en) p = st_ + fmod(p - en, L);
+			else if (p < st_) p = en - fmod(st_ - p, L);
+		}
+		else if (mode == 0x18)   // bi-directional: bounce between START and END, the first pass may begin below START
+		{
+			double left = step;
+			int guard = 0;
+			while (left > 0 && guard++ < 100000)
+			{
+				double room = dir ? (p - st_) : (en - p);
+				if (room < 0) room = 0;
+				if (left <= room) { p += dir ? -left : left; left = 0; break; }
+				left -= room; p = dir ? st_ : en; dir = !dir;
+				if (left > 4 * L) left = fmod(left, 2 * L);   // skip whole round trips
+			}
+			u32* vp; bool* kn; slot(v, 0, vp, kn);
+			*vp = (*vp & ~0x40u) | (dir ? 0x40u : 0u);
+		}
+		else   // one shot: the chip stops the voice at the end
+		{
+			p += dir ? -step : step;
+			if ((!dir && p > en) || (dir && p < st_)) { p = dir ? st_ : en; running &= ~(1u << v); u32* vp; bool* kn; slot(v, 0, vp, kn); *vp |= 1; }
+		}
+		pos[v] = p; pos_t[v] = t;
+	}
+	void restart_positions(i64 t) { for (int v = 0; v < 32; v++) { pos[v] = acc_of(v); pos_t[v] = t; pos_ok[v] = true; } }
 
 	explicit ES55xxState(bool es5506) : is_es5506(es5506)
 	{
@@ -344,6 +404,13 @@ struct ES55xxState
 			page_ = value;
 			return RegWrite{page, reg, value, changed, -1, false, 0};
 		}
+		{
+			int voice = page & 0x1F;
+			bool low = page < 0x20, high = page >= 0x20 && page < 0x40;
+			bool is_act = is_es5506 ? (reg == 11 && page < 0x40) : (reg == 13 && page < 0x40);
+			if (is_act) { for (int w = 0; w < 32; w++) advance(w, now); }
+			else if ((low && (reg == 0 || reg == 1)) || (page < 0x40 && reg == 0)) advance(voice, now);   // CR, FC
+		}
 		u32* v; bool* k; slot(page, reg, v, k);
 		bool had = *k;
 		u32 old = *v;
@@ -359,6 +426,11 @@ struct ES55xxState
 			}
 			else if ((running >> voice) & 1)
 				note_rom_use(voice);
+			// a host write of the accumulator places the voice
+			if ((!is_es5506 && page < 0x20 && (reg == 10 || reg == 11)) || (is_es5506 && page >= 0x20 && reg == 3))
+			{
+				pos[voice] = acc_of(voice); pos_t[voice] = now; pos_ok[voice] = true;
+			}
 		}
 		return RegWrite{page, reg, value, !had || old != value, -1, had, old};
 	}
@@ -566,6 +638,45 @@ struct Emitter
 		if (out_page != page) { out_page = page; page_cmd(out, page); }
 	}
 
+	// every voice as it plays at time t: registers, computed playback position, then CR (a stopped
+	// voice only gets its CR), plus ACT; makes the chip state equal to `st` whatever it was before
+	void voice_image(Bytes& out, ES55xxState& st, i64 t)
+	{
+		auto w = [&](int page, int reg, u32 value) { reg_write(out, RegWrite{page, reg, value & st.mask(page, reg), true, -1, false, 0}); };
+		// ACT is not rewritten: a write changes the chip sample rate and restarts the player's
+		// resampler (a 30 ms dropout), and the body logs any real change anyway
+		int dbg_run = 0, dbg_stop = 0;
+		for (int v = 0; v < 32; v++)
+		{
+			u32 cr = 0;
+			if (!st.get(v, 0, cr)) continue;
+			if (!((st.running >> v) & 1)) { w(v, 0, cr | 3); dbg_stop++; continue; }
+			st.advance(v, t);
+			st.get(v, 0, cr);   // DIR may have been flipped by the bi-directional loop model
+			if (!((st.running >> v) & 1)) { w(v, 0, cr | 3); dbg_stop++; continue; }
+			dbg_run++;
+			u32 acc = (u32)std::llround(std::max(0.0, st.pos[v]));
+			u32 x;
+			if (is_es5506)
+			{
+				for (int r = 1; r <= 0x0A; r++) if (st.get(v, r, x)) w(v, r, x);
+				if (st.get(0x20 + v, 1, x)) w(0x20 + v, 1, x);
+				if (st.get(0x20 + v, 2, x)) w(0x20 + v, 2, x);
+				w(0x20 + v, 3, acc);
+			}
+			else
+			{
+				for (int r = 1; r <= 9; r++) if (st.get(v, r, x)) w(v, r, x);
+				w(v, 10, (acc >> 16) & 0x1FFF);
+				w(v, 11, acc & 0xFFFF);
+			}
+			st.pos[v] = acc; st.pos_t[v] = t; st.pos_ok[v] = true;
+			w(v, 0, cr);
+		}
+		(void)dbg_run; (void)dbg_stop;
+	}
+	void reg_write(Bytes& out, const RegWrite& w) { reg(out, w); }
+
 	void init(Bytes& out, const ES55xxState& st)
 	{
 		for (auto& kv : st.region_alias) { out.push_back(0xD7); out.push_back(0x02 | cs); out.push_back(kv.first); out.push_back(kv.second); }
@@ -769,6 +880,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 	std::vector<EspCmd> esp_splice[2];
 	const u8* d = vgm.data.data();
 	ES55xxState states[2] = {ES55xxState(vgm.is_es5506), ES55xxState(vgm.is_es5506)};
+	states[0].clock = states[1].clock = vgm.es5506_clock & 0x3FFFFFFF;
 	Emitter emitters[2] = {Emitter(vgm.is_es5506, 0x00), Emitter(vgm.is_es5506, 0x80)};
 	RomSet roms[2];
 	Bytes other_blocks, body;
@@ -845,6 +957,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			}
 			if (st.reg_count || !st.esp_cmds.empty() || !st.gains.empty())
 				emitters[ci].init(body, st);
+			st.restart_positions(start);   // the image restarts every voice at its host accumulator
 		}
 	};
 	// voices whose state at the loop point (first pass) differs from the state at the end of the
@@ -886,55 +999,17 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			ES55xxState& st = states[ci];
 			const ES55xxState& sh = shadow[ci];
 			if (!sh.reg_count && sh.esp_cmds.empty()) continue;
-			// a voice that only plays in the skipped repetition stays stopped, unless it is still
-			// playing the same note at the end of the loop body (a layer that is never re-keyed:
-			// it belongs to the loop's steady state and is keyed here)
-			auto same_note = [&](int v) {
-				if (st_end.empty() || !((st_end[ci].running >> v) & 1) || keyed_in_body[ci][v]) return false;
-				const int lo_regs[2] = {2, 4}, hi_regs[2] = {1, 2};   // ES5505 START/END hi words, ES5506 START/END
-				for (int k = 0; k < 2; k++)
-				{
-					int page = vgm.is_es5506 ? 0x20 + v : v, reg = vgm.is_es5506 ? hi_regs[k] : lo_regs[k];
-					u32 a, b; bool ka = const_cast<ES55xxState&>(sh).get(page, reg, a), kb = st_end[ci].get(page, reg, b);
-					if (ka != kb || (ka && a != b)) return false;
-				}
-				return true;
-			};
-			// same note in the emitted state and in the skipped repetition's end state?
-			auto note_equal = [&](int v) {
-				const int lo_regs[2] = {2, 4}, hi_regs[2] = {1, 2};
-				for (int k = 0; k < 2; k++)
-				{
-					int page = vgm.is_es5506 ? 0x20 + v : v, reg = vgm.is_es5506 ? hi_regs[k] : lo_regs[k];
-					u32 a, b; bool ka = const_cast<ES55xxState&>(sh).get(page, reg, a), kb = st.get(page, reg, b);
-					if (ka != kb || (ka && a != b)) return false;
-				}
-				return true;
-			};
-			// tail voices: audible at the end of the skipped repetition but silent in the emitted
-			// stream (stopped, or running at zero volume as drivers leave idle voices). They are
-			// stopped here so that the volume refreshes of the loop body keep them silent in the
-			// first pass, as in the game's first repetition; the loop pass has them from the end
-			// state. A layer still playing the same note at the end of the loop body is keyed instead.
-			auto vol = [&](const ES55xxState& x, int v) -> int {
-				if (!((x.running >> v) & 1)) return 0;
-				ES55xxState& y = const_cast<ES55xxState&>(x);
-				u32 l = 0, r = 0;
-				if (vgm.is_es5506) { y.get(v, 2, l); y.get(v, 4, r); return std::max(l >> 8, r >> 8); }
-				y.get(v, 8, l); y.get(v, 9, r); return std::max(l >> 8, r >> 8);
-			};
-			bool tail[32] = {};
-			for (int v = 0; v < 32; v++)
-				tail[v] = vol(sh, v) > 0x10 && vol(st, v) <= 0x10 && !same_note(v);   // <= 16/255: idle level drivers leave on unused voices
-			// every register gets the value left by the skipped repetition (a later key-on may rely
-			// on START/END/FC already being set); a tail voice is written stopped
+			// the voices as they play at the end of the skipped repetition, at their current position
+			// (a tail of its last bar is heard over the end of the intro, as at every later loop)
+			u32 act;
+			if (!vgm.is_es5506 && const_cast<ES55xxState&>(sh).get(0, 13, act)) emitters[ci].reg(body, RegWrite{0, 13, act, true, -1, false, 0});
+			if (vgm.is_es5506 && const_cast<ES55xxState&>(sh).get(0, 11, act)) emitters[ci].reg(body, RegWrite{0, 11, act, true, -1, false, 0});
 			for (const RegWrite& w0 : sh.image())
 			{
-				RegWrite w = w0;
-				if (w.reg == 0 && w.page < 0x40 && tail[w.page & 0x1F]) w.value |= 3;
-				u32 cur; bool kn = st.get(w.page, w.reg, cur);
-				if (kn && cur == w.value) continue;
-				emitters[ci].reg(body, w);
+				if (w0.page < 0x40 && !st.is_global(w0.page, w0.reg)) continue;   // voices come with the image below
+				u32 cur; bool kn = st.get(w0.page, w0.reg, cur);
+				if (kn && cur == w0.value) continue;
+				emitters[ci].reg(body, w0);
 			}
 			u8 cs = ci ? 0x80 : 0x00;
 			for (auto& kv : sh.region_alias) { auto it = st.region_alias.find(kv.first); if (it == st.region_alias.end() || it->second != kv.second) { body.insert(body.end(), {0xD7, u8(0x02 | cs), u8(kv.first), u8(kv.second)}); } }
@@ -949,12 +1024,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			if (sh.irq_autoack >= 0 && sh.irq_autoack != st.irq_autoack) body.insert(body.end(), {0xD7, u8(0x04 | cs), 0x00, u8(sh.irq_autoack)});
 			for (auto& kv : sh.gains) { auto it = st.gains.find(kv.first); if (it == st.gains.end() || it->second != kv.second) { body.push_back(0xE3); body.push_back(cs); body.push_back(u8(kv.first)); push_be16(body, kv.second); } }
 			for (const EspCmd& e : esp_splice[ci]) body.insert(body.end(), &d[e.tag], &d[e.tag + 4]);
-			st = sh;
-			for (int v = 0; v < 32; v++)
-			{
-				if (!tail[v]) continue;
-				u32 cr; if (st.get(v, 0, cr)) st.store(v, 0, cr | 3);
-			}
+			st = sh;   // the loop image that follows places every voice
 		}
 	};
 	auto mark_loop = [&]() {
@@ -965,6 +1035,10 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			loop_body_ofs = body.size();
 			emitters[0].out_page = emitters[1].out_page = -1;
 			if (!st_end.empty()) { st2 = st_end; track2 = do_cmp; loop_report(); }
+			// first thing in the loop body: the full voice state as it plays here in the first pass,
+			// so that the second pass starts from the same sound whatever the body left behind
+			for (int ci = 0; ci < 2; ci++)
+				if (states[ci].reg_count) emitters[ci].voice_image(body, states[ci], loop);
 		}
 	};
 
@@ -1015,6 +1089,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 		const bool in_skip = skip && c.t >= skip_from && c.t < skip_to;
 		if (in_skip && !shadow_init) { shadow[0] = states[0]; shadow[1] = states[1]; shadow_init = true; }
 		ES55xxState& st = in_skip ? shadow[ci] : states[ci];
+		st.now = c.t;
 		Emitter& em = emitters[ci];
 		RegWrite rw, rw2;
 		int nwrites = -1;      // -1: not a register write
