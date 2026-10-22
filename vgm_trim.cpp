@@ -1470,10 +1470,27 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 	// phrase covers a little less); the rest by coverage
 	std::vector<const Cand*> order;
 	for (const Cand& c : cands) order.push_back(&c);
+	// a multiple of the loop (2x, 3x, 4x) covers as well as the loop itself but matches fewer
+	// windows: it goes behind its base period
+	auto is_multiple_of_shorter = [&](const Cand* c) {
+		for (const Cand& o : cands)
+		{
+			if (o.per >= c->per || o.cover < best_cover - 0.05 || o.windows <= c->windows) continue;
+			double k = (double)c->per / o.per;
+			int ki = (int)std::llround(k);
+			if (ki >= 2 && ki <= 4 && fabs(k - ki) < 0.01 * ki) return true;
+		}
+		return false;
+	};
 	std::stable_sort(order.begin(), order.end(), [&](const Cand* a, const Cand* b) {
-		bool ga = a->cover >= best_cover - 0.02, gb = b->cover >= best_cover - 0.02;
+		bool ga = a->cover >= best_cover - 0.05, gb = b->cover >= best_cover - 0.05;
 		if (ga != gb) return ga;
-		if (ga) return a->windows != b->windows ? a->windows > b->windows : a->per < b->per;
+		if (ga)
+		{
+			bool ma = is_multiple_of_shorter(a), mb = is_multiple_of_shorter(b);
+			if (ma != mb) return !ma;
+			return a->windows != b->windows ? a->windows > b->windows : a->per < b->per;
+		}
 		return a->cover > b->cover;
 	});
 	// first repeated note-on and its recurrence for a period
