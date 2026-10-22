@@ -1136,7 +1136,7 @@ struct NoteEvent { i64 t; NoteKey k; };
 struct Wav;
 static double audio_corr(const Wav& w, i64 a, i64 b, i64 n, i64 max_lag = 2000);
 
-static int g_loop_pass = 2;   // --loop-pass: 1 = loop body is the first repetition, 2 = the second one when captured
+static int g_loop_pass = 1;   // --loop-pass: 1 = loop body is the first repetition (file = intro + 1 repetition), 2 = the second one (seamless, file = intro + 2 repetitions)
 static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool bounded, i64& r_start, i64& r_loop, i64& r_end,
                       const Wav* wav = nullptr, int window = 12, i64 pre = 2205, int loop_pass = g_loop_pass)
 {
@@ -1376,6 +1376,9 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 		if (loop_pass == 2)
 			printf("warning: capture too short to loop on the second repetition (needs %s): looping on the first one, "
 			       "the tail of the last bar is cut at the loop point. Capture intro + 2 repetitions + a few seconds.\n", fmt_pos(t3 + pre).c_str());
+		else if (t3 + pre <= search_to)
+			printf("note: the loop body is the first repetition (file = intro + 1 repetition); the tail of the last bar is cut at the "
+			       "loop point. --loop-pass 2 loops on the second repetition instead (seamless, file one repetition longer).\n");
 		r_loop = std::max<i64>(0, t1 - pre);
 		r_end = t2 - pre;
 	}
@@ -1587,7 +1590,8 @@ static void usage()
 	        "  --start P --end P      trim range (samples, \"12.5s\" or \"m:ss.sss\")\n"
 	        "  --loop P               loop point\n"
 	        "  --find-loop            locate the loop from the note-on sequence (within --start/--end)\n"
-	        "  --loop-pass N          --find-loop: loop body = 2nd repetition when captured (default, seamless) or 1 (shorter file)\n"
+	        "  --loop-pass N          --find-loop: 1 = loop body is the 1st repetition (default, file = intro + 1 repetition),\n"
+	        "                         2 = the 2nd one when captured (seamless loop, file = intro + 2 repetitions)\n"
 	        "  --cmp                  drop register writes that do not change the chip state\n"
 	        "  --sro                  keep only the sample ROM ranges that are played\n"
 	        "  --sro-margin N         --sro: margin in words around each used range (default 256)\n"
