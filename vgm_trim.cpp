@@ -1136,8 +1136,9 @@ struct NoteEvent { i64 t; NoteKey k; };
 struct Wav;
 static double audio_corr(const Wav& w, i64 a, i64 b, i64 n, i64 max_lag = 2000);
 
+static int g_loop_pass = 2;   // --loop-pass: 1 = loop body is the first repetition, 2 = the second one when captured
 static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool bounded, i64& r_start, i64& r_loop, i64& r_end,
-                      const Wav* wav = nullptr, int window = 12, i64 pre = 2205)
+                      const Wav* wav = nullptr, int window = 12, i64 pre = 2205, int loop_pass = g_loop_pass)
 {
 	const u8* d = vgm.data.data();
 	ES55xxState st(vgm.is_es5506);
@@ -1291,6 +1292,7 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 		return a->cover > b->cover;
 	});
 	// first repeated note-on and its recurrence for a period
+	auto first_of = [&](i64 t) -> size_t { for (size_t m = 0; m < n; m++) if (events[m].t == t) return m; return 0; };
 	auto locate = [&](i64 period, i64& t1, i64& t2) -> bool {
 		size_t first = SIZE_MAX;
 		i64 dummy;
@@ -1356,8 +1358,27 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 	printf("loop found: first note-on at %s, first repeated note-on at %s, recurs at %s, period %s (%.4f s), %zu matching windows\n",
 	       fmt_pos(t0).c_str(), fmt_pos(t1).c_str(), fmt_pos(t2).c_str(), fmt_pos(t2 - t1).c_str(), (double)(t2 - t1) / SAMPLE_RATE, chosen->windows);
 	r_start = std::max<i64>(0, t0 - pre);
-	r_loop = std::max<i64>(0, t1 - pre);
-	r_end = t2 - pre;
+	// Loop on the second repetition when the capture holds it: the first repetition starts
+	// after the intro (silence, init writes) while every later one starts over the tail of the
+	// previous bar, so a loop body taken from the first one cuts that tail at every loop. The
+	// second repetition is preceded by the first, exactly like the game plays it.
+	i64 period = t2 - t1, t3 = t2 + period;
+	for (size_t m = 0; m < n; m++)
+		if (events[m].t == t2 && events[m].k == events[first_of(t1)].k) { i64 r; if (recurrence_at(m, period, r)) t3 = r; break; }
+	if (loop_pass == 2 && t3 + pre <= search_to)
+	{
+		printf("loop body = second repetition %s .. %s (the first one is played once before it)\n", fmt_pos(t2 - pre).c_str(), fmt_pos(t3 - pre).c_str());
+		r_loop = std::max<i64>(0, t2 - pre);
+		r_end = t3 - pre;
+	}
+	else
+	{
+		if (loop_pass == 2)
+			printf("warning: capture too short to loop on the second repetition (needs %s): looping on the first one, "
+			       "the tail of the last bar is cut at the loop point. Capture intro + 2 repetitions + a few seconds.\n", fmt_pos(t3 + pre).c_str());
+		r_loop = std::max<i64>(0, t1 - pre);
+		r_end = t2 - pre;
+	}
 	return true;
 }
 
@@ -1566,6 +1587,7 @@ static void usage()
 	        "  --start P --end P      trim range (samples, \"12.5s\" or \"m:ss.sss\")\n"
 	        "  --loop P               loop point\n"
 	        "  --find-loop            locate the loop from the note-on sequence (within --start/--end)\n"
+	        "  --loop-pass N          --find-loop: loop body = 2nd repetition when captured (default, seamless) or 1 (shorter file)\n"
 	        "  --cmp                  drop register writes that do not change the chip state\n"
 	        "  --sro                  keep only the sample ROM ranges that are played\n"
 	        "  --sro-margin N         --sro: margin in words around each used range (default 256)\n"
@@ -1606,6 +1628,7 @@ int main(int argc, char** argv)
 		else if (name == "--cmp") f_cmp = true;
 		else if (name == "--sro") f_sro = true;
 		else if (name == "--auto") f_auto = true;
+		else if (name == "--loop-pass") { std::string v; value(v); g_loop_pass = atoi(v.c_str()); }
 		else if (name == "--start") value(start_s);
 		else if (name == "--end") value(end_s);
 		else if (name == "--loop") value(loop_s);
