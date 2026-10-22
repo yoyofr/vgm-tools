@@ -1136,9 +1136,10 @@ struct NoteEvent { i64 t; NoteKey k; };
 struct Wav;
 static double audio_corr(const Wav& w, i64 a, i64 b, i64 n, i64 max_lag = 2000);
 
-static int g_loop_pass = 1;   // --loop-pass: 1 = loop body is the first repetition (file = intro + 1 repetition), 2 = the second one (seamless, file = intro + 2 repetitions)
-static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool bounded, i64& r_start, i64& r_loop, i64& r_end,
-                      const Wav* wav = nullptr, int window = 12, i64 pre = 2205, int loop_pass = g_loop_pass)
+static int g_loop_pass = 0;   // --loop-pass: 0 = auto, 1 = loop body is the first repetition (file = intro + 1 repetition), 2 = the second one (seamless, file = intro + 2 repetitions)
+struct LoopResult { i64 start, loop1, end1, loop2, end2; bool has2; };
+static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool bounded, LoopResult& lr,
+                      const Wav* wav = nullptr, int window = 12, i64 pre = 2205)
 {
 	const u8* d = vgm.data.data();
 	ES55xxState st(vgm.is_es5506);
@@ -1357,32 +1358,67 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 	for (size_t i = 0; i < n; i++) if (events[i].t >= search_from) { t0 = events[i].t; break; }
 	printf("loop found: first note-on at %s, first repeated note-on at %s, recurs at %s, period %s (%.4f s), %zu matching windows\n",
 	       fmt_pos(t0).c_str(), fmt_pos(t1).c_str(), fmt_pos(t2).c_str(), fmt_pos(t2 - t1).c_str(), (double)(t2 - t1) / SAMPLE_RATE, chosen->windows);
-	r_start = std::max<i64>(0, t0 - pre);
-	// Loop on the second repetition when the capture holds it: the first repetition starts
-	// after the intro (silence, init writes) while every later one starts over the tail of the
-	// previous bar, so a loop body taken from the first one cuts that tail at every loop. The
-	// second repetition is preceded by the first, exactly like the game plays it.
+	lr.start = std::max<i64>(0, t0 - pre);
+	// two constructions: loop body = first repetition (file = intro + 1 repetition), or = second
+	// repetition when the capture holds it (the first one is played once before it, as in the game)
 	i64 period = t2 - t1, t3 = t2 + period;
 	for (size_t m = 0; m < n; m++)
 		if (events[m].t == t2 && events[m].k == events[first_of(t1)].k) { i64 r; if (recurrence_at(m, period, r)) t3 = r; break; }
-	if (loop_pass == 2 && t3 + pre <= search_to)
-	{
-		printf("loop body = second repetition %s .. %s (the first one is played once before it)\n", fmt_pos(t2 - pre).c_str(), fmt_pos(t3 - pre).c_str());
-		r_loop = std::max<i64>(0, t2 - pre);
-		r_end = t3 - pre;
-	}
-	else
-	{
-		if (loop_pass == 2)
-			printf("warning: capture too short to loop on the second repetition (needs %s): looping on the first one, "
-			       "the tail of the last bar is cut at the loop point. Capture intro + 2 repetitions + a few seconds.\n", fmt_pos(t3 + pre).c_str());
-		else if (t3 + pre <= search_to)
-			printf("note: the loop body is the first repetition (file = intro + 1 repetition); the tail of the last bar is cut at the "
-			       "loop point. --loop-pass 2 loops on the second repetition instead (seamless, file one repetition longer).\n");
-		r_loop = std::max<i64>(0, t1 - pre);
-		r_end = t2 - pre;
-	}
+	lr.loop1 = std::max<i64>(0, t1 - pre);
+	lr.end1 = t2 - pre;
+	lr.has2 = t3 + pre <= search_to;
+	lr.loop2 = std::max<i64>(0, t2 - pre);
+	lr.end2 = t3 - pre;
 	return true;
+}
+
+// Voices that would be cut when the loop re-enters: audible at the end of the loop body, silent
+// at the loop point in the first pass, and muted or stopped by the body's own writes within the
+// first 100 ms of the second pass (a driver refreshing every volume replays the silence that
+// preceded the first repetition). Returns their count.
+static int loop_cut_voices(const VGMFile& vgm, i64 loop, i64 end)
+{
+	const u8* d = vgm.data.data();
+	ES55xxState st[2] = {ES55xxState(vgm.is_es5506), ES55xxState(vgm.is_es5506)};
+	std::vector<ES55xxState> at_loop;
+	auto apply = [&](ES55xxState* states, const Cmd& c) {
+		int ci = (c.len > 1 && (d[c.p + 1] & 0x80)) ? 1 : 0;
+		RegWrite rw;
+		if (c.op == 0xBE) states[ci].write8(d[c.p + 1] & 0x7F, d[c.p + 2], rw);
+		else if (c.op == 0xD6) states[ci].write16(d[c.p + 1] & 0x7F, (d[c.p + 2] << 8) | d[c.p + 3], rw);
+	};
+	auto volume = [&](const ES55xxState& s, int v) -> int {
+		if (!((s.running >> v) & 1)) return 0;
+		if (vgm.is_es5506) return std::max(s.known[v][2] ? (int)(s.regs[v][2] >> 8) : 0, s.known[v][4] ? (int)(s.regs[v][4] >> 8) : 0);
+		return std::max(s.known[v][8] ? (int)(s.regs[v][8] >> 8) : 0, s.known[v][9] ? (int)(s.regs[v][9] >> 8) : 0);
+	};
+	vgm.commands([&](const Cmd& c) {
+		if (c.op == 0x66 || c.t >= end) return false;
+		if (c.t >= loop && at_loop.empty()) at_loop.assign(st, st + 2);
+		apply(st, c);
+		return true;
+	});
+	if (at_loop.empty()) return 0;
+	// second pass: start from the end state, replay the first 100 ms of the body
+	ES55xxState pass2[2] = {st[0], st[1]};
+	int audible_end[2][32];
+	for (int ci = 0; ci < 2; ci++) for (int v = 0; v < 32; v++) audible_end[ci][v] = volume(st[ci], v);
+	int cut = 0;
+	bool counted[2][32] = {};
+	vgm.commands([&](const Cmd& c) {
+		if (c.op == 0x66 || c.t >= loop + SAMPLE_RATE / 10) return false;
+		if (c.t < loop) return true;
+		apply(pass2, c);
+		for (int ci = 0; ci < 2; ci++)
+			for (int v = 0; v < 32; v++)
+				if (!counted[ci][v] && audible_end[ci][v] >= 0x10 && volume(at_loop[ci], v) < 0x10 && volume(pass2[ci], v) < 0x10)
+				{
+					counted[ci][v] = true;
+					cut++;
+				}
+		return true;
+	});
+	return cut;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1590,8 +1626,8 @@ static void usage()
 	        "  --start P --end P      trim range (samples, \"12.5s\" or \"m:ss.sss\")\n"
 	        "  --loop P               loop point\n"
 	        "  --find-loop            locate the loop from the note-on sequence (within --start/--end)\n"
-	        "  --loop-pass N          --find-loop: 1 = loop body is the 1st repetition (default, file = intro + 1 repetition),\n"
-	        "                         2 = the 2nd one when captured (seamless loop, file = intro + 2 repetitions)\n"
+	        "  --loop-pass N          --find-loop: 1 = loop body is the 1st repetition (file = intro + 1 repetition), 2 = the 2nd one\n"
+	        "                         (seamless, file = intro + 2 repetitions); default: 2 only when the loop re-entry would cut voices\n"
 	        "  --cmp                  drop register writes that do not change the chip state\n"
 	        "  --sro                  keep only the sample ROM ranges that are played\n"
 	        "  --sro-margin N         --sro: margin in words around each used range (default 256)\n"
@@ -1719,8 +1755,41 @@ int main(int argc, char** argv)
 		if (job.end > (i64)vgm.total) job.end = vgm.total;
 		if (f_find_loop)
 		{
-			i64 s, l, e;
-			if (!find_loop(vgm, job.start, job.end, true, s, l, e, render.get()))
+			LoopResult lr;
+			i64 s = 0, l = 0, e = 0;
+			bool found = find_loop(vgm, job.start, job.end, true, lr, render.get());
+			if (found)
+			{
+				int pass = g_loop_pass;
+				s = lr.start;
+				if (pass == 0)
+				{
+					int cut = loop_cut_voices(vgm, lr.loop1, lr.end1);
+					if (cut == 0)
+						pass = 1;
+					else if (lr.has2)
+					{
+						pass = 2;
+						printf("loop re-entry would cut %d voice(s) still sounding at the end of the first repetition: "
+						       "looping on the second repetition (file = intro + 2 repetitions)\n", cut);
+					}
+					else
+					{
+						pass = 1;
+						printf("warning: loop re-entry cuts %d voice(s) still sounding at the end of the loop body; the capture is too short to loop "
+						       "on the second repetition instead (needs %s). Capture intro + 2 repetitions + a few seconds for a seamless loop.\n",
+						       cut, fmt_pos(lr.end2 + 2205).c_str());
+					}
+				}
+				else if (pass == 2 && !lr.has2)
+				{
+					pass = 1;
+					printf("warning: capture too short to loop on the second repetition (needs %s): looping on the first one\n", fmt_pos(lr.end2 + 2205).c_str());
+				}
+				if (pass == 2) { l = lr.loop2; e = lr.end2; printf("loop body = second repetition %s .. %s\n", fmt_pos(l).c_str(), fmt_pos(e).c_str()); }
+				else { l = lr.loop1; e = lr.end1; }
+			}
+			if (!found)
 			{
 				printf("%s: no loop found, written without loop\n", job.output.c_str());
 			}
