@@ -1355,17 +1355,48 @@ static bool read_wav(const std::string& path, Wav& w)
 	return true;
 }
 
+// peak of every 10 ms window after removing the window's DC offset (boards with an effects DSP
+// in the output path, like Taito F3, output a small DC level and noise while "silent")
+static std::vector<int> window_peaks(const Wav& w, size_t win)
+{
+	std::vector<int> peaks;
+	for (size_t i = 0; i < w.frames; i += win)
+	{
+		size_t e = std::min(w.frames, i + win);
+		int peak = 0;
+		for (int ch = 0; ch < w.nch; ch++)
+		{
+			double mean = 0;
+			for (size_t f = i; f < e; f++) mean += w.smp[f * w.nch + ch];
+			mean /= (double)(e - i);
+			for (size_t f = i; f < e; f++) peak = std::max(peak, abs((int)(w.smp[f * w.nch + ch] - mean)));
+		}
+		peaks.push_back(peak);
+	}
+	return peaks;
+}
+
+// silence threshold from the noise floor: 3x the 5th percentile of the window peaks, 4..64
+static int auto_silence(const std::vector<int>& peaks)
+{
+	if (peaks.empty()) return 4;
+	std::vector<int> sorted(peaks);
+	std::sort(sorted.begin(), sorted.end());
+	int noise = sorted[sorted.size() / 20];
+	return std::max(4, std::min(64, noise * 3 + 4));
+}
+
 static std::vector<std::pair<i64, i64>> find_segments(const Wav& w, int silence_peak, i64 min_silence, i64 min_length)
 {
 	size_t win = w.sr / 100;
+	std::vector<int> peaks = window_peaks(w, win);
+	if (silence_peak < 0) { silence_peak = auto_silence(peaks); printf("silence threshold (auto, from the noise floor): peak <= %d\n", silence_peak); }
 	std::vector<std::pair<i64, i64>> segs;
 	bool in_seg = false;
 	size_t seg_start = 0, seg_last = 0, silent_run = 0, idx = 0;
 	for (size_t i = 0; i < w.frames; i += win, idx++)
 	{
-		size_t e = std::min(w.frames, i + win);
-		int peak = 0;
-		for (size_t s = i * w.nch; s < e * w.nch; s++) peak = std::max(peak, abs((int)w.smp[s]));
+		int peak = peaks[idx];
 		bool loud = peak > silence_peak;
 		if (loud)
 		{
@@ -1473,7 +1504,7 @@ static void usage()
 	        "  --split wav|log        --auto: from the rendered audio (needs vgm2wav) or from the log (default wav)\n"
 	        "  --track N|all|0        --auto: track to extract (default 1), all = every track to output_NN, 0 = list only\n"
 	        "  --vgm2wav PATH         vgm2wav tool (default: vgm2wav)\n"
-	        "  --silence N            --auto: peak level treated as silence (default 4)\n"
+	        "  --silence N            --auto: peak level treated as silence (default: automatic from the noise floor, DC removed)\n"
 	        "  --gap P                --auto / --activity: minimum silence between two tracks (default 1.0s)\n"
 	        "  --pre P --post P       --auto: silence kept before / after each track (default 0.05s / 0.3s)\n"
 	        "  --min-length P         --auto: ignore segments shorter than this (default 0.5s)\n");
@@ -1486,7 +1517,7 @@ int main(int argc, char** argv)
 	std::string gap = "1.0s", pre = "0.05s", post = "0.3s", min_length = "0.5s";
 	bool f_info = false, f_activity = false, f_find_loop = false, f_cmp = false, f_sro = false, f_auto = false;
 	i64 sro_margin = 256, sro_gap = 0;
-	int silence = 4;
+	int silence = -1;   // -1: automatic (noise floor)
 	std::vector<std::string> positional;
 	for (int i = 1; i < argc; i++)
 	{
