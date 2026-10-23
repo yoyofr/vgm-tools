@@ -1821,6 +1821,72 @@ static bool ends_with_nocase(const std::string& s, const char* suffix)
 }
 
 // .vgz output is gzip-compressed (level 9, no name/mtime in the gzip header)
+// --append: concatenate captures. The data blocks (0x67) of every file come first (exact duplicates
+// dropped), then the command streams in order: the initial register image of an appended file re-creates
+// its state at the junction, the ESP keeps the tail of the previous part. Header and GD3 of the first
+// file, total = sum, loop of the last file that has one (offsets shifted, the loop runs to the end).
+static Bytes merge(const std::vector<VGMFile>& in)
+{
+	const VGMFile& a = in[0];
+	Bytes blocks, body;
+	std::set<Bytes> seen;
+	i64 total = 0, loop_t = -1;
+	size_t loop_body_ofs = 0, loop_part = 0;
+	for (size_t k = 0; k < in.size(); k++) if (in[k].loop_ofs) loop_part = k + 1;
+	if (loop_part && loop_part < in.size())
+		fprintf(stderr, "warning: part %zu has a loop but is not the last part: the loop will run to the end of the merged file\n", loop_part);
+	for (size_t k = 0; k < in.size(); k++)
+	{
+		const VGMFile& v = in[k];
+		if (v.es5506_clock != a.es5506_clock || v.is_es5506 != a.is_es5506)
+			fprintf(stderr, "warning: part %zu: ES5506 clock %08X differs from the first part (%08X)\n", k + 1, v.es5506_clock, a.es5506_clock);
+		if (k && v.data_ofs > 0x7C && a.data_ofs > 0x7C && v.data[0x7C] != a.data[0x7C])
+			fprintf(stderr, "warning: part %zu: volume modifier %02X differs from the first part (%02X), the first one is kept\n", k + 1, v.data[0x7C], a.data[0x7C]);
+		if (v.loop_ofs && k + 1 != loop_part) fprintf(stderr, "warning: part %zu has a loop too, only the one of part %zu is kept\n", k + 1, loop_part);
+		if (k + 1 == loop_part) loop_t = -1;
+		const u8* d = v.data.data();
+		bool found_loop = false;
+		v.commands([&](const Cmd& c) {
+			if (c.op == 0x66) return false;
+			if (k + 1 == loop_part && c.p == v.loop_ofs) { loop_body_ofs = body.size(); loop_t = total + c.t; found_loop = true; }
+			if (c.op == 0x67)
+			{
+				Bytes b(d + c.p, d + c.p + c.len);
+				if (seen.insert(b).second) blocks.insert(blocks.end(), b.begin(), b.end());
+				return true;
+			}
+			body.insert(body.end(), d + c.p, d + c.p + c.len);
+			return true;
+		});
+		if (k + 1 == loop_part && !found_loop) fprintf(stderr, "warning: part %zu: loop offset does not fall on a command, loop dropped\n", k + 1);
+		total += v.total;
+		printf("part %zu: %s%s\n", k + 1, fmt_pos(v.total).c_str(), v.loop_ofs ? (", loop " + fmt_pos(v.loop_samples)).c_str() : "");
+	}
+	body.push_back(0x66);
+	Bytes out(a.data.begin(), a.data.begin() + a.data_ofs);
+	size_t data_start = out.size();
+	put_le32(&out[0x18], (u32)total);
+	if (loop_t >= 0)
+	{
+		put_le32(&out[0x1C], (u32)(data_start + blocks.size() + loop_body_ofs - 0x1C));
+		put_le32(&out[0x20], (u32)(total - loop_t));
+	}
+	else { put_le32(&out[0x1C], 0); put_le32(&out[0x20], 0); }
+	out.insert(out.end(), blocks.begin(), blocks.end());
+	out.insert(out.end(), body.begin(), body.end());
+	if (a.gd3 && a.gd3 + 12 <= a.data.size())
+	{
+		u32 gd3_len = le32(&a.data[a.gd3 + 8]);
+		size_t e = std::min<size_t>(a.gd3 + 12 + gd3_len, a.data.size());
+		put_le32(&out[0x14], (u32)(out.size() - 0x14));
+		out.insert(out.end(), a.data.begin() + a.gd3, a.data.begin() + e);
+	}
+	else put_le32(&out[0x14], 0);
+	put_le32(&out[0x04], (u32)(out.size() - 4));
+	printf("merged: %s%s, %zu data block(s)\n", fmt_pos(total).c_str(), loop_t >= 0 ? (", loop " + fmt_pos(total - loop_t)).c_str() : "", seen.size());
+	return out;
+}
+
 static void write_output(const std::string& path, const Bytes& out)
 {
 	if (ends_with_nocase(path, ".vgz"))
@@ -1873,6 +1939,8 @@ static void usage()
 	        "  --sro-margin N         --sro: margin in words around each used range (default 256)\n"
 	        "  --sro-gap N            --sro: merge used ranges closer than this many words (default 0)\n"
 	        "  --gd3 keep|drop        keep the GD3 tag (default keep)\n"
+	        "  --append FILE          append FILE (repeatable) to the input and write the result: header, GD3 and volume of the\n"
+	        "                         input, loop of the last part that has one; no other processing\n"
 	        "  --volume D             set the header volume modifier (VGM 1.60+) from a gain in dB (e.g. +6dB, -3): the player\n"
 	        "                         applies 2^(n/32), n = round(D / 6.02 * 32), range -64..192 (-12 dB..+36 dB); 0 removes it\n"
 	        "  --auto                 split the capture into tracks separated by silence\n"
@@ -1893,7 +1961,7 @@ int main(int argc, char** argv)
 	bool f_info = false, f_activity = false, f_find_loop = false, f_cmp = false, f_sro = false, f_auto = false;
 	i64 sro_margin = 256, sro_gap = 0;
 	int silence = -1;   // -1: automatic (noise floor)
-	std::vector<std::string> positional;
+	std::vector<std::string> positional, appends;
 	for (int i = 1; i < argc; i++)
 	{
 		std::string a = argv[i];
@@ -1915,6 +1983,7 @@ int main(int argc, char** argv)
 		else if (name == "--end") value(end_s);
 		else if (name == "--loop") value(loop_s);
 		else if (name == "--gd3") value(gd3);
+		else if (name == "--append") { std::string v; value(v); appends.push_back(v); }
 		else if (name == "--volume")
 		{
 			std::string v; value(v);
@@ -1946,6 +2015,16 @@ int main(int argc, char** argv)
 	vgm.load(input);
 	if (f_activity) { activity(vgm, parse_pos(gap), false); return 0; }
 	if (f_info || output.empty()) { info(vgm); return 0; }
+	if (!appends.empty())
+	{
+		std::vector<VGMFile> parts(1 + appends.size());
+		parts[0] = std::move(vgm);
+		for (size_t k = 0; k < appends.size(); k++) parts[k + 1].load(appends[k]);
+		Bytes out = merge(parts);
+		write_output(output, out);
+		printf("%s -> %s: %zu bytes\n", input.c_str(), output.c_str(), out.size());
+		return 0;
+	}
 
 	struct Job { i64 start, loop, end; bool has_loop; std::string output; bool explicit_start; i64 skip_from = 0, skip_to = 0; };
 	std::vector<Job> jobs;

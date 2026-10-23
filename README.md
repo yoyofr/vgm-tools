@@ -17,6 +17,7 @@ vgm_trim capture.vgm --activity
 vgm_trim capture.vgm out.vgz --auto --split log --track all --cmp --sro --find-loop
 vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --loop 30.0s --cmp --sro
 vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --volume +6dB
+vgm_trim part1.vgz merged.vgz --append part2.vgz
 ```
 
 All reductions are output-neutral: rendered audio is byte-identical before and after.
@@ -24,6 +25,11 @@ All reductions are output-neutral: rendered audio is byte-identical before and a
 `--volume` sets the VGM header volume modifier (offset 0x7C, VGM 1.60+): the player applies
 2^(n/32) to its output, n = round(dB / 6.02 × 32), range -12 dB..+36 dB. The chip data is untouched,
 so it stays lossless and reversible; `--info` prints the current value.
+
+`--append` (repeatable) concatenates captures: data blocks of every part first, then the command
+streams in order. The initial register image of an appended part re-creates its state at the
+junction and the ESP keeps the tail of the previous part. Header, GD3 and volume come from the
+first part, the loop from the last part that has one.
 
 ## gd3edit.html
 
