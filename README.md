@@ -11,7 +11,7 @@ points from the note-on sequence, drop register writes that do not change the ch
 the sample ROM ranges that are played, upgrade the header to VGM 1.72, read and write `.vgz`.
 
 ```sh
-c++ -O2 -std=c++17 -o vgm_trim vgm_trim.cpp -lz
+c++ -O2 -std=c++17 -o vgm_trim vgm_trim.cpp libvgm/emu/cores/tms57002.cpp -lz   # the DSP core is a copy of libvgm's
 
 vgm_trim capture.vgm --info
 vgm_trim capture.vgm --activity
@@ -37,7 +37,8 @@ junction and the ESP keeps the tail of the previous part. Header, GD3 and volume
 first part, the loop from the last part that has one.
 
 ZSG-2 logs (Taito FX-1B / G-NET, VGM 1.72 with a 0x110-byte header) are handled by a dedicated path: a cut re-creates the
-board gains, the DSP (host write history replayed with pre-runs), the register image and re-keys the
+board gains, the DSP (simulated from the start of the capture with libvgm's TMS57002 core, a copy of
+which lives in `libvgm/`, and written as a state block 0x98 that loads instantly), the register image and re-keys the
 voices still playing at their computed position; `--cmp`, `--sro`, `--find-loop` and `--split log` use
 a ZSG-2 voice model; the loop body is taken from the second repetition when captured (seamless loop).
 

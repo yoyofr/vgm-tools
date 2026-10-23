@@ -27,6 +27,7 @@
 #include <strings.h>
 #include <cstdarg>
 #include <initializer_list>
+#include "libvgm/emu/cores/tms57002.h"   // DSP core of libvgm (copy kept in sync): simulates the TMS57002 at a cut point
 #include <unistd.h>
 
 typedef uint8_t u8;
@@ -1499,7 +1500,7 @@ struct TmsHost
 		return changed;
 	}
 };
-struct DspCmd { i64 t; u8 sub, aa; u16 data; };
+struct DspCmd { i64 t; u8 sub, aa; u16 data; };   // sub 0xFF: state block (aa = index into ZSG2State::dsp_states)
 
 struct ZSG2Voice
 {
@@ -1532,13 +1533,17 @@ struct ZSG2State
 	bool creg_known[32] = {};
 	std::map<int, u16> gains;
 	TmsHost tms;
-	std::vector<DspCmd> dsp_hist;   // host writes, control lines, resets and pre-runs of the DSP since the start
+	std::vector<DspCmd> dsp_hist;   // host writes, control lines, resets, pre-runs and state blocks of the DSP since the start
+	std::vector<Bytes> dsp_states;   // state block payloads (data block 0x98) seen in the input
+	u32 clock = 25000000;
 	i64 now = 0;
 	double chip_rate = 25000000.0 / 768;   // samples per second
 	std::vector<Range> rom_used;           // words (2 bytes), from the key-ons
 	bool reg_count = false;                // anything known
 
-	void set_clock(u32 clock) { if (clock) chip_rate = (double)(clock / 768); }
+	void set_clock(u32 c) { if (c) { clock = c; chip_rate = (double)(c / 768); } }
+	int dsp_cycles() const { return (int)((clock / 2) / (clock / 768)); }   // as the libvgm device
+	void dsp_state_block(i64 t, const u8* data, size_t len) { dsp_hist.push_back({t, 0xFF, (u8)dsp_states.size(), 0}); dsp_states.emplace_back(data, data + len); }
 	double chip_samples(i64 dt) const { return dt * chip_rate / SAMPLE_RATE; }
 
 	static u16 ramp(u16 current, u16 target, i16 delta, double steps)
@@ -1687,18 +1692,73 @@ struct ZSG2State
 		for (auto& kv : gains) raw(6, u8(kv.first), kv.second);
 		if (mode == IMAGE_INIT && !dsp_hist.empty())
 		{
-			// replay the DSP history; the time between the writes becomes pre-runs of the program (silent input),
-			// which re-creates the coefficient memory and the program-internal state (LFO phases...)
-			i64 base_t = dsp_hist[0].t, emitted = 0;
-			auto prerun_to = [&](i64 t) {
-				i64 n = (i64)chip_samples(t - base_t) - emitted;
-				while (n > 0) { i64 k = std::min<i64>(n, 0xFFFFFF); raw(8, u8(k >> 16), u16(k & 0xFFFF)); emitted += k; n -= k; }
+			// simulate the DSP from the start of the capture (host writes, state blocks, the time in between
+			// as silent sample periods) with the player's own core, and write the resulting state as a data
+			// block 0x98: exact and instantaneous to load, where a replay would cost minutes of DSP time
+			// the simulation is kept between the cuts of one session (tracks are cut in order): it resumes
+			// from the previous cut when the history up to there is the same, instead of starting over
+			static TMS57002* d = nullptr;
+			static std::vector<DspCmd> done_hist;   // history entries already applied
+			static i64 done_ticks = 0, done_t = 0, base_t = 0;
+			const int cycles = dsp_cycles();
+			size_t idx = 0;
+			bool resume = d != nullptr && !done_hist.empty() && done_hist.size() <= dsp_hist.size() && done_t <= at && base_t == dsp_hist[0].t;
+			for (size_t k = 0; resume && k < done_hist.size(); k++)
+				if (done_hist[k].t != dsp_hist[k].t || done_hist[k].sub != dsp_hist[k].sub || done_hist[k].aa != dsp_hist[k].aa || done_hist[k].data != dsp_hist[k].data) resume = false;
+			if (resume && done_hist.size() < dsp_hist.size() && dsp_hist[done_hist.size()].t < done_t) resume = false;
+			if (resume)
+				idx = done_hist.size();
+			else
+			{
+				if (d) tms57002_destroy(d);
+				d = tms57002_create();
+				done_hist.clear(); done_ticks = 0; base_t = dsp_hist[0].t; done_t = base_t;
+			}
+			auto run_to = [&](i64 t) {
+				i64 n = (i64)chip_samples(t - base_t) - done_ticks;
+				if (n > 0) { tms57002_prerun(d, (u32)n, cycles); done_ticks += n; }
+				done_t = std::max(done_t, t);
 			};
-			for (const DspCmd& c : dsp_hist) { prerun_to(c.t); raw(c.sub, c.aa, c.data); }
-			prerun_to(at);
+			for (; idx < dsp_hist.size() && dsp_hist[idx].t <= at; idx++)
+			{
+				const DspCmd& c = dsp_hist[idx];
+				run_to(c.t);
+				switch (c.sub)
+				{
+				case 4: tms57002_data_w(d, c.data & 0xFF); break;
+				case 5: tms57002_cload_w(d, c.data & 2); tms57002_pload_w(d, c.data & 1); break;
+				case 7: tms57002_reset(d); break;
+				case 8: tms57002_prerun(d, ((u32)c.aa << 16) | c.data, cycles); break;
+				case 0xFF: tms57002_state_load(d, dsp_states[c.aa].data(), (u32)dsp_states[c.aa].size()); break;
+				default: break;
+				}
+				done_hist.push_back(c);
+			}
+			run_to(at);
+			u32 size = tms57002_state_save(d, nullptr, 0);
+			Bytes st(size);
+			tms57002_state_save(d, st.data(), size);
+			out.insert(out.end(), {0x67, 0x66, 0x98});
+			push_le32(out, 8 + size);
+			push_le32(out, size);
+			push_le32(out, 0);
+			out.insert(out.end(), st.begin(), st.end());
+			if (mirror) mirror->dsp_state_block(at, st.data(), st.size());
 		}
 		else if (mode == IMAGE_SPLICE)
-			for (size_t k = dsp_from; k < dsp_hist.size(); k++) raw(dsp_hist[k].sub, dsp_hist[k].aa, dsp_hist[k].data);
+			for (size_t k = dsp_from; k < dsp_hist.size(); k++)
+			{
+				const DspCmd& c = dsp_hist[k];
+				if (c.sub == 0xFF)
+				{
+					const Bytes& st = dsp_states[c.aa];
+					out.insert(out.end(), {0x67, 0x66, 0x98});
+					push_le32(out, 8 + (u32)st.size()); push_le32(out, (u32)st.size()); push_le32(out, 0);
+					out.insert(out.end(), st.begin(), st.end());
+				}
+				else
+					raw(c.sub, c.aa, c.data);
+			}
 		for (int r = 8; r < 32; r++) if (creg_known[r]) regw(0x300 + r, creg[r]);
 		for (int vi = 0; vi < 48; vi++)
 			for (int r = 0; r < 16; r++)
@@ -1829,6 +1889,7 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 		st_end->set_clock(vgm.zsg2_clock);
 		vgm.commands([&](const Cmd& c) {
 			if (c.op == 0x66 || c.t >= end) return false;
+			if (c.op == 0x67 && d[c.p + 2] == 0x98 && c.len >= 15) { st_end->dsp_state_block(c.t, &d[c.p + 15], c.len - 15); return true; }
 			if (c.op != 0xE4) return true;
 			u8 sub = d[c.p + 1] & 0x0F;
 			u16 data = (d[c.p + 3] << 8) | d[c.p + 4];
@@ -1884,6 +1945,20 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 		{
 			if (d[p + 2] == 0x97 && c.len >= 15)
 				rom.add_block(le32(&d[p + 7]), le32(&d[p + 11]), &d[p + 15], c.len - 15);
+			else if (d[p + 2] == 0x98 && c.len >= 15)
+			{
+				// DSP state image: part of the DSP history (the simulation starts from it); a block inside
+				// the trimmed range is kept where it is
+				st.dsp_state_block(c.t, &d[p + 15], c.len - 15);
+				if (st2 && c.t >= start && c.t < end) st2->dsp_state_block(c.t, &d[p + 15], c.len - 15);
+				if (c.t >= start && c.t < end && !(skip && c.t >= skip_from && c.t < skip_to))
+				{
+					emit_init();
+					if (has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
+					flush_wait();
+					body.insert(body.end(), &d[p], &d[p + c.len]);
+				}
+			}
 			else
 				other_blocks.insert(other_blocks.end(), &d[p], &d[p + c.len]);
 			return true;
@@ -2493,7 +2568,7 @@ static Bytes merge(const std::vector<VGMFile>& in)
 		v.commands([&](const Cmd& c) {
 			if (c.op == 0x66) return false;
 			if (k + 1 == loop_part && c.p == v.loop_ofs) { loop_body_ofs = body.size(); loop_t = total + c.t; found_loop = true; }
-			if (c.op == 0x67)
+			if (c.op == 0x67 && d[c.p + 2] != 0x98)   // a DSP state block (0x98) stays where it is in the stream
 			{
 				Bytes b(d + c.p, d + c.p + c.len);
 				if (seen.insert(b).second) blocks.insert(blocks.end(), b.begin(), b.end());

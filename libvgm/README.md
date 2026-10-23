@@ -1,0 +1,1 @@
+Copy of libvgm's TMS57002 core (branch es55xx of github.com/yoyofr/libvgm), used by vgm_trim to simulate the DSP of ZSG-2 logs at a cut point. Keep in sync with libvgm: the state block it writes must match what the player loads.

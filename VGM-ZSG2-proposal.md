@@ -72,6 +72,17 @@ emits them as channels 0x12 / 0x17 with (value & 0x3F) / 63.
 `67 66 97 size romsize start data`: the ZSG-2 sample ROM (32-bit little-endian blocks of four 7-bit
 compressed samples), plain byte offsets, one region.
 
+## DSP state data block 0x98
+
+`67 66 98 size statesize 0 data`: the complete state of the TMS57002 (status registers, accumulators,
+pointers, host interface, update queue, program, coefficients, internal memories, and the non-zero
+spans of the 256 KB external memory), little-endian, versioned (layout in `tms57002.h`). The player
+loads it where the block appears in the stream. It replaces the replay of the DSP host history with
+pre-runs at a cut point: a track cut late in a long session would otherwise carry up to minutes of DSP
+time to re-execute before its first note (4 to 16 s of loading on a phone). vgm_trim simulates the DSP
+with the player's own core from the start of the capture to the cut and writes the result, so the
+block is bit-exact with the replay it replaces (~3 KB when the delay memory is silent at the cut).
+
 ## Player model (libvgm)
 
 Per ZSG-2 sample: the 48 voices are mixed into the four outputs (clamped to 16 bits), scaled by the
@@ -105,7 +116,8 @@ with the uncut render in the first second, 0.98-0.99 after 6 s, level 1.00.
 ## Trim tool (vgm_trim)
 
 ZSG-2 logs are recognised from the header. At a cut point the tool re-creates the gains, the DSP
-(host write history with pre-runs), the control registers and every known voice register, and
+(simulated with libvgm's core from the start of the capture, written as a state block 0x98), the
+control registers and every known voice register, and
 re-keys the voices still playing at their computed position (position model from the key-on time,
 pitch, loop and end registers; current volume and filter ramps). `--cmp` drops the writes that do not
 change the chip state (never key on/off, current volume/filter values, DSP writes, or a ramp speed
