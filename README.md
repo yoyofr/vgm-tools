@@ -29,7 +29,8 @@ so it stays lossless and reversible; `--info` prints the current value.
 
 Local, single-file GD3 tag editor (open it in Chrome for in-place saving). Japanese tags, batch
 copy of a field to every loaded file, `.vgm` / `.vgz`, the header volume modifier (in dB, see
-`--volume` above), and a vgmrips pack generator (zip with the tracks, `.m3u`, `.txt` in the vgmrips
+`--volume` above), the loop modifier and loop base (0x7F / 0x7E: the player plays
+`default × modifier − base` loops), and a vgmrips pack generator (zip with the tracks, `.m3u`, `.txt` in the vgmrips
 layout and the pack `.png`).
 
 ## Related repositories

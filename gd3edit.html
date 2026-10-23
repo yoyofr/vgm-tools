@@ -54,6 +54,7 @@ main { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; mi
 .row.single { grid-template-columns: 130px minmax(0, 1fr) auto }
 .volbox { display: flex; gap: 10px; align-items: center; min-width: 0 }
 .volbox input { width: 7em; flex: none }
+.volbox span:not([id]) { color: var(--fg) }
 .volbox span { font-family: var(--mono); font-size: 12px; color: var(--muted) }
 @media (max-width: 760px) { .row.single { grid-template-columns: 1fr } }
 input[type=text], textarea { width: 100%; font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--fg) }
@@ -112,6 +113,7 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
       <div class="row single"><label for="creator">Rippé par</label><input type="text" id="creator" data-i="9"><button class="all" data-all="9">→ tous</button></div>
       <div class="row single"><label for="notes">Notes</label><textarea id="notes" data-i="10"></textarea><button class="all" data-all="10">→ tous</button></div>
       <div class="row single"><label for="vol">Volume (dB)</label><div class="volbox"><input type="number" id="vol" step="0.5" min="-12" max="36" placeholder="0"><span id="volHint"></span></div><button class="all" id="volAll">→ tous</button></div>
+      <div class="row single"><label for="loopMul">Boucles</label><div class="volbox"><span>×</span><input type="number" id="loopMul" step="0.25" min="0.0625" max="15.9375" placeholder="1"><span>−</span><input type="number" id="loopBase" step="1" min="-128" max="127" placeholder="0"><span id="loopHint"></span></div><button class="all" id="loopAll">→ tous</button></div>
     </div>
     <div id="info"></div>
   </section>
@@ -151,6 +153,17 @@ const VOL_DB = 20 * Math.log10(2) / 32;   // dB per modifier step
 function volModOf(b) { const ver = le32(b, 8), dataOfs = ver >= 0x150 ? le32(b, 0x34) + 0x34 : 0x40; if (ver < 0x160 || dataOfs <= 0x7C) return 0; const v = b[0x7C]; return v <= 0xC0 ? v : v === 0xC1 ? -64 : v - 0x100; }
 function volByte(n) { return n >= 0 ? n : n <= -64 ? 0xC1 : n + 0x100; }
 function volModFromDb(db) { return Math.max(-64, Math.min(192, Math.round(db / VOL_DB))); }
+// loop base (0x7E, signed) and loop modifier (0x7F, 4.4 fixed point, 0 = default): the player plays
+// round(default * modifier / 16) - base loops
+function loopFieldsOf(b) { const ver = le32(b, 8), dataOfs = ver >= 0x150 ? le32(b, 0x34) + 0x34 : 0x40; if (ver < 0x160 || dataOfs < 0x80) return { loopMod: 0, loopBase: 0 }; return { loopMod: b[0x7F], loopBase: b[0x7E] >= 0x80 ? b[0x7E] - 0x100 : b[0x7E] }; }
+function loopCount(f, dflt) { const n = f.loopMod ? Math.floor((dflt * f.loopMod + 8) / 16) : dflt; return n <= f.loopBase ? 1 : n - f.loopBase; }
+function loopText(f) {
+  if (!f.loopMod && !f.loopBase) return '';
+  const parts = [];
+  if (f.loopMod) parts.push('×' + (f.loopMod / 16));
+  if (f.loopBase) parts.push(f.loopBase > 0 ? '−' + f.loopBase : '+' + -f.loopBase);
+  return parts.join(' ') + ' (lecteur à 2 boucles : ' + loopCount(f, 2) + ')';
+}
 function volText(n) { return n ? (n * VOL_DB >= 0 ? '+' : '') + (n * VOL_DB).toFixed(2) + ' dB (×' + Math.pow(2, n / 32).toFixed(3) + ')' : ''; }
 
 function parseGd3(bytes) {
@@ -186,15 +199,19 @@ function rebuild(f) {
   const gd3 = encodeGd3(f.tags);
   // the volume modifier needs the VGM 1.60 header (0x80 bytes): pad the header of older files
   const ver = le32(body, 8), dataOfs = ver >= 0x150 ? le32(body, 0x34) + 0x34 : 0x40;
-  const pad = f.volMod && dataOfs < 0x80 ? 0x80 - dataOfs : 0;
+  const pad = (f.volMod || f.loopMod || f.loopBase) && dataOfs < 0x80 ? 0x80 - dataOfs : 0;
   const out = new Uint8Array(body.length + pad + gd3.length);
   out.set(body.subarray(0, dataOfs)); out.set(body.subarray(dataOfs), dataOfs + pad); out.set(gd3, body.length + pad);
   if (pad) {
     putLe32(out, 0x34, 0x80 - 0x34);
     if (le32(out, 0x1C)) putLe32(out, 0x1C, le32(out, 0x1C) + pad);
   }
-  if (f.volMod) { if (le32(out, 8) < 0x160) putLe32(out, 8, 0x160); out[0x7C] = volByte(f.volMod); }
-  else if (le32(out, 8) >= 0x160 && le32(out, 0x34) + 0x34 > 0x7C) out[0x7C] = 0;
+  if (f.volMod || f.loopMod || f.loopBase) { if (le32(out, 8) < 0x160) putLe32(out, 8, 0x160); }
+  if (le32(out, 8) >= 0x160 && le32(out, 0x34) + 0x34 >= 0x80) {
+    out[0x7C] = f.volMod ? volByte(f.volMod) : 0;
+    out[0x7E] = f.loopBase & 0xFF;
+    out[0x7F] = f.loopMod;
+  }
   putLe32(out, 0x14, body.length + pad - 0x14);
   putLe32(out, 0x04, out.length - 4);
   return out;
@@ -212,7 +229,7 @@ async function readFile(file, handle) {
   }
   if (bytes.length < 0x40 || String.fromCharCode(...bytes.subarray(0, 4)) !== 'Vgm ') throw new Error(file.name + ' : pas un fichier VGM');
   const g = parseGd3(bytes);
-  return { name: file.name, size: file.size, bytes, gz, raw, tags: g.tags, volMod: volModOf(bytes), dirty: false, handle, hadGd3: !!g.ofs };
+  return { name: file.name, size: file.size, bytes, gz, raw, tags: g.tags, volMod: volModOf(bytes), ...loopFieldsOf(bytes), dirty: false, handle, hadGd3: !!g.ofs };
 }
 
 async function addFiles(list, handles) {
@@ -294,6 +311,9 @@ function select(i) {
   inputs.forEach(inp => { inp.value = f.tags[+inp.dataset.i] || ''; });
   $('vol').value = f.volMod ? (f.volMod * VOL_DB).toFixed(2).replace(/\.?0+$/, '') : '';
   $('volHint').textContent = volText(f.volMod);
+  $('loopMul').value = f.loopMod ? String(f.loopMod / 16) : '';
+  $('loopBase').value = f.loopBase ? String(f.loopBase) : '';
+  $('loopHint').textContent = loopText(f);
   const b = f.bytes;
   const ver = le32(b, 8), total = le32(b, 0x18), loop = le32(b, 0x20);
   const clk = b.length > 0xD3 ? le32(b, 0xD0) : 0;
@@ -302,6 +322,7 @@ function select(i) {
     (b.length / 1048576).toFixed(2) + ' Mo'];
   if (clk) info.push((clk & 0x80000000 ? 'ES5506' : 'ES5505') + ' ' + ((clk & 0x3FFFFFFF) / 1e6).toFixed(3) + ' MHz');
   if (f.volMod) info.push('volume ' + volText(f.volMod));
+  if (f.loopMod || f.loopBase) info.push('boucles ' + loopText(f));
   $('info').innerHTML = info.map(t => '<span></span>').join('');
   [...$('info').children].forEach((el, k) => el.textContent = info[k]);
   renderList();
@@ -323,6 +344,25 @@ $('vol').addEventListener('input', () => {
   f.volMod = n;
   if (!f.dirty) { f.dirty = true; renderList(); }
 });
+function loopInput() {
+  if (current < 0) return;
+  const f = files[current], m = parseFloat($('loopMul').value), b = parseInt($('loopBase').value, 10);
+  const loopMod = isFinite(m) && m > 0 ? Math.max(1, Math.min(255, Math.round(m * 16))) : 0;
+  const loopBase = isFinite(b) ? Math.max(-128, Math.min(127, b)) : 0;
+  if (loopMod === f.loopMod && loopBase === f.loopBase) { $('loopHint').textContent = loopText(f); return; }
+  f.loopMod = loopMod; f.loopBase = loopBase;
+  $('loopHint').textContent = loopText(f);
+  if (!f.dirty) { f.dirty = true; renderList(); }
+}
+$('loopMul').addEventListener('input', loopInput);
+$('loopBase').addEventListener('input', loopInput);
+$('loopAll').onclick = () => {
+  if (current < 0) return;
+  const c = files[current];
+  files.forEach((f, i) => { if (i !== current && (f.loopMod !== c.loopMod || f.loopBase !== c.loopBase)) { f.loopMod = c.loopMod; f.loopBase = c.loopBase; f.dirty = true; } });
+  renderList();
+  setStatus('Boucles copiées dans ' + (files.length - 1) + ' autre(s) fichier(s)', 'ok');
+};
 $('volAll').onclick = () => {
   if (current < 0) return;
   files.forEach((f, i) => { if (i !== current && f.volMod !== files[current].volMod) { f.volMod = files[current].volMod; f.dirty = true; } });
