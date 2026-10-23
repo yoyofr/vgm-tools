@@ -1300,7 +1300,8 @@ static std::vector<std::pair<i64, i64>> activity(const VGMFile& vgm, i64 min_gap
 		}
 		else
 		{
-			if (gap_start >= 0 && c.t - gap_start >= min_gap) gaps.push_back({gap_start, c.t});
+			// the silence before the first note always ends a (leading) gap, whatever its length
+			if (gap_start >= 0 && (c.t - gap_start >= min_gap || gaps.empty())) gaps.push_back({gap_start, c.t});
 			gap_start = -1;
 		}
 		last_t = c.t;
