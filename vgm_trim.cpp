@@ -1723,6 +1723,20 @@ static std::vector<std::pair<i64, i64>> find_segments(const Wav& w, int silence_
 	size_t win = w.sr / 100;
 	std::vector<int> peaks = window_peaks(w, win);
 	if (silence_peak < 0) { silence_peak = auto_silence(peaks); printf("silence threshold (auto, from the noise floor): peak <= %d\n", silence_peak); }
+	// the chip initialisation at t = 0 leaves a DC step in the first window(s): a burst shorter than 50 ms
+	// at the very start of the capture, followed by at least 0.5 s of silence, is not sound
+	{
+		size_t first = 0, last = 0;
+		while (first < peaks.size() && peaks[first] <= silence_peak) first++;
+		for (last = first; last < peaks.size() && peaks[last] > silence_peak; last++);
+		size_t quiet = 0;
+		while (last + quiet < peaks.size() && peaks[last + quiet] <= silence_peak) quiet++;
+		if (first < 5 && last < first + 5 && last < peaks.size() && quiet >= 50)
+		{
+			printf("start-up click at %s ignored (%zu ms, then %.2f s of silence)\n", fmt_pos((i64)(first * win * SAMPLE_RATE / w.sr)).c_str(), (last - first) * 10, quiet * 0.01);
+			for (size_t k = first; k < last; k++) peaks[k] = 0;
+		}
+	}
 	std::vector<std::pair<i64, i64>> segs;
 	bool in_seg = false;
 	size_t seg_start = 0, seg_last = 0, silent_run = 0, idx = 0;
