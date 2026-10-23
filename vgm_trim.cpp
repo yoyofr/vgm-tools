@@ -14,6 +14,7 @@
 #include <zlib.h>
 #include <array>
 #include <cmath>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <strings.h>
 #include <unistd.h>
 
 typedef uint8_t u8;
@@ -871,6 +873,14 @@ struct TrimStats { i64 kept = 0, dropped = 0, skipped = 0; size_t rom_bytes = 0;
 // skip_from..skip_to: commands of that range are not emitted (the first repetition of a song whose
 // loop body is taken from the second one); the state they leave is re-created at the splice, except
 // the key-ons of voices that only play there
+// --volume: VGM header volume modifier (offset 0x7C, VGM 1.60+): the player applies 2^(n/32) to the output.
+// n is -64..192 (0xC1..0xFF code -63..-1, 0xC0 is not used); INT_MIN leaves the header untouched.
+static int g_volume_mod = INT_MIN;
+static int volume_mod_from_db(double db) { return (int)std::lround(db * 32.0 / (20.0 * std::log10(2.0))); }
+static double volume_db_from_mod(int n) { return n * (20.0 * std::log10(2.0)) / 32.0; }
+static int volume_mod_from_byte(u8 b) { return b <= 0xC0 ? b : (b == 0xC1 ? -64 : (int)b - 0x100); }
+static u8 volume_byte_from_mod(int n) { return n >= 0 ? (u8)n : (n <= -64 ? 0xC1 : (u8)(n + 0x100)); }
+
 static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 end, bool do_cmp, bool do_sro, bool keep_gd3,
                   i64 sro_margin, i64 sro_gap, TrimStats& stats, i64 skip_from = 0, i64 skip_to = 0)
 {
@@ -1178,6 +1188,13 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 		if (le32(&out[0x08]) < 0x172) put_le32(&out[0x08], 0x172);
 		if (out.size() < 0x100) { out.resize(0x100, 0); put_le32(&out[0x34], 0x100 - 0x34); }
 	}
+	if (g_volume_mod != INT_MIN)
+	{
+		// the volume modifier needs the VGM 1.60 header (0x80 bytes)
+		if (le32(&out[0x08]) < 0x160) put_le32(&out[0x08], 0x160);
+		if (out.size() < 0x80) { out.resize(0x80, 0); put_le32(&out[0x34], 0x80 - 0x34); }
+		out[0x7C] = volume_byte_from_mod(g_volume_mod);
+	}
 	size_t data_start = out.size();
 	put_le32(&out[0x18], (u32)(end - start - (skip ? skip_to - skip_from : 0)));
 	if (has_loop)
@@ -1228,6 +1245,11 @@ static void info(const VGMFile& vgm)
 		return true;
 	});
 	printf("version %X, total %s, loop %s\n", vgm.version, fmt_pos(vgm.total).c_str(), vgm.loop_ofs ? fmt_pos(vgm.loop_samples).c_str() : "none");
+	if (vgm.version >= 0x160 && vgm.data_ofs > 0x7C && vgm.data[0x7C] != 0)
+	{
+		int n = volume_mod_from_byte(vgm.data[0x7C]);
+		printf("volume modifier %d (%+.2f dB, x%.3f)\n", n, volume_db_from_mod(n), std::pow(2.0, n / 32.0));
+	}
 	printf("ES5506 clock %08X (%s, %d pair(s))\n", vgm.es5506_clock, vgm.is_es5506 ? "ES5506" : "ES5505", vgm.data.size() > 0xD5 ? vgm.data[0xD5] : 0);
 	printf("data blocks: %s\n", blocks.c_str());
 	std::string cmds;
@@ -1836,6 +1858,8 @@ static void usage()
 	        "  --sro-margin N         --sro: margin in words around each used range (default 256)\n"
 	        "  --sro-gap N            --sro: merge used ranges closer than this many words (default 0)\n"
 	        "  --gd3 keep|drop        keep the GD3 tag (default keep)\n"
+	        "  --volume D             set the header volume modifier (VGM 1.60+) from a gain in dB (e.g. +6dB, -3): the player\n"
+	        "                         applies 2^(n/32), n = round(D / 6.02 * 32), range -64..192 (-12 dB..+36 dB); 0 removes it\n"
 	        "  --auto                 split the capture into tracks separated by silence\n"
 	        "  --split wav|log        --auto: from the rendered audio (needs vgm2wav) or from the log (default wav)\n"
 	        "  --track N|all|0        --auto: track to extract (default 1), all = every track to output_NN, 0 = list only\n"
@@ -1876,6 +1900,16 @@ int main(int argc, char** argv)
 		else if (name == "--end") value(end_s);
 		else if (name == "--loop") value(loop_s);
 		else if (name == "--gd3") value(gd3);
+		else if (name == "--volume")
+		{
+			std::string v; value(v);
+			char* e = nullptr;
+			double db = strtod(v.c_str(), &e);
+			if (e == v.c_str() || (*e && strcasecmp(e, "dB") != 0)) { fprintf(stderr, "--volume: expected a gain in dB, got %s\n", v.c_str()); usage(); }
+			g_volume_mod = volume_mod_from_db(db);
+			if (g_volume_mod < -64 || g_volume_mod > 192) { fprintf(stderr, "--volume: %s is out of range (-12 dB..+36 dB)\n", v.c_str()); usage(); }
+			fprintf(stderr, "volume modifier %d (%+.2f dB requested, %+.2f dB applied, x%.3f)\n", g_volume_mod, db, volume_db_from_mod(g_volume_mod), std::pow(2.0, g_volume_mod / 32.0));
+		}
 		else if (name == "--split") value(split);
 		else if (name == "--track") value(track);
 		else if (name == "--vgm2wav") value(vgm2wav);
