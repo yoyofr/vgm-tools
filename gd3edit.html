@@ -105,7 +105,7 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
   <section class="panel">
     <div id="form">
       <div class="head"><span></span><span>English</span><span>日本語</span><span></span></div>
-      <div class="row"><label for="trackE">Titre</label><input type="text" id="trackE" data-i="0"><input type="text" id="trackJ" data-i="1" lang="ja"><button class="all" id="titleFromFile" title="Titre anglais depuis le nom du fichier (sans numéro de piste ni extension) ; Maj+clic : tous les fichiers">← fichier</button></div>
+      <div class="row"><label for="trackE">Titre</label><input type="text" id="trackE" data-i="0"><input type="text" id="trackJ" data-i="1" lang="ja"><button class="all" id="titleFromFile" title="Titres anglais et japonais depuis le nom du fichier (sans numéro de piste ni extension) ; Maj+clic : tous les fichiers">← fichier</button></div>
       <div class="row"><label for="gameE">Jeu</label><input type="text" id="gameE" data-i="2"><input type="text" id="gameJ" data-i="3" lang="ja"><button class="all" data-all="2,3">→ tous</button></div>
       <div class="row"><label for="systemE">Système</label><input type="text" id="systemE" data-i="4"><input type="text" id="systemJ" data-i="5" lang="ja"><button class="all" data-all="4,5">→ tous</button></div>
       <div class="row"><label for="authorE">Compositeur</label><input type="text" id="authorE" data-i="6"><input type="text" id="authorJ" data-i="7" lang="ja"><button class="all" data-all="6,7">→ tous</button></div>
@@ -346,8 +346,9 @@ $('titleFromFile').onclick = e => {
   if (current < 0) return;
   const targets = e.shiftKey ? files : [files[current]];
   let n = 0;
-  for (const f of targets) { const t = titleFromName(f.name); if (f.tags[0] !== t) { f.tags[0] = t; f.dirty = true; n++; } }
+  for (const f of targets) { const t = titleFromName(f.name); if (f.tags[0] !== t || f.tags[1] !== t) { f.tags[0] = t; f.tags[1] = t; f.dirty = true; n++; } }
   $('trackE').value = files[current].tags[0];
+  $('trackJ').value = files[current].tags[1];
   renderList();
   setStatus(e.shiftKey ? 'Titre initialisé depuis le nom de fichier pour ' + n + ' fichier(s)' : 'Titre : « ' + files[current].tags[0] + ' »', 'ok');
 };
