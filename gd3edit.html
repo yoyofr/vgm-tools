@@ -105,7 +105,7 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
   <section class="panel">
     <div id="form">
       <div class="head"><span></span><span>English</span><span>日本語</span><span></span></div>
-      <div class="row"><label for="trackE">Titre</label><input type="text" id="trackE" data-i="0"><input type="text" id="trackJ" data-i="1" lang="ja"><span></span></div>
+      <div class="row"><label for="trackE">Titre</label><input type="text" id="trackE" data-i="0"><input type="text" id="trackJ" data-i="1" lang="ja"><button class="all" id="titleFromFile" title="Titre anglais depuis le nom du fichier (sans numéro de piste ni extension) ; Maj+clic : tous les fichiers">← fichier</button></div>
       <div class="row"><label for="gameE">Jeu</label><input type="text" id="gameE" data-i="2"><input type="text" id="gameJ" data-i="3" lang="ja"><button class="all" data-all="2,3">→ tous</button></div>
       <div class="row"><label for="systemE">Système</label><input type="text" id="systemE" data-i="4"><input type="text" id="systemJ" data-i="5" lang="ja"><button class="all" data-all="4,5">→ tous</button></div>
       <div class="row"><label for="authorE">Compositeur</label><input type="text" id="authorE" data-i="6"><input type="text" id="authorJ" data-i="7" lang="ja"><button class="all" data-all="6,7">→ tous</button></div>
@@ -165,6 +165,13 @@ function loopText(f) {
   return parts.join(' ') + ' (lecteur à 2 boucles : ' + loopCount(f, 2) + ')';
 }
 function volText(n) { return n ? (n * VOL_DB >= 0 ? '+' : '') + (n * VOL_DB).toFixed(2) + ' dB (×' + Math.pow(2, n / 32).toFixed(3) + ')' : ''; }
+
+// title from the file name: the track number prefix (digits, optional separator) and the extension are removed
+function titleFromName(name) {
+  const base = name.replace(/\.(vgm|vgz|gz)$/i, '').replace(/\.vgm$/i, '');
+  const t = base.replace(/^\d+\s*[-_.:]?\s*/, '').trim();
+  return t || base;
+}
 
 function parseGd3(bytes) {
   const tags = Array(FIELDS).fill('');
@@ -334,6 +341,16 @@ inputs.forEach(inp => inp.addEventListener('input', () => {
   f.tags[+inp.dataset.i] = inp.value;
   if (!f.dirty) { f.dirty = true; renderList(); }
 }));
+
+$('titleFromFile').onclick = e => {
+  if (current < 0) return;
+  const targets = e.shiftKey ? files : [files[current]];
+  let n = 0;
+  for (const f of targets) { const t = titleFromName(f.name); if (f.tags[0] !== t) { f.tags[0] = t; f.dirty = true; n++; } }
+  $('trackE').value = files[current].tags[0];
+  renderList();
+  setStatus(e.shiftKey ? 'Titre initialisé depuis le nom de fichier pour ' + n + ' fichier(s)' : 'Titre : « ' + files[current].tags[0] + ' »', 'ok');
+};
 
 $('vol').addEventListener('input', () => {
   if (current < 0) return;
