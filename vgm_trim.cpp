@@ -160,7 +160,7 @@ struct VGMFile
 		data_ofs = (version >= 0x150) ? le32(&data[0x34]) + 0x34 : 0x40;
 		es5506_clock = (data_ofs > 0xD3) ? le32(&data[0xD0]) : 0;
 		is_es5506 = (es5506_clock & 0x80000000) != 0;
-		zsg2_clock = (data_ofs > 0x103) ? le32(&data[0x100]) : 0;   // VGM 1.73: ZSG-2 (Taito Zoom) at 0x100
+		zsg2_clock = (data_ofs > 0x103) ? le32(&data[0x100]) : 0;   // VGM 1.72 extension: ZSG-2 (Taito Zoom) clock at 0x100 (header 0x110)
 		is_zsg2 = zsg2_clock != 0;
 	}
 
@@ -881,6 +881,10 @@ struct TrimStats { i64 kept = 0, dropped = 0, skipped = 0; size_t rom_bytes = 0;
 // --volume: VGM header volume modifier (offset 0x7C, VGM 1.60+): the player applies 2^(n/32) to the output.
 // n is -64..192 (0xC1..0xFF code -63..-1, 0xC0 is not used); INT_MIN leaves the header untouched.
 static int g_volume_mod = INT_MIN;
+
+// the ES55xx / ZSG-2 extensions stay at VGM 1.72 while nothing is validated upstream; early ZSG-2
+// captures were written as 1.73 and are brought back to 1.72 by every output path
+static void fix_version(Bytes& out) { if (out.size() >= 0x0C && le32(&out[0x08]) == 0x173) put_le32(&out[0x08], 0x172); }
 static int volume_mod_from_db(double db) { return (int)std::lround(db * 32.0 / (20.0 * std::log10(2.0))); }
 static double volume_db_from_mod(int n) { return n * (20.0 * std::log10(2.0)) / 32.0; }
 static int volume_mod_from_byte(u8 b) { return b <= 0xC0 ? b : (b == 0xC1 ? -64 : (int)b - 0x100); }
@@ -1193,6 +1197,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 		if (le32(&out[0x08]) < 0x172) put_le32(&out[0x08], 0x172);
 		if (out.size() < 0x100) { out.resize(0x100, 0); put_le32(&out[0x34], 0x100 - 0x34); }
 	}
+	fix_version(out);
 	if (g_volume_mod != INT_MIN)
 	{
 		// the volume modifier needs the VGM 1.60 header (0x80 bytes)
@@ -1795,6 +1800,7 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 	stats.rom_bytes = rom.blocks(blocks, 0x00, do_sro ? &st.rom_used : nullptr, sro_margin, sro_gap);
 
 	Bytes out(vgm.data.begin(), vgm.data.begin() + vgm.data_ofs);
+	fix_version(out);
 	if (g_volume_mod != INT_MIN) out[0x7C] = volume_byte_from_mod(g_volume_mod);
 	size_t data_start = out.size();
 	put_le32(&out[0x18], (u32)(end - start));
@@ -2360,6 +2366,7 @@ static Bytes merge(const std::vector<VGMFile>& in)
 		out.insert(out.end(), a.data.begin() + a.gd3, a.data.begin() + e);
 	}
 	else put_le32(&out[0x14], 0);
+	fix_version(out);
 	put_le32(&out[0x04], (u32)(out.size() - 4));
 	printf("merged: %s%s, %zu data block(s)\n", fmt_pos(total).c_str(), loop_t >= 0 ? (", loop " + fmt_pos(total - loop_t)).c_str() : "", seen.size());
 	return out;
@@ -2419,6 +2426,7 @@ static void usage()
 	        "  --gd3 keep|drop        keep the GD3 tag (default keep)\n"
 	        "  --append FILE          append FILE (repeatable) to the input and write the result: header, GD3 and volume of the\n"
 	        "                         input, loop of the last part that has one; no other processing\n"
+	        "  (no option)            rewrite the input as is (.vgm <-> .vgz, loop kept); files written as VGM 1.73 become 1.72\n"
 	        "  --volume D             set the header volume modifier (VGM 1.60+) from a gain in dB (e.g. +6dB, -3): the player\n"
 	        "                         applies 2^(n/32), n = round(D / 6.02 * 32), range -64..192 (-12 dB..+36 dB); 0 removes it\n"
 	        "  --auto                 split the capture into tracks separated by silence\n"
@@ -2501,6 +2509,16 @@ int main(int argc, char** argv)
 		Bytes out = merge(parts);
 		write_output(output, out);
 		printf("%s -> %s: %zu bytes\n", input.c_str(), output.c_str(), out.size());
+		return 0;
+	}
+
+	if (!f_auto && !f_find_loop && !f_cmp && !f_sro && start_s.empty() && end_s.empty() && loop_s.empty() && g_volume_mod == INT_MIN && gd3 == "keep")
+	{
+		// nothing to trim: rewrite the file as is (loop kept), only the version word is normalised
+		Bytes out = vgm.data;
+		fix_version(out);
+		write_output(output, out);
+		printf("%s -> %s: rewritten unchanged (version %X), %zu bytes\n", input.c_str(), output.c_str(), le32(&out[0x08]), out.size());
 		return 0;
 	}
 

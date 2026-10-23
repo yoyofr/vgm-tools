@@ -19,6 +19,7 @@ vgm_trim capture.vgm out.vgz --auto --split log --track all --cmp --sro --find-l
 vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --loop 30.0s --cmp --sro
 vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --volume +6dB
 vgm_trim part1.vgz merged.vgz --append part2.vgz
+vgm_trim capture.vgm capture.vgz            # no option: rewrite as is (loop kept); 1.73 files become 1.72
 ```
 
 All reductions are output-neutral: rendered audio is byte-identical before and after.
@@ -32,7 +33,7 @@ streams in order. The initial register image of an appended part re-creates its 
 junction and the ESP keeps the tail of the previous part. Header, GD3 and volume come from the
 first part, the loop from the last part that has one.
 
-ZSG-2 logs (Taito FX-1B / G-NET, VGM 1.73) are handled by a dedicated path: a cut re-creates the
+ZSG-2 logs (Taito FX-1B / G-NET, VGM 1.72 with a 0x110-byte header) are handled by a dedicated path: a cut re-creates the
 board gains, the DSP (host write history replayed with pre-runs), the register image and re-keys the
 voices still playing at their computed position; `--cmp`, `--sro`, `--find-loop` and `--split log` use
 a ZSG-2 voice model. `--loop-pass 2` is not available for them.

@@ -8,8 +8,9 @@ The Taito Zoom sound board (Taito FX-1B: Ray Storm, G-Darius; Taito G-NET: Ray C
 MN10200 sound CPU driving a ZOOM ZSG-2 48-voice wavetable chip whose four outputs (reverb send, chorus
 send, direct left, direct right) go through a Texas Instruments TMS57002 effects DSP programmed by the
 sound CPU. Neither chip exists in VGM 1.71. This extension adds one header field, one fixed-length
-reserved opcode (0xE4, 5 bytes) and one ROM data block type (0x97). Files using it are VGM 1.73 with a
-0x110-byte header. Implemented on both sides (MAME 0.288 logger on top of vgmlog0288, libvgm with a C
+reserved opcode (0xE4, 5 bytes) and one ROM data block type (0x97). Files using it stay VGM 1.72 (the
+draft version of the ES55xx extension, nothing validated by Valley Bell yet) with the header grown to
+0x110 bytes. Implemented on both sides (MAME 0.288 logger on top of vgmlog0288, libvgm with a C
 port of MAME's ZSG-2 core and a C++ port of MAME's TMS57002 core). Replay of Ray Storm matches MAME's
 own output of the sound board: level 1.00, waveform correlation 0.98-1.00 at the native 32552 Hz rate
 (brief dips at note attacks come from the 44100 Hz quantisation of the write times).
@@ -38,7 +39,7 @@ of the sound board does not contain.
 | 0x100 | 32 | ZSG-2 clock (25000000 on the Taito Zoom board); bit 30 = dual chip |
 | 0x104 | 12 | reserved |
 
-Version (0x08): 0x00000173, data offset >= 0x110.
+Version (0x08): 0x00000172, data offset >= 0x110 (players read the field only when the header reaches it).
 
 ## Command 0xE4 ss aa dddd
 
