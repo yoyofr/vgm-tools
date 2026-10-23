@@ -24,6 +24,9 @@ vgm_trim capture.vgm capture.vgz            # no option: rewrite as is (loop kep
 
 All reductions are output-neutral: rendered audio is byte-identical before and after.
 
+The console output uses sections, status lines and tables; colours when stdout is a terminal
+(`--color auto|always|never`, `NO_COLOR` honoured).
+
 `--volume` sets the VGM header volume modifier (offset 0x7C, VGM 1.60+): the player applies
 2^(n/32) to its output, n = round(dB / 6.02 × 32), range -12 dB..+36 dB. The chip data is untouched,
 so it stays lossless and reversible; `--info` prints the current value.

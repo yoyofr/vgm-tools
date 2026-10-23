@@ -25,6 +25,8 @@
 #include <unordered_map>
 #include <vector>
 #include <strings.h>
+#include <cstdarg>
+#include <initializer_list>
 #include <unistd.h>
 
 typedef uint8_t u8;
@@ -45,11 +47,7 @@ static void put_le32(u8* p, u32 v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[
 static void push_le32(Bytes& b, u32 v) { b.push_back(v); b.push_back(v >> 8); b.push_back(v >> 16); b.push_back(v >> 24); }
 static void push_be16(Bytes& b, u32 v) { b.push_back((v >> 8) & 0xFF); b.push_back(v & 0xFF); }
 
-[[noreturn]] static void die(const std::string& msg)
-{
-	fprintf(stderr, "%s\n", msg.c_str());
-	exit(1);
-}
+[[noreturn]] static void die(const std::string& msg);
 
 static std::string fmt_pos(i64 samples)
 {
@@ -69,6 +67,116 @@ static i64 parse_pos(const std::string& txt)
 		return (i64)llround(atof(txt.substr(0, txt.size() - 1).c_str()) * SAMPLE_RATE);
 	return atoll(txt.c_str());
 }
+
+// ---------------------------------------------------------------------------------------------
+// console output: status lines, sections and tables (colours when stdout is a terminal)
+// ---------------------------------------------------------------------------------------------
+namespace ui
+{
+static bool color = false;
+static const char* C_RESET = "\033[0m", *C_BOLD = "\033[1m", *C_DIM = "\033[2m", *C_RED = "\033[31m", *C_GREEN = "\033[32m",
+                  *C_YELLOW = "\033[33m", *C_CYAN = "\033[36m";
+static inline const char* esc(const char* c) { return color ? c : ""; }
+static std::string strf(const char* fmt, ...)
+{
+	char buf[1024];
+	va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+	return buf;
+}
+static size_t width(const std::string& s)   // display width (UTF-8 code points, escapes excluded)
+{
+	size_t n = 0;
+	for (size_t i = 0; i < s.size(); i++)
+	{
+		if (s[i] == '\033') { while (i < s.size() && s[i] != 'm') i++; continue; }
+		if (((unsigned char)s[i] & 0xC0) != 0x80) n++;
+	}
+	return n;
+}
+static void line(FILE* f, const char* icon, const char* col, const std::string& msg)
+{
+	fprintf(f, "%s%s%s %s\n", esc(col), icon, esc(C_RESET), msg.c_str());
+}
+static void ok(const std::string& msg) { line(stdout, "✔", C_GREEN, msg); }
+static void info(const std::string& msg) { line(stdout, "•", C_CYAN, msg); }
+static void warn(const std::string& msg) { line(stdout, "⚠", C_YELLOW, std::string(esc(C_YELLOW)) + msg + esc(C_RESET)); }
+static void err(const std::string& msg) { line(stderr, "✖", C_RED, std::string(esc(C_RED)) + msg + esc(C_RESET)); }
+static void section(const std::string& title)
+{
+	printf("\n%s%s── %s ──%s\n", esc(C_BOLD), esc(C_CYAN), title.c_str(), esc(C_RESET));
+}
+static std::string pad(const std::string& s, size_t w, bool right)
+{
+	size_t n = width(s);
+	if (n >= w) return s;
+	return right ? std::string(w - n, ' ') + s : s + std::string(w - n, ' ');
+}
+struct Table
+{
+	std::vector<std::string> head;
+	std::vector<bool> right;
+	std::vector<std::vector<std::string>> rows;
+	Table(std::initializer_list<const char*> h, std::initializer_list<bool> r = {}) : head(h.begin(), h.end()), right(r.begin(), r.end()) { right.resize(head.size(), false); }
+	void add(std::initializer_list<std::string> cells) { rows.emplace_back(cells.begin(), cells.end()); rows.back().resize(head.size()); }
+	void print() const
+	{
+		std::vector<size_t> w(head.size());
+		for (size_t c = 0; c < head.size(); c++)
+		{
+			w[c] = width(head[c]);
+			for (const auto& r : rows) w[c] = std::max(w[c], width(r[c]));
+		}
+		auto rule = [&](const char* l, const char* m, const char* r) {
+			std::string s = esc(C_DIM); s += l;
+			for (size_t c = 0; c < w.size(); c++) { for (size_t k = 0; k < w[c] + 2; k++) s += "─"; s += c + 1 < w.size() ? m : r; }
+			s += esc(C_RESET); printf("%s\n", s.c_str());
+		};
+		auto row = [&](const std::vector<std::string>& r, bool bold) {
+			std::string s = std::string(esc(C_DIM)) + "│" + esc(C_RESET);
+			for (size_t c = 0; c < w.size(); c++)
+				s += " " + std::string(bold ? esc(C_BOLD) : "") + pad(r[c], w[c], right[c]) + esc(C_RESET) + " " + esc(C_DIM) + "│" + esc(C_RESET);
+			printf("%s\n", s.c_str());
+		};
+		rule("┌", "┬", "┐");
+		if (!head.empty() && !head[0].empty()) { row(head, true); rule("├", "┼", "┤"); }
+		for (const auto& r : rows) row(r, false);
+		rule("└", "┴", "┘");
+	}
+};
+// key / value table without a header
+struct KV
+{
+	Table t{{"", ""}};
+	void add(const std::string& k, const std::string& v) { t.add({std::string(esc(C_BOLD)) + k + esc(C_RESET), v}); }
+	void print() const { t.print(); }
+};
+static std::string secs(i64 samples) { return strf("%.2f s", (double)samples / SAMPLE_RATE); }
+static std::string basename(const std::string& path) { size_t k = path.find_last_of('/'); return k == std::string::npos ? path : path.substr(k + 1); }
+static std::string bytes(size_t n)
+{
+	if (n >= 1 << 20) return strf("%.2f MB", n / 1048576.0);
+	if (n >= 1 << 10) return strf("%.1f KB", n / 1024.0);
+	return strf("%zu B", n);
+}
+static std::string grid(const std::vector<std::pair<std::string, std::string>>& cells, int per_line)
+{
+	// compact "key:value" grid, `per_line` cells per line
+	std::string s;
+	int col = 0;
+	size_t kw = 0, vw = 0;
+	for (auto& c : cells) { kw = std::max(kw, width(c.first)); vw = std::max(vw, width(c.second)); }
+	for (auto& c : cells)
+	{
+		s += (col == 0 ? "  " : "  ") + std::string(esc(C_DIM)) + pad(c.first, kw, true) + esc(C_RESET) + ":" + pad(c.second, vw, true);
+		if (++col == per_line) { s += "\n"; col = 0; }
+	}
+	if (col) s += "\n";
+	return s;
+}
+}	// namespace ui
+using ui::strf;
+
+[[noreturn]] static void die(const std::string& msg) { ui::err(msg); exit(1); }
 
 static int cmd_length(u8 op)
 {
@@ -1004,9 +1112,9 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 				if (diff) { changed++; }
 			}
 			if (sustained || stopped || changed)
-				printf("loop point, chip %d: voice state differs between the loop point and the end of the loop body "
-				       "(%d voices still playing at the loop point only, %d at the end only, %d with other parameters); "
-				       "the second pass converges as the driver re-keys them\n", ci + 1, sustained, stopped, changed);
+				ui::info(strf("loop point, chip %d: voice state differs between the loop point and the end of the loop body "
+				              "(%d voices still playing at the loop point only, %d at the end only, %d with other parameters); "
+				              "the second pass converges as the driver re-keys them", ci + 1, sustained, stopped, changed));
 		}
 	};
 	// re-create, before the loop point, the state left by the skipped repetition: registers that
@@ -1238,15 +1346,16 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 static void info(const VGMFile& vgm)
 {
 	std::map<int, i64> counts;
-	std::string blocks;
+	struct BlkInfo { int n = 0; size_t bytes = 0; i64 first_t = 0; };
+	std::map<int, BlkInfo> blocks;
 	std::set<int> other;
 	vgm.commands([&](const Cmd& c) {
 		counts[c.op]++;
 		if (c.op == 0x67)
 		{
-			char buf[96];
-			snprintf(buf, sizeof(buf), "%stype %02X %zu bytes @%s", blocks.empty() ? "" : ", ", vgm.data[c.p + 2], c.len - 7, fmt_pos(c.t).c_str());
-			blocks += buf;
+			BlkInfo& b = blocks[vgm.data[c.p + 2]];
+			if (b.n == 0) b.first_t = c.t;
+			b.n++; b.bytes += c.len - 7;
 		}
 		u8 op = c.op;
 		if ((op >= 0x50 && op <= 0x5F) || (op >= 0x30 && op <= 0x4E) ||
@@ -1254,28 +1363,52 @@ static void info(const VGMFile& vgm)
 			other.insert(op);
 		return true;
 	});
-	printf("version %X, total %s, loop %s\n", vgm.version, fmt_pos(vgm.total).c_str(), vgm.loop_ofs ? fmt_pos(vgm.loop_samples).c_str() : "none");
+	ui::section("File");
+	ui::KV kv;
+	kv.add("Version", strf("%X.%02X (header 0x%X)%s", vgm.version >> 8, vgm.version & 0xFF, vgm.data_ofs, vgm.version == 0x173 ? ", early ZSG-2 logger: written back as 1.72 on output" : ""));
+	kv.add("Length", fmt_pos(vgm.total));
+	kv.add("Loop", vgm.loop_ofs ? fmt_pos(vgm.loop_samples) : "none");
 	if (vgm.version >= 0x160 && vgm.data_ofs > 0x7C && vgm.data[0x7C] != 0)
 	{
 		int n = volume_mod_from_byte(vgm.data[0x7C]);
-		printf("volume modifier %d (%+.2f dB, x%.3f)\n", n, volume_db_from_mod(n), std::pow(2.0, n / 32.0));
+		kv.add("Volume", strf("%+.2f dB (modifier %d, x%.3f)", volume_db_from_mod(n), n, std::pow(2.0, n / 32.0)));
 	}
-	if (vgm.is_zsg2) printf("ZSG-2 clock %u Hz (%u Hz output, TMS57002 DSP at %u Hz)\n", vgm.zsg2_clock, vgm.zsg2_clock / 768, vgm.zsg2_clock / 2);
-	else printf("ES5506 clock %08X (%s, %d pair(s))\n", vgm.es5506_clock, vgm.is_es5506 ? "ES5506" : "ES5505", vgm.data.size() > 0xD5 ? vgm.data[0xD5] : 0);
-	printf("data blocks: %s\n", blocks.c_str());
-	std::string cmds;
-	for (auto& kv : counts) { char buf[32]; snprintf(buf, sizeof(buf), "%s%02X:%lld", cmds.empty() ? "" : ", ", kv.first, (long long)kv.second); cmds += buf; }
-	printf("commands: %s\n", cmds.c_str());
+	if (vgm.is_zsg2) kv.add("Chip", strf("ZSG-2 at %u Hz (%u Hz output), TMS57002 DSP at %u Hz", vgm.zsg2_clock, vgm.zsg2_clock / 768, vgm.zsg2_clock / 2));
+	else if (vgm.es5506_clock) kv.add("Chip", strf("%s at %u Hz, %d stereo pair(s)%s", vgm.is_es5506 ? "ES5506" : "ES5505", vgm.es5506_clock & 0x3FFFFFFF, vgm.data.size() > 0xD5 ? vgm.data[0xD5] : 0, (vgm.es5506_clock & 0x40000000) ? ", dual" : ""));
+	else kv.add("Chip", "no ES55xx / ZSG-2 clock");
+	kv.add("Size", ui::bytes(vgm.data.size()));
+	kv.print();
+	if (!blocks.empty())
+	{
+		ui::Table bt({"Data block type", "Blocks", "Bytes", "First at"}, {false, true, true, false});
+		for (auto& b : blocks) bt.add({strf("%02X", b.first), strf("%d", b.second.n), ui::bytes(b.second.bytes), fmt_pos(b.second.first_t)});
+		bt.print();
+	}
+	ui::Table ct({"Command", "Count"}, {false, true});
+	for (auto& kvp : counts) ct.add({strf("%02X", kvp.first), strf("%lld", (long long)kvp.second)});
+	ct.print();
 	if (!other.empty())
 	{
-		std::string s;
-		for (int o : other) { char buf[8]; snprintf(buf, sizeof(buf), "%s%02X", s.empty() ? "" : " ", o); s += buf; }
-		printf("WARNING: commands of other chips present (%s), their state is not re-created by trimming\n", s.c_str());
+		std::string o;
+		for (int op : other) { char buf[8]; snprintf(buf, sizeof(buf), "%s%02X", o.empty() ? "" : " ", op); o += buf; }
+		ui::warn("commands of other chips present (" + o + "), their state is not re-created by trimming");
 	}
 }
 
 // gaps where no voice is audible (running with a non-zero volume)
 static std::vector<std::pair<i64, i64>> zsg2_activity(const VGMFile& vgm, i64 min_gap, bool quiet);
+static void print_activity(const std::map<i64, int>& per_sec, const std::vector<std::pair<i64, i64>>& gaps, i64 min_gap)
+{
+	ui::section("Running voices per second (max)");
+	std::vector<std::pair<std::string, std::string>> cells;
+	for (auto& kv : per_sec) cells.push_back({strf("%lld", (long long)kv.first), strf("%d", kv.second)});
+	printf("%s", ui::grid(cells, 12).c_str());
+	ui::section("Silent gaps (>= " + ui::secs(min_gap) + ")");
+	if (gaps.empty()) { ui::info("none"); return; }
+	ui::Table t({"From", "To", "Length"}, {false, false, true});
+	for (auto& g : gaps) t.add({fmt_pos(g.first), fmt_pos(g.second), ui::secs(g.second - g.first)});
+	t.print();
+}
 static std::vector<std::pair<i64, i64>> activity(const VGMFile& vgm, i64 min_gap, bool quiet)
 {
 	if (vgm.is_zsg2) return zsg2_activity(vgm, min_gap, quiet);
@@ -1322,17 +1455,7 @@ static std::vector<std::pair<i64, i64>> activity(const VGMFile& vgm, i64 min_gap
 	});
 	if (gap_start >= 0 && last_t - gap_start >= min_gap) gaps.push_back({gap_start, last_t});
 	if (quiet) return gaps;
-	printf("running voices per second (max):\n");
-	int col = 0;
-	for (auto& kv : per_sec)
-	{
-		printf("%s%3lld:%2d", col == 0 ? "  " : " ", (long long)kv.first, kv.second);
-		if (++col == 12) { printf("\n"); col = 0; }
-	}
-	if (col) printf("\n");
-	printf("gaps with no running voice (>= %s):\n", fmt_pos(min_gap).c_str());
-	for (auto& g : gaps)
-		printf("  %s .. %s (%.2f s)\n", fmt_pos(g.first).c_str(), fmt_pos(g.second).c_str(), (double)(g.second - g.first) / SAMPLE_RATE);
+	print_activity(per_sec, gaps, min_gap);
 	return gaps;
 }
 
@@ -1674,11 +1797,7 @@ static std::vector<std::pair<i64, i64>> zsg2_activity(const VGMFile& vgm, i64 mi
 		return true;
 	});
 	if (gap_start >= 0 && (i64)vgm.total - gap_start >= min_gap) gaps.push_back({gap_start, (i64)vgm.total});
-	if (!quiet)
-	{
-		for (auto& kv : per_sec) printf("%s: %d voice(s)\n", fmt_pos(kv.first * SAMPLE_RATE).c_str(), kv.second);
-		for (auto& g : gaps) printf("gap %s .. %s (%.2f s)\n", fmt_pos(g.first).c_str(), fmt_pos(g.second).c_str(), (double)(g.second - g.first) / SAMPLE_RATE);
-	}
+	if (!quiet) print_activity(per_sec, gaps, min_gap);
 	(void)last_t;
 	return gaps;
 }
@@ -1730,8 +1849,8 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 		int rekeyed, lost;
 		st.image(body, start, ZSG2State::IMAGE_INIT, rekeyed, lost);
 		if (rekeyed || lost)
-			printf("start %s: %d voice(s) re-keyed at their computed position%s\n", fmt_pos(start).c_str(), rekeyed,
-			       lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : "");
+			ui::info(strf("start %s: %d voice(s) re-keyed at their computed position%s", fmt_pos(start).c_str(), rekeyed,
+			         lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : ""));
 	};
 	// the first repetition is left out: re-create, before the loop point, the state at the end of it
 	auto emit_splice = [&]() {
@@ -1739,8 +1858,8 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 		splice_done = true;
 		int rekeyed, lost;
 		st.image(body, skip_to, ZSG2State::IMAGE_SPLICE, rekeyed, lost, nullptr, dsp_at_skip);
-		printf("splice %s -> %s: %d voice(s) re-keyed at their computed position%s\n", fmt_pos(skip_from).c_str(), fmt_pos(skip_to).c_str(), rekeyed,
-		       lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : "");
+		ui::info(strf("splice %s -> %s: %d voice(s) re-keyed at their computed position%s", fmt_pos(skip_from).c_str(), fmt_pos(skip_to).c_str(), rekeyed,
+		         lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : ""));
 	};
 	auto mark_loop = [&]() {
 		if (has_loop && loop_body_ofs < 0)
@@ -1752,8 +1871,8 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 			int rekeyed, lost;
 			st.image(body, loop, ZSG2State::IMAGE_LOOP, rekeyed, lost, st2.get());
 			if (rekeyed || lost)
-				printf("loop point %s: %d voice(s) re-keyed at their computed position%s\n", fmt_pos(loop).c_str(), rekeyed,
-				       lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : "");
+				ui::info(strf("loop point %s: %d voice(s) re-keyed at their computed position%s", fmt_pos(loop).c_str(), rekeyed,
+				         lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : ""));
 		}
 	};
 
@@ -1992,19 +2111,26 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 		}
 		cands.push_back({best_per, best_cover, sel_b.size()});
 	}
-	std::string cand;
-	for (const Cand& c : cands)
-	{
-		char buf[64];
-		snprintf(buf, sizeof(buf), "%s%.1f s:%zu:%.0f%%", cand.empty() ? "" : ", ", (double)c.per / SAMPLE_RATE, c.windows, 100 * c.cover);
-		cand += buf;
-	}
-	printf("repetition candidates (period, matching windows, note-on recurrence): %s\n", cand.c_str());
+	ui::section("Loop detection");
+	std::map<const Cand*, double> cand_corr;   // audio correlation of the second pass, when measured
+	auto print_cands = [&](const Cand* chosen_c) {
+		ui::Table t({"Period", "Windows", "Note-on recurrence", "Audio corr.", ""}, {true, true, true, true, false});
+		std::set<i64> shown;
+		for (const Cand& c : cands)
+		{
+			if (!shown.insert(c.per).second) continue;
+			auto it = cand_corr.find(&c);
+			t.add({strf("%.3f s", (double)c.per / SAMPLE_RATE), strf("%zu", c.windows), strf("%.0f%%", 100 * c.cover),
+			       it == cand_corr.end() ? "-" : strf("%.2f", it->second), &c == chosen_c ? std::string(ui::esc(ui::C_GREEN)) + "\u2714 chosen" + ui::esc(ui::C_RESET) : ""});
+		}
+		t.print();
+	};
 	double best_cover = -1;
 	for (const Cand& c : cands) best_cover = std::max(best_cover, c.cover);
 	if (best_cover < 0.6)
 	{
-		printf("no repetition covers the song (best %.0f%%): repeated phrases only, no loop\n", 100 * best_cover);
+		print_cands(nullptr);
+		ui::warn(strf("no repetition covers the song (best %.0f%%): repeated phrases only, no loop", 100 * best_cover));
 		return false;
 	}
 	// preference from the note-ons: the best covered period, then more matching windows, then
@@ -2068,7 +2194,6 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 		// modulation to rank candidates, so the note-on preference order is kept among the survivors
 		struct Scored { const Cand* c; i64 t1, t2; double corr; };
 		std::vector<Scored> scored;
-		std::string report;
 		for (const Cand* c : order)
 		{
 			i64 a, b;
@@ -2077,16 +2202,14 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 			if (len < SAMPLE_RATE) continue;   // the capture does not reach far enough into the second pass
 			double corr = audio_corr(*wav, a, b, len);
 			scored.push_back({c, a, b, corr});
-			char buf[48];
-			snprintf(buf, sizeof(buf), "%s%.1f s:%.2f", report.empty() ? "" : ", ", (double)c->per / SAMPLE_RATE, corr);
-			report += buf;
+			cand_corr[c] = corr;
 		}
-		printf("audio correlation of the second pass per candidate: %s\n", report.c_str());
 		for (const Scored& sc : scored)
 			if (sc.corr >= 0.2) { chosen = sc.c; t1 = sc.t1; t2 = sc.t2; break; }
+		print_cands(chosen);
 		if (!chosen)
 		{
-			printf("no candidate sounds the same on its second pass (correlation < 0.2): no loop (capture too short for a full repetition?)\n");
+			ui::warn("no candidate sounds the same on its second pass (correlation < 0.2): no loop (capture too short for a full repetition?)");
 			return false;
 		}
 	}
@@ -2094,19 +2217,20 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 	{
 		for (const Cand* c : order)
 			if (locate(c->per, t1, t2)) { chosen = c; break; }
+		print_cands(chosen);
 	}
-	if (!chosen) return false;
-	printf("period %s (%.4f s): %.0f%% of the note-ons recur at that offset\n", fmt_pos(chosen->per).c_str(), (double)chosen->per / SAMPLE_RATE, 100 * chosen->cover);
+	if (!chosen) { ui::warn("no loop found"); return false; }
 	i64 t0 = t1;   // first note-on of the range: the intro before the loop body is kept
 	for (size_t i = 0; i < n; i++) if (events[i].t >= search_from) { t0 = events[i].t; break; }
-	printf("loop found: first note-on at %s, first repeated note-on at %s, recurs at %s, period %s (%.4f s), %zu matching windows\n",
-	       fmt_pos(t0).c_str(), fmt_pos(t1).c_str(), fmt_pos(t2).c_str(), fmt_pos(t2 - t1).c_str(), (double)(t2 - t1) / SAMPLE_RATE, chosen->windows);
+	ui::ok(strf("loop found: period %s (%.4f s), %.0f%% of the note-ons recur, %zu matching windows", fmt_pos(chosen->per).c_str(),
+	            (double)chosen->per / SAMPLE_RATE, 100 * chosen->cover, chosen->windows));
+	ui::info(strf("first note-on at %s, first repeated note-on at %s, recurs at %s", fmt_pos(t0).c_str(), fmt_pos(t1).c_str(), fmt_pos(t2).c_str()));
 	lr.start = std::max<i64>(0, t0 - pre);
 	// the loop length is the median period of all recurring note-ons (sample exact when the
 	// driver is frame locked), not the recurrence of one note, which may carry its own jitter
 	i64 period = chosen->per;
 	if (std::llabs((t2 - t1) - period) > SAMPLE_RATE / 1000)
-		printf("note: the first repeated note recurs %.1f ms off the median period, loop length taken from the median\n", (double)((t2 - t1) - period) * 1000 / SAMPLE_RATE);
+		ui::info(strf("the first repeated note recurs %.1f ms off the median period, loop length taken from the median", (double)((t2 - t1) - period) * 1000 / SAMPLE_RATE));
 	// two constructions: loop body = first repetition (file = intro + 1 repetition), or = second
 	// repetition when the capture holds it (the first one is left out of the stream)
 	lr.loop1 = std::max<i64>(0, t1 - pre);
@@ -2242,7 +2366,7 @@ static std::vector<std::pair<i64, i64>> find_segments(const Wav& w, int silence_
 {
 	size_t win = w.sr / 100;
 	std::vector<int> peaks = window_peaks(w, win);
-	if (silence_peak < 0) { silence_peak = auto_silence(peaks); printf("silence threshold (auto, from the noise floor): peak <= %d\n", silence_peak); }
+	if (silence_peak < 0) { silence_peak = auto_silence(peaks); ui::info(strf("silence threshold (auto, from the noise floor): peak <= %d", silence_peak)); }
 	// the chip initialisation at t = 0 leaves a DC step in the first window(s): a burst shorter than 50 ms
 	// at the very start of the capture, followed by at least 0.5 s of silence, is not sound
 	{
@@ -2253,7 +2377,7 @@ static std::vector<std::pair<i64, i64>> find_segments(const Wav& w, int silence_
 		while (last + quiet < peaks.size() && peaks[last + quiet] <= silence_peak) quiet++;
 		if (first < 5 && last < first + 5 && last < peaks.size() && quiet >= 50)
 		{
-			printf("start-up click at %s ignored (%zu ms, then %.2f s of silence)\n", fmt_pos((i64)(first * win * SAMPLE_RATE / w.sr)).c_str(), (last - first) * 10, quiet * 0.01);
+			ui::info(strf("start-up click at %s ignored (%zu ms, then %.2f s of silence)", fmt_pos((i64)(first * win * SAMPLE_RATE / w.sr)).c_str(), (last - first) * 10, quiet * 0.01));
 			for (size_t k = first; k < last; k++) peaks[k] = 0;
 		}
 	}
@@ -2316,16 +2440,15 @@ static double audio_corr(const Wav& w, i64 a, i64 b, i64 n, i64 max_lag)
 static void print_loudness(const Wav& w, double step = 2.0)
 {
 	size_t win = (size_t)(w.sr * step);
-	printf("RMS level (left channel) every %.0f s:\n", step);
-	int col = 0;
+	ui::section(strf("RMS level (left channel) every %.0f s", step));
+	std::vector<std::pair<std::string, std::string>> cells;
 	for (size_t i = 0; i + win <= w.frames; i += win)
 	{
 		double acc = 0;
 		for (size_t s = i; s < i + win; s++) { double v = w.smp[s * w.nch]; acc += v * v; }
-		printf("%s%4zu:%5.0f", col == 0 ? "  " : " ", i / w.sr, sqrt(acc / win));
-		if (++col == 10) { printf("\n"); col = 0; }
+		cells.push_back({strf("%zu", i / w.sr), strf("%.0f", sqrt(acc / win))});
 	}
-	if (col) printf("\n");
+	printf("%s", ui::grid(cells, 10).c_str());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2351,17 +2474,19 @@ static Bytes merge(const std::vector<VGMFile>& in)
 	std::set<Bytes> seen;
 	i64 total = 0, loop_t = -1;
 	size_t loop_body_ofs = 0, loop_part = 0;
+	ui::section("Merge");
+	ui::Table parts_table({"Part", "Length", "Loop"}, {true, false, false});
 	for (size_t k = 0; k < in.size(); k++) if (in[k].loop_ofs) loop_part = k + 1;
 	if (loop_part && loop_part < in.size())
-		fprintf(stderr, "warning: part %zu has a loop but is not the last part: the loop will run to the end of the merged file\n", loop_part);
+		ui::warn(strf("part %zu has a loop but is not the last part: the loop will run to the end of the merged file", loop_part));
 	for (size_t k = 0; k < in.size(); k++)
 	{
 		const VGMFile& v = in[k];
 		if (v.es5506_clock != a.es5506_clock || v.is_es5506 != a.is_es5506)
-			fprintf(stderr, "warning: part %zu: ES5506 clock %08X differs from the first part (%08X)\n", k + 1, v.es5506_clock, a.es5506_clock);
+			ui::warn(strf("part %zu: ES5506 clock %08X differs from the first part (%08X)", k + 1, v.es5506_clock, a.es5506_clock));
 		if (k && v.data_ofs > 0x7C && a.data_ofs > 0x7C && v.data[0x7C] != a.data[0x7C])
-			fprintf(stderr, "warning: part %zu: volume modifier %02X differs from the first part (%02X), the first one is kept\n", k + 1, v.data[0x7C], a.data[0x7C]);
-		if (v.loop_ofs && k + 1 != loop_part) fprintf(stderr, "warning: part %zu has a loop too, only the one of part %zu is kept\n", k + 1, loop_part);
+			ui::warn(strf("part %zu: volume modifier %02X differs from the first part (%02X), the first one is kept", k + 1, v.data[0x7C], a.data[0x7C]));
+		if (v.loop_ofs && k + 1 != loop_part) ui::warn(strf("part %zu has a loop too, only the one of part %zu is kept", k + 1, loop_part));
 		if (k + 1 == loop_part) loop_t = -1;
 		const u8* d = v.data.data();
 		bool found_loop = false;
@@ -2377,9 +2502,9 @@ static Bytes merge(const std::vector<VGMFile>& in)
 			body.insert(body.end(), d + c.p, d + c.p + c.len);
 			return true;
 		});
-		if (k + 1 == loop_part && !found_loop) fprintf(stderr, "warning: part %zu: loop offset does not fall on a command, loop dropped\n", k + 1);
+		if (k + 1 == loop_part && !found_loop) ui::warn(strf("part %zu: loop offset does not fall on a command, loop dropped", k + 1));
 		total += v.total;
-		printf("part %zu: %s%s\n", k + 1, fmt_pos(v.total).c_str(), v.loop_ofs ? (", loop " + fmt_pos(v.loop_samples)).c_str() : "");
+		parts_table.add({strf("%zu", k + 1), fmt_pos(v.total), v.loop_ofs ? fmt_pos(v.loop_samples) : "-"});
 	}
 	body.push_back(0x66);
 	Bytes out(a.data.begin(), a.data.begin() + a.data_ofs);
@@ -2403,7 +2528,8 @@ static Bytes merge(const std::vector<VGMFile>& in)
 	else put_le32(&out[0x14], 0);
 	fix_version(out);
 	put_le32(&out[0x04], (u32)(out.size() - 4));
-	printf("merged: %s%s, %zu data block(s)\n", fmt_pos(total).c_str(), loop_t >= 0 ? (", loop " + fmt_pos(total - loop_t)).c_str() : "", seen.size());
+	parts_table.print();
+	ui::ok(strf("merged: %s%s, %zu data block(s)", fmt_pos(total).c_str(), loop_t >= 0 ? (", loop " + fmt_pos(total - loop_t)).c_str() : "", seen.size()));
 	return out;
 }
 
@@ -2471,7 +2597,8 @@ static void usage()
 	        "  --silence N            --auto: peak level treated as silence (default: automatic from the noise floor, DC removed)\n"
 	        "  --gap P                --auto / --activity: minimum silence between two tracks (default 1.0s)\n"
 	        "  --pre P --post P       --auto: silence kept before / after each track (default 0.05s / 0.3s)\n"
-	        "  --min-length P         --auto: ignore segments shorter than this (default 0.5s)\n");
+	        "  --min-length P         --auto: ignore segments shorter than this (default 0.5s)\n"
+	        "  --color auto|always|never  coloured output (default auto: when stdout is a terminal and NO_COLOR is unset)\n");
 	exit(1);
 }
 
@@ -2483,6 +2610,7 @@ int main(int argc, char** argv)
 	i64 sro_margin = 256, sro_gap = 0;
 	int silence = -1;   // -1: automatic (noise floor)
 	std::vector<std::string> positional, appends;
+	std::string color = "auto";
 	for (int i = 1; i < argc; i++)
 	{
 		std::string a = argv[i];
@@ -2525,10 +2653,12 @@ int main(int argc, char** argv)
 		else if (name == "--sro-margin") { std::string v; value(v); sro_margin = atoll(v.c_str()); }
 		else if (name == "--sro-gap") { std::string v; value(v); sro_gap = atoll(v.c_str()); }
 		else if (name == "--silence") { std::string v; value(v); silence = atoi(v.c_str()); }
+		else if (name == "--color") value(color);
 		else if (name.rfind("--", 0) == 0) { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); }
 		else positional.push_back(a);
 	}
 	if (positional.empty()) usage();
+	ui::color = color == "always" || (color != "never" && isatty(fileno(stdout)) && getenv("NO_COLOR") == nullptr);
 	input = positional[0];
 	if (positional.size() > 1) output = positional[1];
 
@@ -2543,7 +2673,7 @@ int main(int argc, char** argv)
 		for (size_t k = 0; k < appends.size(); k++) parts[k + 1].load(appends[k]);
 		Bytes out = merge(parts);
 		write_output(output, out);
-		printf("%s -> %s: %zu bytes\n", input.c_str(), output.c_str(), out.size());
+		ui::ok(strf("%s written (%s)", output.c_str(), ui::bytes(out.size()).c_str()));
 		return 0;
 	}
 
@@ -2553,7 +2683,7 @@ int main(int argc, char** argv)
 		Bytes out = vgm.data;
 		fix_version(out);
 		write_output(output, out);
-		printf("%s -> %s: rewritten unchanged (version %X), %zu bytes\n", input.c_str(), output.c_str(), le32(&out[0x08]), out.size());
+		ui::ok(strf("%s -> %s: rewritten unchanged (version %X.%02X), %s", input.c_str(), output.c_str(), le32(&out[0x08]) >> 8, le32(&out[0x08]) & 0xFF, ui::bytes(out.size()).c_str()));
 		return 0;
 	}
 
@@ -2592,9 +2722,11 @@ int main(int argc, char** argv)
 			if (track == "0") print_loudness(w);
 		}
 		if (segs.empty()) die("no non-silent segment found");
+		ui::section(strf("Tracks (%s, gap >= %s)", split == "log" ? "from the log" : "from the rendered audio", ui::secs(parse_pos(gap)).c_str()));
+		ui::Table tt({"Track", "Start", "End", "Length"}, {true, false, false, true});
 		for (size_t i = 0; i < segs.size(); i++)
-			printf("track %zu: %s .. %s (%.1f s)\n", i + 1, fmt_pos(segs[i].first).c_str(), fmt_pos(segs[i].second).c_str(),
-			       (double)(segs[i].second - segs[i].first) / SAMPLE_RATE);
+			tt.add({strf("%zu", i + 1), fmt_pos(segs[i].first), fmt_pos(segs[i].second), ui::secs(segs[i].second - segs[i].first)});
+		tt.print();
 		std::vector<size_t> wanted;
 		if (track == "all")
 			for (size_t i = 0; i < segs.size(); i++) wanted.push_back(i);
@@ -2612,9 +2744,11 @@ int main(int argc, char** argv)
 		jobs.push_back({start_s.empty() ? 0 : parse_pos(start_s), loop_s.empty() ? 0 : parse_pos(loop_s),
 		                end_s.empty() ? (i64)vgm.total : parse_pos(end_s), !loop_s.empty(), output, !start_s.empty()});
 
+	ui::Table results({"Output", "Start", "End", "Loop", "Writes kept", "Dropped", "Skipped", "ROM", "Size"}, {false, false, false, false, true, true, true, true, true});
 	for (Job& job : jobs)
 	{
 		if (job.end > (i64)vgm.total) job.end = vgm.total;
+		if (jobs.size() > 1) ui::section("Track " + ui::basename(job.output));
 		if (f_find_loop)
 		{
 			LoopResult lr;
@@ -2632,9 +2766,9 @@ int main(int argc, char** argv)
 					else
 					{
 						pass = 1;
-						printf("warning: the capture is too short to loop on the second repetition (needs %s): looping on the first one, "
-						       "the tails at the loop point will differ. Capture intro + 2 repetitions + a few seconds for a seamless loop.\n",
-						       fmt_pos(lr.end2 + 2205).c_str());
+						ui::warn(strf("the capture is too short to loop on the second repetition (needs %s): looping on the first one, "
+						              "the tails at the loop point will differ. Capture intro + 2 repetitions + a few seconds for a seamless loop.",
+						              fmt_pos(lr.end2 + 2205).c_str()));
 					}
 				}
 				if (pass == 0)
@@ -2645,33 +2779,33 @@ int main(int argc, char** argv)
 					else if (lr.has2)
 					{
 						pass = 2;
-						printf("loop re-entry would cut %d voice(s) still sounding at the end of the first repetition: "
-						       "taking the loop body from the second repetition\n", cut);
+						ui::info(strf("loop re-entry would cut %d voice(s) still sounding at the end of the first repetition: "
+						              "taking the loop body from the second repetition", cut));
 					}
 					else
 					{
 						pass = 1;
-						printf("warning: loop re-entry cuts %d voice(s) still sounding at the end of the loop body; the capture is too short to loop "
-						       "on the second repetition instead (needs %s). Capture intro + 2 repetitions + a few seconds for a seamless loop.\n",
-						       cut, fmt_pos(lr.end2 + 2205).c_str());
+						ui::warn(strf("loop re-entry cuts %d voice(s) still sounding at the end of the loop body; the capture is too short to loop "
+						              "on the second repetition instead (needs %s). Capture intro + 2 repetitions + a few seconds for a seamless loop.",
+						              cut, fmt_pos(lr.end2 + 2205).c_str()));
 					}
 				}
 				else if (pass == 2 && !lr.has2)
 				{
 					pass = 1;
-					printf("warning: capture too short to loop on the second repetition (needs %s): looping on the first one\n", fmt_pos(lr.end2 + 2205).c_str());
+					ui::warn(strf("capture too short to loop on the second repetition (needs %s): looping on the first one", fmt_pos(lr.end2 + 2205).c_str()));
 				}
 				if (pass == 2)
 				{
 					l = lr.loop2; e = lr.end2; job.skip_from = lr.loop1; job.skip_to = lr.loop2;
-					printf("loop body = second repetition %s .. %s, the first one (%s .. %s) is left out: the file plays intro + one repetition\n",
-					       fmt_pos(l).c_str(), fmt_pos(e).c_str(), fmt_pos(lr.loop1).c_str(), fmt_pos(lr.loop2).c_str());
+					ui::info(strf("loop body = second repetition %s .. %s, the first one (%s .. %s) is left out: the file plays intro + one repetition",
+					       fmt_pos(l).c_str(), fmt_pos(e).c_str(), fmt_pos(lr.loop1).c_str(), fmt_pos(lr.loop2).c_str()));
 				}
 				else { l = lr.loop1; e = lr.end1; }
 			}
 			if (!found)
 			{
-				printf("%s: no loop found, written without loop\n", job.output.c_str());
+				ui::warn(job.output + ": no loop found, written without loop");
 			}
 			else
 			{
@@ -2685,10 +2819,12 @@ int main(int argc, char** argv)
 		Bytes out = vgm.is_zsg2 ? trim_zsg2(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats, job.skip_from, job.skip_to)
 		                        : trim(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats, job.skip_from, job.skip_to);
 		write_output(job.output, out);
-		printf("%s -> %s: %s .. %s%s, %lld writes kept, %lld dropped (--cmp), %lld commands before start, ROM data %zu bytes; %zu -> %zu bytes\n",
-		       input.c_str(), job.output.c_str(), fmt_pos(job.start).c_str(), fmt_pos(job.end).c_str(),
-		       job.has_loop ? (", loop at " + fmt_pos(job.loop)).c_str() : "",
-		       (long long)stats.kept, (long long)stats.dropped, (long long)stats.skipped, stats.rom_bytes, vgm.data.size(), out.size());
+		results.add({ui::basename(job.output), fmt_pos(job.start), fmt_pos(job.end), job.has_loop ? fmt_pos(job.loop) : "-",
+		             strf("%lld", (long long)stats.kept), strf("%lld", (long long)stats.dropped), strf("%lld", (long long)stats.skipped),
+		             ui::bytes(stats.rom_bytes), ui::bytes(out.size())});
+		ui::ok(strf("%s written (%s)", ui::basename(job.output).c_str(), ui::bytes(out.size()).c_str()));
 	}
+	ui::section(strf("Result (%s, %s)", ui::basename(input).c_str(), ui::bytes(vgm.data.size()).c_str()));
+	results.print();
 	return 0;
 }
