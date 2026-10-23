@@ -2643,6 +2643,22 @@ static std::string track_name(const std::string& output, int n)
 	return output + "_" + num;
 }
 
+// --track all never overwrites: each track takes the first free number from 00 (existing files and
+// the names already given in this run are skipped, so gaps are filled first)
+static std::string next_track_name(const std::string& output)
+{
+	static std::set<std::string> given;
+	for (int n = 0; n < 10000; n++)
+	{
+		std::string name = track_name(output, n);
+		if (given.count(name)) continue;
+		if (access(name.c_str(), F_OK) == 0) continue;
+		given.insert(name);
+		return name;
+	}
+	die("no free track number for " + output);
+}
+
 static void usage()
 {
 	fprintf(stderr,
@@ -2667,7 +2683,8 @@ static void usage()
 	        "                         applies 2^(n/32), n = round(D / 6.02 * 32), range -64..192 (-12 dB..+36 dB); 0 removes it\n"
 	        "  --auto                 split the capture into tracks separated by silence\n"
 	        "  --split wav|log        --auto: from the rendered audio (needs vgm2wav) or from the log (default wav)\n"
-	        "  --track N|all|0        --auto: track to extract (default 1), all = every track to output_NN, 0 = list only\n"
+	        "  --track N|all|0        --auto: track to extract (default 1), all = every track to output_NN (first free\n"
+	        "                         numbers from 00, existing files are never overwritten), 0 = list only\n"
 	        "  --vgm2wav PATH         vgm2wav tool (default: vgm2wav)\n"
 	        "  --silence N            --auto: peak level treated as silence (default: automatic from the noise floor, DC removed)\n"
 	        "  --gap P                --auto / --activity: minimum silence between two tracks (default 1.0s)\n"
@@ -2813,7 +2830,7 @@ int main(int argc, char** argv)
 		}
 		for (size_t i : wanted)
 			jobs.push_back({std::max<i64>(0, segs[i].first - parse_pos(pre)), 0, std::min<i64>(vgm.total, segs[i].second + parse_pos(post)), false,
-			                track == "all" ? track_name(output, (int)i + 1) : output, true});
+			                track == "all" ? next_track_name(output) : output, true});
 	}
 	else
 		jobs.push_back({start_s.empty() ? 0 : parse_pos(start_s), loop_s.empty() ? 0 : parse_pos(loop_s),

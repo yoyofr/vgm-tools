@@ -15,7 +15,7 @@ c++ -O2 -std=c++17 -o vgm_trim vgm_trim.cpp libvgm/emu/cores/tms57002.cpp -lz   
 
 vgm_trim capture.vgm --info
 vgm_trim capture.vgm --activity
-vgm_trim capture.vgm out.vgz --auto --split log --track all --cmp --sro --find-loop
+vgm_trim capture.vgm out.vgz --auto --split log --track all --cmp --sro --find-loop   # out_00.vgz, out_01... first free numbers, nothing overwritten
 vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --loop 30.0s --cmp --sro
 vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --volume +6dB
 vgm_trim part1.vgz merged.vgz --append part2.vgz
