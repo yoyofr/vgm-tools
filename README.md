@@ -1,7 +1,8 @@
 # vgm-tools
 
 Tools around VGM logging and packaging, written for the ES5505 / ES5506 / ES5510 VGM extension
-(see `VGM-ES55xx-proposal.md`) but usable on any VGM file.
+(see `VGM-ES55xx-proposal.md`) and the ZOOM ZSG-2 / TMS57002 extension of the Taito Zoom sound board
+(see `VGM-ZSG2-proposal.md`), but usable on any VGM file.
 
 ## vgm_trim
 
@@ -30,6 +31,11 @@ so it stays lossless and reversible; `--info` prints the current value.
 streams in order. The initial register image of an appended part re-creates its state at the
 junction and the ESP keeps the tail of the previous part. Header, GD3 and volume come from the
 first part, the loop from the last part that has one.
+
+ZSG-2 logs (Taito FX-1B / G-NET, VGM 1.73) are handled by a dedicated path: a cut re-creates the
+board gains, the DSP (host write history replayed with pre-runs), the register image and re-keys the
+voices still playing at their computed position; `--cmp`, `--sro`, `--find-loop` and `--split log` use
+a ZSG-2 voice model. `--loop-pass 2` is not available for them.
 
 ## gd3edit.html
 

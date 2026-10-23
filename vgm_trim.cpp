@@ -29,6 +29,7 @@
 
 typedef uint8_t u8;
 typedef uint16_t u16;
+typedef int16_t i16;
 typedef uint32_t u32;
 typedef int64_t i64;
 typedef std::vector<u8> Bytes;
@@ -117,8 +118,8 @@ struct VGMFile
 {
 	Bytes data;
 	u32 version = 0, eof = 0, gd3 = 0, total = 0, loop_ofs = 0, loop_samples = 0, data_ofs = 0;
-	u32 es5506_clock = 0;
-	bool is_es5506 = false;
+	u32 es5506_clock = 0, zsg2_clock = 0;
+	bool is_es5506 = false, is_zsg2 = false;
 
 	void load(const std::string& path)
 	{
@@ -159,6 +160,8 @@ struct VGMFile
 		data_ofs = (version >= 0x150) ? le32(&data[0x34]) + 0x34 : 0x40;
 		es5506_clock = (data_ofs > 0xD3) ? le32(&data[0xD0]) : 0;
 		is_es5506 = (es5506_clock & 0x80000000) != 0;
+		zsg2_clock = (data_ofs > 0x103) ? le32(&data[0x100]) : 0;   // VGM 1.73: ZSG-2 (Taito Zoom) at 0x100
+		is_zsg2 = zsg2_clock != 0;
 	}
 
 	// iterate the commands: f(cmd) returns false to stop
@@ -704,12 +707,14 @@ struct RomSet
 {
 	bool has[4] = {false, false, false, false};
 	Bytes region[4];
+	u8 blk_type = 0x90;   // 0x90: ES5506 (region in bits 28-29 of the start, bit 31 = 8-bit data), 0x97: ZSG-2 (plain offset)
 
 	void add_block(u32 rom_size, u32 start, const u8* data, size_t len)
 	{
 		int r = (start >> 28) & 3;
 		bool is8 = (start >> 31) & 1;
 		size_t ofs = start & 0x0FFFFFFF;
+		if (blk_type == 0x97) { r = 0; is8 = false; ofs = start; }
 		Bytes conv;
 		if (is8)
 		{
@@ -761,10 +766,10 @@ struct RomSet
 				i64 a = rg.first, b = rg.second;
 				if (b <= a) continue;
 				u32 plen = 8 + (u32)(b - a);
-				out.push_back(0x67); out.push_back(0x66); out.push_back(0x90);
+				out.push_back(0x67); out.push_back(0x66); out.push_back(blk_type);
 				push_le32(out, plen | (cs ? 0x80000000 : 0));
 				push_le32(out, buf.size());
-				push_le32(out, ((u32)r << 28) | (u32)a);
+				push_le32(out, blk_type == 0x97 ? (u32)a : (((u32)r << 28) | (u32)a));
 				out.insert(out.end(), buf.begin() + a, buf.begin() + b);
 				total += b - a;
 			}
@@ -1250,7 +1255,8 @@ static void info(const VGMFile& vgm)
 		int n = volume_mod_from_byte(vgm.data[0x7C]);
 		printf("volume modifier %d (%+.2f dB, x%.3f)\n", n, volume_db_from_mod(n), std::pow(2.0, n / 32.0));
 	}
-	printf("ES5506 clock %08X (%s, %d pair(s))\n", vgm.es5506_clock, vgm.is_es5506 ? "ES5506" : "ES5505", vgm.data.size() > 0xD5 ? vgm.data[0xD5] : 0);
+	if (vgm.is_zsg2) printf("ZSG-2 clock %u Hz (%u Hz output, TMS57002 DSP at %u Hz)\n", vgm.zsg2_clock, vgm.zsg2_clock / 768, vgm.zsg2_clock / 2);
+	else printf("ES5506 clock %08X (%s, %d pair(s))\n", vgm.es5506_clock, vgm.is_es5506 ? "ES5506" : "ES5505", vgm.data.size() > 0xD5 ? vgm.data[0xD5] : 0);
 	printf("data blocks: %s\n", blocks.c_str());
 	std::string cmds;
 	for (auto& kv : counts) { char buf[32]; snprintf(buf, sizeof(buf), "%s%02X:%lld", cmds.empty() ? "" : ", ", kv.first, (long long)kv.second); cmds += buf; }
@@ -1264,8 +1270,10 @@ static void info(const VGMFile& vgm)
 }
 
 // gaps where no voice is audible (running with a non-zero volume)
+static std::vector<std::pair<i64, i64>> zsg2_activity(const VGMFile& vgm, i64 min_gap, bool quiet);
 static std::vector<std::pair<i64, i64>> activity(const VGMFile& vgm, i64 min_gap, bool quiet)
 {
+	if (vgm.is_zsg2) return zsg2_activity(vgm, min_gap, quiet);
 	const u8* d = vgm.data.data();
 	ES55xxState states[2] = {ES55xxState(vgm.is_es5506), ES55xxState(vgm.is_es5506)};
 	std::map<i64, int> per_sec;
@@ -1343,6 +1351,475 @@ struct NoteEvent { i64 t; NoteKey k; };
 struct Wav;
 static double audio_corr(const Wav& w, i64 a, i64 b, i64 n, i64 max_lag = 2000);
 
+// ---------------------------------------------------------------------------------------------
+// ZOOM ZSG-2 + TMS57002 (Taito Zoom board): command 0xE4 ss aa dddd, ROM data block 0x97
+// ---------------------------------------------------------------------------------------------
+// TMS57002 control lines (bit 0 = PLOAD, bit 1 = CLOAD, active low). The program, status registers and
+// coefficients are not modelled: the coefficient updates the sound CPU sends through CLOAD land where the
+// running program reads them, so the DSP state at a cut is re-created by replaying every host write from
+// the start of the capture, with the time between them replaced by DSP pre-runs (command 0xE4 sub 8).
+struct TmsHost
+{
+	u8 ctrl = 3;
+	bool ctrl_known = false, loaded = false;
+	bool control(u8 bits)
+	{
+		bits &= 3;
+		bool changed = !ctrl_known || bits != ctrl;
+		if (!(bits & 1)) loaded = true;
+		ctrl = bits; ctrl_known = true;
+		return changed;
+	}
+};
+struct DspCmd { i64 t; u8 sub, aa; u16 data; };
+
+struct ZSG2Voice
+{
+	u16 v[16] = {};
+	bool known[16] = {};
+	bool active = false;
+	// playback model: the ZSG-2 has no readable position, it is computed from the key-on time
+	i64 t_on = 0;               // VGM time of the key-on
+	double acc = 0;             // step_ptr accumulator (1/65536 block units, starts at 0x10000 at key-on)
+	double chip_frac = 0;       // fractional chip sample carried between events
+	i64 last_t = 0;             // VGM time the model was advanced to
+	u32 start = 0;              // start position latched at key-on (cur_pos starts at start - 1)
+	u16 vol = 0, vol_target = 0, cutoff = 0, cutoff_target = 0, cutoff_initial = 0;
+	i16 vol_delta = 0, cutoff_delta = 0;
+	bool keyon_delta = false;   // vol_delta = 0x400 from the key-on, not overwritten by register 0xF yet
+	double ramp_frac = 0;       // ramp steps happen every other chip sample
+};
+
+static i16 zsg2_get_ramp(u8 val)
+{
+	i16 frac = (i16)(val << 12);
+	frac = ((frac >> 12) ^ 8) << (val >> 4);
+	return (frac >> 4);
+}
+
+struct ZSG2State
+{
+	ZSG2Voice voice[48];
+	u16 creg[32] = {};
+	bool creg_known[32] = {};
+	std::map<int, u16> gains;
+	TmsHost tms;
+	std::vector<DspCmd> dsp_hist;   // host writes, control lines, resets and pre-runs of the DSP since the start
+	i64 now = 0;
+	double chip_rate = 25000000.0 / 768;   // samples per second
+	std::vector<Range> rom_used;           // words (2 bytes), from the key-ons
+	bool reg_count = false;                // anything known
+
+	void set_clock(u32 clock) { if (clock) chip_rate = (double)(clock / 768); }
+	double chip_samples(i64 dt) const { return dt * chip_rate / SAMPLE_RATE; }
+
+	static u16 ramp(u16 current, u16 target, i16 delta, double steps)
+	{
+		if (steps < 1) return current;
+		if (delta >= 0)
+		{
+			if (current > target) return target;
+			double r = current + (double)delta * std::floor(steps);
+			return r > target ? target : (u16)r;
+		}
+		if (current < target) return target;
+		double r = current + (double)delta * std::floor(steps);
+		return r < target ? target : (u16)r;
+	}
+	// advance the playback model of a voice to time t
+	void advance(int vi, i64 t)
+	{
+		ZSG2Voice& w = voice[vi];
+		if (t <= w.last_t) return;
+		double n = chip_samples(t - w.last_t) + w.chip_frac;
+		double whole = std::floor(n);
+		w.chip_frac = n - whole;
+		w.last_t = t;
+		if (!w.active) return;
+		u32 step = (u32)w.v[4] + 1;
+		w.acc += whole * step;
+		double steps = whole / 2 + w.ramp_frac;
+		w.ramp_frac = steps - std::floor(steps);
+		w.vol = ramp(w.vol, w.vol_target, w.vol_delta, steps);
+		w.cutoff = ramp(w.cutoff, w.cutoff_target, w.cutoff_delta, steps);
+	}
+	// current block position of an active voice; false when the sample has ended
+	bool position(int vi, u32& pos) const
+	{
+		const ZSG2Voice& w = voice[vi];
+		if (!w.active) return false;
+		u32 end = w.v[6], loop = (w.v[5] & 0xFF) | ((w.v[7] & 0xFF) << 8);
+		i64 inc = (i64)(w.acc / 65536.0);
+		i64 p = (i64)w.start - 1 + inc;
+		if (p >= end)
+		{
+			if ((i64)loop + 1 >= end) return false;
+			p = loop + (p - end) % ((i64)end - loop);
+		}
+		pos = (u32)p;
+		return true;
+	}
+	bool playing(int vi, i64 t)
+	{
+		advance(vi, t);
+		u32 p;
+		if (!position(vi, p)) { voice[vi].active = false; return false; }
+		return voice[vi].vol_target > 0 || voice[vi].vol > 0;
+	}
+	void note_rom_use(int vi)
+	{
+		const ZSG2Voice& w = voice[vi];
+		if (!w.known[0] || !w.known[1] || !w.known[6]) return;
+		u32 page = (u32)(w.v[1] & 0xFF00) << 8;
+		u32 s = page | ((w.v[0] >> 8) | ((w.v[1] & 0xFF) << 8)), e = page | w.v[6];
+		if (e <= s) e = s + 1;
+		rom_used.push_back({(i64)s * 2, (i64)e * 2 + 2});
+	}
+	// a register / control write; returns true when the chip state changes (false = redundant)
+	bool write(u16 ofs, u16 data)
+	{
+		reg_count = true;
+		if (ofs < 0x300)
+		{
+			int vi = ofs >> 4, reg = ofs & 15;
+			ZSG2Voice& w = voice[vi];
+			advance(vi, now);
+			bool same = w.known[reg] && w.v[reg] == data;
+			w.v[reg] = data; w.known[reg] = true;
+			switch (reg)
+			{
+			case 0x8: w.cutoff_initial = data; break;
+			case 0x9: w.cutoff = data; return true;        // current value: side effect
+			case 0xB: w.vol = data; return true;
+			case 0xC: w.cutoff_target = data; break;
+			case 0xD: w.cutoff_delta = zsg2_get_ramp(data & 0xFF); break;
+			case 0xE: w.vol_target = data; break;
+			case 0xF: { bool kd = w.keyon_delta; w.vol_delta = zsg2_get_ramp(data & 0xFF); w.keyon_delta = false; if (kd) return true; break; }
+			default: break;
+			}
+			return !same;
+		}
+		int reg = ofs - 0x300;
+		if (reg <= 2 || (reg >= 4 && reg <= 6))
+		{
+			int base = (reg & 3) << 4;
+			for (int i = 0; i < 16; i++)
+			{
+				if (!(data & (1 << i))) continue;
+				ZSG2Voice& w = voice[base | i];
+				advance(base | i, now);
+				if (reg <= 2)
+				{
+					w.active = true; w.t_on = now; w.acc = 65536.0; w.chip_frac = 0; w.ramp_frac = 0; w.last_t = now;
+					w.start = (w.v[0] >> 8) | ((w.v[1] & 0xFF) << 8);
+					w.vol = 0; w.vol_delta = 0x400; w.keyon_delta = true;
+					w.cutoff = w.cutoff_initial;
+					note_rom_use(base | i);
+				}
+				else { w.active = false; w.vol = 0; }
+			}
+			return data != 0;
+		}
+		if (reg < 32)
+		{
+			bool same = creg_known[reg] && creg[reg] == data;
+			creg[reg] = data; creg_known[reg] = true;
+			return !same;
+		}
+		return true;
+	}
+	bool ext(u8 sub, u8 aa, u16 data)
+	{
+		reg_count = true;
+		switch (sub)
+		{
+		case 4: dsp_hist.push_back({now, sub, aa, data}); return true;
+		case 5: dsp_hist.push_back({now, sub, aa, data}); return tms.control(data & 0xFF);
+		case 8: dsp_hist.push_back({now, sub, aa, data}); return true;
+		case 6: { auto it = gains.find(aa); bool same = it != gains.end() && it->second == data; gains[aa] = data; return !same; }
+		case 7: dsp_hist.push_back({now, sub, aa, data}); for (ZSG2Voice& w : voice) { w.active = false; w.vol = 0; } return true;
+		default: return true;
+		}
+	}
+	// re-create the state at time `at`: gains, DSP (program upload unless `dsp_diff` gives the state the
+	// player already has, then only the coefficients that differ are updated), control registers,
+	// every known voice register, and the voices still playing re-keyed at their current position
+	void image(Bytes& out, i64 at, const ZSG2State* dsp_diff, int& rekeyed, int& lost)
+	{
+		auto raw = [&](u8 sub, u8 aa, u16 d) { out.insert(out.end(), {0xE4, sub, aa, u8(d >> 8), u8(d & 0xFF)}); };
+		auto regw = [&](u16 ofs, u16 d) { raw(u8((ofs >> 8) & 3), u8(ofs & 0xFF), d); };
+		for (auto& kv : gains) raw(6, u8(kv.first), kv.second);
+		if (dsp_diff == nullptr && !dsp_hist.empty())
+		{
+			// replay the DSP history; the time between the writes becomes pre-runs of the program (silent input),
+			// which re-creates the coefficient memory and the program-internal state (LFO phases...)
+			i64 base_t = dsp_hist[0].t, emitted = 0;
+			auto prerun_to = [&](i64 t) {
+				i64 n = (i64)chip_samples(t - base_t) - emitted;
+				while (n > 0) { i64 k = std::min<i64>(n, 0xFFFFFF); raw(8, u8(k >> 16), u16(k & 0xFFFF)); emitted += k; n -= k; }
+			};
+			for (const DspCmd& c : dsp_hist) { prerun_to(c.t); raw(c.sub, c.aa, c.data); }
+			prerun_to(at);
+		}
+		for (int r = 8; r < 32; r++) if (creg_known[r]) regw(0x300 + r, creg[r]);
+		for (int vi = 0; vi < 48; vi++)
+			for (int r = 0; r < 16; r++)
+				if (voice[vi].known[r]) regw(vi * 16 + r, voice[vi].v[r]);
+		rekeyed = lost = 0;
+		for (int vi = 0; vi < 48; vi++)
+		{
+			ZSG2Voice& w = voice[vi];
+			if (!w.active) continue;
+			advance(vi, at);
+			u32 pos;
+			if (!position(vi, pos)) { w.active = false; continue; }
+			if (!w.known[0] || !w.known[1]) { lost++; continue; }
+			// key on at the current position, then put the real start address back
+			regw(vi * 16 + 0, u16(((pos & 0xFF) << 8) | (w.v[0] & 0xFF)));
+			regw(vi * 16 + 1, u16((w.v[1] & 0xFF00) | ((pos >> 8) & 0xFF)));
+			regw(0x300 + (vi >> 4), u16(1 << (vi & 15)));
+			regw(vi * 16 + 0, w.v[0]);
+			regw(vi * 16 + 1, w.v[1]);
+			regw(vi * 16 + 0xB, w.vol);
+			regw(vi * 16 + 0x9, w.cutoff);
+			if (!w.keyon_delta && w.known[0xF]) regw(vi * 16 + 0xF, w.v[0xF]);
+			rekeyed++;
+		}
+	}
+};
+
+// note-on events of a ZSG-2 log (for the loop finder): key-on with the sample of the voice
+static void zsg2_notes(const VGMFile& vgm, bool bounded, i64 search_to, std::vector<NoteEvent>& events)
+{
+	const u8* d = vgm.data.data();
+	ZSG2State st;
+	st.set_clock(vgm.zsg2_clock);
+	vgm.commands([&](const Cmd& c) {
+		if (c.op == 0x66 || (bounded && c.t >= search_to)) return false;
+		if (c.op != 0xE4 || (d[c.p + 1] & 0x0F) > 3) return true;
+		u16 ofs = ((d[c.p + 1] & 3) << 8) | d[c.p + 2], data = (d[c.p + 3] << 8) | d[c.p + 4];
+		st.now = c.t;
+		if (ofs >= 0x300 && ofs <= 0x302 && data)
+		{
+			int base = (ofs - 0x300) << 4;
+			for (int i = 0; i < 16; i++)
+			{
+				if (!(data & (1 << i))) continue;
+				const ZSG2Voice& w = st.voice[base | i];
+				i64 start = ((u32)(w.v[1] & 0xFF00) << 8) | (w.v[0] >> 8) | ((w.v[1] & 0xFF) << 8);
+				i64 loop = (w.v[5] & 0xFF) | ((w.v[7] & 0xFF) << 8);
+				events.push_back({c.t, NoteKey{start, w.v[6], loop, (i64)w.v[4]}});
+			}
+		}
+		st.write(ofs, data);
+		return true;
+	});
+}
+
+// gaps where no ZSG-2 voice is audible (keyed on, not ended, with a non-zero volume)
+static std::vector<std::pair<i64, i64>> zsg2_activity(const VGMFile& vgm, i64 min_gap, bool quiet)
+{
+	const u8* d = vgm.data.data();
+	ZSG2State st;
+	st.set_clock(vgm.zsg2_clock);
+	std::map<i64, int> per_sec;
+	std::vector<std::pair<i64, i64>> gaps;
+	i64 gap_start = -1, last_t = 0;
+	auto sample = [&](i64 t) {
+		int n = 0;
+		for (int vi = 0; vi < 48; vi++) if (st.playing(vi, t)) n++;
+		if (!quiet)
+		{
+			i64 sec = t / SAMPLE_RATE;
+			auto it = per_sec.find(sec);
+			if (it == per_sec.end()) per_sec[sec] = n; else it->second = std::max(it->second, n);
+		}
+		if (n == 0) { if (gap_start < 0) gap_start = t; }
+		else if (gap_start >= 0)
+		{
+			if (t - gap_start >= min_gap || gaps.empty()) gaps.push_back({gap_start, t});
+			gap_start = -1;
+		}
+		last_t = t;
+	};
+	i64 next_check = 0;
+	vgm.commands([&](const Cmd& c) {
+		if (c.op == 0x66) return false;
+		// sample the state at least every 100 ms (voices end on their own)
+		while (next_check < c.t) { sample(next_check); next_check += SAMPLE_RATE / 10; }
+		if (c.op == 0xE4)
+		{
+			u8 sub = d[c.p + 1] & 0x0F;
+			u16 data = (d[c.p + 3] << 8) | d[c.p + 4];
+			st.now = c.t;
+			if (sub <= 3) st.write(((sub & 3) << 8) | d[c.p + 2], data);
+			else st.ext(sub, d[c.p + 2], data);
+			sample(c.t);
+		}
+		return true;
+	});
+	if (gap_start >= 0 && (i64)vgm.total - gap_start >= min_gap) gaps.push_back({gap_start, (i64)vgm.total});
+	if (!quiet)
+	{
+		for (auto& kv : per_sec) printf("%s: %d voice(s)\n", fmt_pos(kv.first * SAMPLE_RATE).c_str(), kv.second);
+		for (auto& g : gaps) printf("gap %s .. %s (%.2f s)\n", fmt_pos(g.first).c_str(), fmt_pos(g.second).c_str(), (double)(g.second - g.first) / SAMPLE_RATE);
+	}
+	(void)last_t;
+	return gaps;
+}
+
+// trim a ZSG-2 log: the state at `start` is re-created (gains, DSP program and coefficients, registers,
+// playing voices re-keyed at their computed position), the loop body gets a voice image at the loop point
+// and the coefficient updates the second pass needs; --cmp drops writes that are redundant in both passes
+static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 end, bool do_cmp, bool do_sro, bool keep_gd3,
+                       i64 sro_margin, i64 sro_gap, TrimStats& stats)
+{
+	const u8* d = vgm.data.data();
+	ZSG2State st;
+	st.set_clock(vgm.zsg2_clock);
+	RomSet rom;
+	rom.blk_type = 0x97;
+	Bytes other_blocks, body;
+	i64 loop_body_ofs = -1, pending_wait = 0;
+	bool init_emitted = false;
+
+	// state at the end of the loop body (what the second pass starts with)
+	std::unique_ptr<ZSG2State> st_end, st2;
+	bool track2 = false;
+	if (has_loop)
+	{
+		st_end.reset(new ZSG2State());
+		st_end->set_clock(vgm.zsg2_clock);
+		vgm.commands([&](const Cmd& c) {
+			if (c.op == 0x66 || c.t >= end) return false;
+			if (c.op != 0xE4) return true;
+			u8 sub = d[c.p + 1] & 0x0F;
+			u16 data = (d[c.p + 3] << 8) | d[c.p + 4];
+			st_end->now = c.t;
+			if (sub <= 3) st_end->write(((sub & 3) << 8) | d[c.p + 2], data);
+			else st_end->ext(sub, d[c.p + 2], data);
+			return true;
+		});
+	}
+
+	auto flush_wait = [&]() { if (pending_wait) { wait_cmd(body, pending_wait); pending_wait = 0; } };
+	auto emit_init = [&]() {
+		if (init_emitted) return;
+		init_emitted = true;
+		st.rom_used.clear();
+		for (int vi = 0; vi < 48; vi++) if (st.voice[vi].active) st.note_rom_use(vi);
+		if (!st.reg_count) return;
+		int rekeyed, lost;
+		st.image(body, start, nullptr, rekeyed, lost);
+		if (rekeyed || lost)
+			printf("start %s: %d voice(s) re-keyed at their computed position%s\n", fmt_pos(start).c_str(), rekeyed,
+			       lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : "");
+	};
+	auto mark_loop = [&]() {
+		if (has_loop && loop_body_ofs < 0)
+		{
+			flush_wait();
+			loop_body_ofs = body.size();
+			if (st_end) { st2.reset(new ZSG2State(*st_end)); track2 = do_cmp; }
+			int rekeyed, lost;
+			st.image(body, loop, st_end.get(), rekeyed, lost);
+			if (rekeyed || lost)
+				printf("loop point %s: %d voice(s) re-keyed at their computed position%s\n", fmt_pos(loop).c_str(), rekeyed,
+				       lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : "");
+		}
+	};
+
+	vgm.commands([&](const Cmd& c) {
+		size_t p = c.p;
+		u8 op = c.op;
+		if (op == 0x66) return false;
+		if (op == 0x67)
+		{
+			if (d[p + 2] == 0x97 && c.len >= 15)
+				rom.add_block(le32(&d[p + 7]), le32(&d[p + 11]), &d[p + 15], c.len - 15);
+			else
+				other_blocks.insert(other_blocks.end(), &d[p], &d[p + c.len]);
+			return true;
+		}
+		i64 w = wait_of(&d[p], op);
+		if (w)
+		{
+			i64 a = c.t, b = c.t + w;
+			if (b <= start || a >= end) return true;
+			emit_init();
+			a = std::max(a, start);
+			b = std::min(b, end);
+			if (has_loop && loop_body_ofs < 0 && a <= loop && loop < b)
+			{
+				pending_wait += loop - a;
+				mark_loop();
+				a = loop;
+			}
+			pending_wait += b - a;
+			return true;
+		}
+		bool changed = true;
+		if (op == 0xE4)
+		{
+			u8 sub = d[p + 1] & 0x0F;
+			u16 data = (d[p + 3] << 8) | d[p + 4];
+			bool in_body = track2 && c.t >= start && c.t < end;
+			st.now = c.t;
+			if (sub <= 3)
+			{
+				u16 ofs = ((sub & 3) << 8) | d[p + 2];
+				changed = st.write(ofs, data);
+				if (in_body) { st2->now = c.t; changed |= st2->write(ofs, data); }
+			}
+			else
+			{
+				changed = st.ext(sub, d[p + 2], data);
+				if (in_body) { st2->now = c.t; changed |= st2->ext(sub, d[p + 2], data); }
+			}
+		}
+		if (c.t < start) { stats.skipped++; return true; }
+		if (c.t >= end) return true;
+		emit_init();
+		if (has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
+		if (do_cmp && !changed) { stats.dropped++; return true; }
+		flush_wait();
+		body.insert(body.end(), &d[p], &d[p + c.len]);
+		stats.kept++;
+		return true;
+	});
+	flush_wait();
+	if (has_loop && loop_body_ofs < 0) loop_body_ofs = body.size();
+	body.push_back(0x66);
+
+	Bytes blocks(other_blocks);
+	stats.rom_bytes = rom.blocks(blocks, 0x00, do_sro ? &st.rom_used : nullptr, sro_margin, sro_gap);
+
+	Bytes out(vgm.data.begin(), vgm.data.begin() + vgm.data_ofs);
+	if (g_volume_mod != INT_MIN) out[0x7C] = volume_byte_from_mod(g_volume_mod);
+	size_t data_start = out.size();
+	put_le32(&out[0x18], (u32)(end - start));
+	if (has_loop)
+	{
+		put_le32(&out[0x1C], (u32)(data_start + blocks.size() + loop_body_ofs - 0x1C));
+		put_le32(&out[0x20], (u32)(end - loop));
+	}
+	else { put_le32(&out[0x1C], 0); put_le32(&out[0x20], 0); }
+	out.insert(out.end(), blocks.begin(), blocks.end());
+	out.insert(out.end(), body.begin(), body.end());
+	Bytes gd3;
+	if (keep_gd3 && vgm.gd3 && vgm.gd3 + 12 <= vgm.data.size())
+	{
+		u32 gd3_len = le32(&d[vgm.gd3 + 8]);
+		size_t e = std::min<size_t>(vgm.gd3 + 12 + gd3_len, vgm.data.size());
+		gd3.assign(&d[vgm.gd3], &d[e]);
+	}
+	put_le32(&out[0x14], gd3.empty() ? 0 : (u32)(out.size() - 0x14));
+	out.insert(out.end(), gd3.begin(), gd3.end());
+	put_le32(&out[0x04], (u32)(out.size() - 4));
+	return out;
+}
+
+
 static int g_loop_pass = 0;   // --loop-pass: 0 = auto, 1 = loop body is the first repetition (file = intro + 1 repetition), 2 = the second one (seamless, file = intro + 2 repetitions)
 struct LoopResult { i64 start, loop1, end1, loop2, end2; bool has2; };
 static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool bounded, LoopResult& lr,
@@ -1351,7 +1828,8 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 	const u8* d = vgm.data.data();
 	ES55xxState st(vgm.is_es5506);
 	std::vector<NoteEvent> events;
-	vgm.commands([&](const Cmd& c) {
+	if (vgm.is_zsg2) zsg2_notes(vgm, bounded, search_to, events);
+	else vgm.commands([&](const Cmd& c) {
 		if (c.op == 0x66 || (bounded && c.t >= search_to)) return false;
 		RegWrite w;
 		int n;
@@ -2093,6 +2571,11 @@ int main(int argc, char** argv)
 			{
 				int pass = g_loop_pass;
 				s = lr.start;
+				if (vgm.is_zsg2 && pass != 1)
+				{
+					if (pass == 2) printf("warning: --loop-pass 2 is not available for ZSG-2 logs, looping on the first repetition\n");
+					pass = 1;
+				}
 				if (pass == 0)
 				{
 					int cut = loop_cut_voices(vgm, lr.loop1, lr.end1);
@@ -2138,7 +2621,8 @@ int main(int argc, char** argv)
 		}
 		if (job.has_loop && !(job.start <= job.loop && job.loop < job.end)) die("loop point must be within [start, end)");
 		TrimStats stats;
-		Bytes out = trim(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats, job.skip_from, job.skip_to);
+		Bytes out = vgm.is_zsg2 ? trim_zsg2(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats)
+		                        : trim(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats, job.skip_from, job.skip_to);
 		write_output(job.output, out);
 		printf("%s -> %s: %s .. %s%s, %lld writes kept, %lld dropped (--cmp), %lld commands before start, ROM data %zu bytes; %zu -> %zu bytes\n",
 		       input.c_str(), job.output.c_str(), fmt_pos(job.start).c_str(), fmt_pos(job.end).c_str(),
