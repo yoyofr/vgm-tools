@@ -79,6 +79,13 @@ input gains and latched as the DSP serial inputs (24-bit, x256 when the DSP is i
 the DSP outputs of the previous pass, scaled by the output gains, plus the bypass mix give the stereo
 sample; then the DSP is synchronised and runs up to clock / 2 / sample rate = 384 instruction cycles.
 The DSP external data memory is 256 KB (the board RAM), accesses beyond it are unmapped as in MAME.
+Coefficient updates sent through CLOAD are applied when the program reads the coefficient they were
+sent for (matched by address). MAME applies the queue to the reads that follow the read of the last
+address sent, which depends on how the sound CPU's writes interleave with the program; a VGM delivers
+a whole burst (Ray Storm sends 9 updates at a time at every scene change) between two passes, and
+that put every value on the wrong coefficient: the gameplay reverb presets made the DSP run away to
+full scale. With the address match, a scripted game (coin, start, fire) renders at level 1.00 and
+correlation 0.98-1.00 against MAME with the SPU muted, through the preset changes.
 Device ID 0x30, cores `emu/cores/zsg2.c` and `emu/cores/tms57002.cpp` (+ generated
 `tms57002_ops.hxx`), playback volume weight 0x200 like the ES5506 (MAME output level).
 
