@@ -36,7 +36,7 @@ first part, the loop from the last part that has one.
 ZSG-2 logs (Taito FX-1B / G-NET, VGM 1.72 with a 0x110-byte header) are handled by a dedicated path: a cut re-creates the
 board gains, the DSP (host write history replayed with pre-runs), the register image and re-keys the
 voices still playing at their computed position; `--cmp`, `--sro`, `--find-loop` and `--split log` use
-a ZSG-2 voice model. `--loop-pass 2` is not available for them.
+a ZSG-2 voice model; the loop body is taken from the second repetition when captured (seamless loop).
 
 ## gd3edit.html
 

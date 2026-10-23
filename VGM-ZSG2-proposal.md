@@ -104,8 +104,16 @@ pitch, loop and end registers; current volume and filter ramps). `--cmp` drops t
 change the chip state (never key on/off, current volume/filter values, DSP writes, or a ramp speed
 write that overrides the key-on ramp), tracked over both loop passes for looped files; `--sro` keeps the
 played ROM ranges; `--find-loop` matches the key-on sequence (sample address, end, loop, pitch);
-`--split log` uses the voice model. The seamless loop mode (`--loop-pass 2`) is not available.
+`--split log` uses the voice model. The driver never frees a voice (idle voices keep ringing at a
+small volume and get re-allocated), so a loop whose body is the first repetition replaces the tails of
+the end of the song by the tails of the intro at every re-entry, which is audible. The loop body is
+therefore taken from the second repetition whenever the capture holds it (`--loop-pass` auto, as for
+the ES55xx logs): the first repetition is left out, a splice image re-creates the state at its end
+(registers, voices re-keyed, DSP host writes of the skipped span), and the full voice image at the loop
+point makes the second pass start from the same "end of a repetition" state. Capture intro + 2
+repetitions + a few seconds.
 
 Validation on Ray Storm (90 s capture): cut 1 s before the first note, no `--cmp`: correlation 1.00
-with the uncut render; automatic track with `--cmp --sro`: first pass 0.97-1.00, loop pass 0.95-0.98
-(39 voices re-keyed at the loop point, DSP state continuous), 6.7 MB -> 0.88 MB (0.5 MB vgz).
+with the uncut render; automatic track with `--cmp --sro` (intro + second repetition, 26 s): first pass
+0.97-1.00, loop re-entry vs the game's own second repetition 0.88 in the first 0.5 s then 0.96-0.99,
+6.7 MB -> 0.5 MB vgz.

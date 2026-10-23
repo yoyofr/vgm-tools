@@ -1546,15 +1546,23 @@ struct ZSG2State
 		default: return true;
 		}
 	}
-	// re-create the state at time `at`: gains, DSP (program upload unless `dsp_diff` gives the state the
-	// player already has, then only the coefficients that differ are updated), control registers,
-	// every known voice register, and the voices still playing re-keyed at their current position
-	void image(Bytes& out, i64 at, const ZSG2State* dsp_diff, int& rekeyed, int& lost)
+	// re-create the state at time `at`: gains, DSP, control registers, every known voice register and the
+	// voices still playing re-keyed at their current position. The DSP part depends on the mode: a fresh
+	// chip (IMAGE_INIT) replays the whole host write history with the elapsed time as pre-runs; a splice
+	// (IMAGE_SPLICE, the first repetition left out) replays the host writes of the skipped span only, the
+	// DSP keeps running; a loop point (IMAGE_LOOP) needs nothing, the program runs on. The full voice image
+	// at the loop point makes the second pass start from the first pass's voice state (the driver rotates
+	// its voice allocation at every repetition). `mirror` (second-pass state) receives every write emitted.
+	enum ImageMode { IMAGE_INIT, IMAGE_SPLICE, IMAGE_LOOP };
+	void image(Bytes& out, i64 at, ImageMode mode, int& rekeyed, int& lost, ZSG2State* mirror = nullptr, size_t dsp_from = 0)
 	{
-		auto raw = [&](u8 sub, u8 aa, u16 d) { out.insert(out.end(), {0xE4, sub, aa, u8(d >> 8), u8(d & 0xFF)}); };
+		auto raw = [&](u8 sub, u8 aa, u16 d) {
+			out.insert(out.end(), {0xE4, sub, aa, u8(d >> 8), u8(d & 0xFF)});
+			if (mirror) { mirror->now = at; if (sub <= 3) mirror->write(((sub & 3) << 8) | aa, d); else mirror->ext(sub, aa, d); }
+		};
 		auto regw = [&](u16 ofs, u16 d) { raw(u8((ofs >> 8) & 3), u8(ofs & 0xFF), d); };
 		for (auto& kv : gains) raw(6, u8(kv.first), kv.second);
-		if (dsp_diff == nullptr && !dsp_hist.empty())
+		if (mode == IMAGE_INIT && !dsp_hist.empty())
 		{
 			// replay the DSP history; the time between the writes becomes pre-runs of the program (silent input),
 			// which re-creates the coefficient memory and the program-internal state (LFO phases...)
@@ -1566,6 +1574,8 @@ struct ZSG2State
 			for (const DspCmd& c : dsp_hist) { prerun_to(c.t); raw(c.sub, c.aa, c.data); }
 			prerun_to(at);
 		}
+		else if (mode == IMAGE_SPLICE)
+			for (size_t k = dsp_from; k < dsp_hist.size(); k++) raw(dsp_hist[k].sub, dsp_hist[k].aa, dsp_hist[k].data);
 		for (int r = 8; r < 32; r++) if (creg_known[r]) regw(0x300 + r, creg[r]);
 		for (int vi = 0; vi < 48; vi++)
 			for (int r = 0; r < 16; r++)
@@ -1677,8 +1687,11 @@ static std::vector<std::pair<i64, i64>> zsg2_activity(const VGMFile& vgm, i64 mi
 // playing voices re-keyed at their computed position), the loop body gets a voice image at the loop point
 // and the coefficient updates the second pass needs; --cmp drops writes that are redundant in both passes
 static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 end, bool do_cmp, bool do_sro, bool keep_gd3,
-                       i64 sro_margin, i64 sro_gap, TrimStats& stats)
+                       i64 sro_margin, i64 sro_gap, TrimStats& stats, i64 skip_from = 0, i64 skip_to = 0)
 {
+	const bool skip = skip_to > skip_from;
+	bool splice_done = false;
+	size_t dsp_at_skip = 0;
 	const u8* d = vgm.data.data();
 	ZSG2State st;
 	st.set_clock(vgm.zsg2_clock);
@@ -1715,19 +1728,29 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 		for (int vi = 0; vi < 48; vi++) if (st.voice[vi].active) st.note_rom_use(vi);
 		if (!st.reg_count) return;
 		int rekeyed, lost;
-		st.image(body, start, nullptr, rekeyed, lost);
+		st.image(body, start, ZSG2State::IMAGE_INIT, rekeyed, lost);
 		if (rekeyed || lost)
 			printf("start %s: %d voice(s) re-keyed at their computed position%s\n", fmt_pos(start).c_str(), rekeyed,
 			       lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : "");
+	};
+	// the first repetition is left out: re-create, before the loop point, the state at the end of it
+	auto emit_splice = [&]() {
+		if (splice_done) return;
+		splice_done = true;
+		int rekeyed, lost;
+		st.image(body, skip_to, ZSG2State::IMAGE_SPLICE, rekeyed, lost, nullptr, dsp_at_skip);
+		printf("splice %s -> %s: %d voice(s) re-keyed at their computed position%s\n", fmt_pos(skip_from).c_str(), fmt_pos(skip_to).c_str(), rekeyed,
+		       lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : "");
 	};
 	auto mark_loop = [&]() {
 		if (has_loop && loop_body_ofs < 0)
 		{
 			flush_wait();
+			if (skip) emit_splice();
 			loop_body_ofs = body.size();
 			if (st_end) { st2.reset(new ZSG2State(*st_end)); track2 = do_cmp; }
 			int rekeyed, lost;
-			st.image(body, loop, st_end.get(), rekeyed, lost);
+			st.image(body, loop, ZSG2State::IMAGE_LOOP, rekeyed, lost, st2.get());
 			if (rekeyed || lost)
 				printf("loop point %s: %d voice(s) re-keyed at their computed position%s\n", fmt_pos(loop).c_str(), rekeyed,
 				       lost ? (", " + std::to_string(lost) + " lost (sample address unknown)").c_str() : "");
@@ -1754,16 +1777,28 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 			emit_init();
 			a = std::max(a, start);
 			b = std::min(b, end);
-			if (has_loop && loop_body_ofs < 0 && a <= loop && loop < b)
+			auto add_span = [&](i64 sa, i64 sb) {
+				if (has_loop && loop_body_ofs < 0 && sa <= loop && loop < sb)
+				{
+					pending_wait += loop - sa;
+					mark_loop();
+					sa = loop;
+				}
+				pending_wait += sb - sa;
+			};
+			if (skip)
 			{
-				pending_wait += loop - a;
-				mark_loop();
-				a = loop;
+				if (b > skip_from && dsp_at_skip == 0 && a <= skip_from) dsp_at_skip = st.dsp_hist.size();
+				if (std::min(b, skip_from) > a) add_span(a, std::min(b, skip_from));
+				if (b > std::max(a, skip_to)) add_span(std::max(a, skip_to), b);
 			}
-			pending_wait += b - a;
+			else
+				add_span(a, b);
 			return true;
 		}
 		bool changed = true;
+		const bool in_skip = skip && c.t >= skip_from && c.t < skip_to;
+		if (in_skip && dsp_at_skip == 0) dsp_at_skip = st.dsp_hist.size();
 		if (op == 0xE4)
 		{
 			u8 sub = d[p + 1] & 0x0F;
@@ -1782,7 +1817,7 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 				if (in_body) { st2->now = c.t; changed |= st2->ext(sub, d[p + 2], data); }
 			}
 		}
-		if (c.t < start) { stats.skipped++; return true; }
+		if (c.t < start || in_skip) { stats.skipped++; return true; }
 		if (c.t >= end) return true;
 		emit_init();
 		if (has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
@@ -1803,7 +1838,7 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 	fix_version(out);
 	if (g_volume_mod != INT_MIN) out[0x7C] = volume_byte_from_mod(g_volume_mod);
 	size_t data_start = out.size();
-	put_le32(&out[0x18], (u32)(end - start));
+	put_le32(&out[0x18], (u32)(end - start - (skip ? skip_to - skip_from : 0)));
 	if (has_loop)
 	{
 		put_le32(&out[0x1C], (u32)(data_start + blocks.size() + loop_body_ofs - 0x1C));
@@ -2589,10 +2624,18 @@ int main(int argc, char** argv)
 			{
 				int pass = g_loop_pass;
 				s = lr.start;
-				if (vgm.is_zsg2 && pass != 1)
+				if (vgm.is_zsg2 && pass == 0)
 				{
-					if (pass == 2) printf("warning: --loop-pass 2 is not available for ZSG-2 logs, looping on the first repetition\n");
-					pass = 1;
+					// the driver keeps every voice allocated: the loop body is taken from the second repetition
+					// whenever it was captured, so that both ends of the loop are "end of a repetition" states
+					if (lr.has2) pass = 2;
+					else
+					{
+						pass = 1;
+						printf("warning: the capture is too short to loop on the second repetition (needs %s): looping on the first one, "
+						       "the tails at the loop point will differ. Capture intro + 2 repetitions + a few seconds for a seamless loop.\n",
+						       fmt_pos(lr.end2 + 2205).c_str());
+					}
 				}
 				if (pass == 0)
 				{
@@ -2639,7 +2682,7 @@ int main(int argc, char** argv)
 		}
 		if (job.has_loop && !(job.start <= job.loop && job.loop < job.end)) die("loop point must be within [start, end)");
 		TrimStats stats;
-		Bytes out = vgm.is_zsg2 ? trim_zsg2(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats)
+		Bytes out = vgm.is_zsg2 ? trim_zsg2(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats, job.skip_from, job.skip_to)
 		                        : trim(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats, job.skip_from, job.skip_to);
 		write_output(job.output, out);
 		printf("%s -> %s: %s .. %s%s, %lld writes kept, %lld dropped (--cmp), %lld commands before start, ROM data %zu bytes; %zu -> %zu bytes\n",
