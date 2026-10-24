@@ -196,6 +196,133 @@ function formatName(f, fmt) {
   return fsSafe(out);
 }
 function sortedFiles() { sortFiles(); return files; }   // pack / m3u order = list order (track number)
+// ---------------------------------------------------------------- Ogg (Opus / Vorbis) comments
+// GD3 field index <-> Vorbis comment key (free UTF-8 key=value pairs; the Japanese variants are our convention)
+const OGG_KEYS = ['TITLE', 'TITLE_JA', 'ALBUM', 'ALBUM_JA', 'SYSTEM', 'SYSTEM_JA', 'ARTIST', 'ARTIST_JA', 'DATE', 'ENCODED_BY', 'COMMENT'];
+const isOgg = name => /\.(ogg|opus|oga)$/i.test(name);
+const oggCrcTable = (() => { const t = new Uint32Array(256); for (let i = 0; i < 256; i++) { let r = i << 24; for (let k = 0; k < 8; k++) r = (r & 0x80000000) ? ((r << 1) ^ 0x04c11db7) >>> 0 : (r << 1) >>> 0; t[i] = r; } return t; })();
+function oggCrc(b) { let crc = 0; for (let i = 0; i < b.length; i++) crc = ((crc << 8) >>> 0) ^ oggCrcTable[((crc >>> 24) ^ b[i]) & 0xff]; return crc >>> 0; }
+// split the file into pages: {ofs, len, hdr (header bytes incl. lacing), segs (lacing values), body (Uint8Array), serial, seq, granule(8 bytes), flags}
+function oggPages(b) {
+  const pages = [];
+  let p = 0;
+  while (p + 27 <= b.length) {
+    if (String.fromCharCode(b[p], b[p + 1], b[p + 2], b[p + 3]) !== 'OggS') throw new Error('page Ogg attendue à ' + p);
+    const nseg = b[p + 26], segs = [...b.subarray(p + 27, p + 27 + nseg)];
+    const bodyLen = segs.reduce((a, v) => a + v, 0), hdrLen = 27 + nseg;
+    pages.push({ ofs: p, hdrLen, segs, body: b.subarray(p + hdrLen, p + hdrLen + bodyLen), flags: b[p + 5], granule: b.slice(p + 6, p + 14), serial: le32(b, p + 14), seq: le32(b, p + 18) });
+    p += hdrLen + bodyLen;
+  }
+  return pages;
+}
+// packets of the first logical stream: [{data, firstPage, lastPage}] (only as far as needed: headers + the first audio packets)
+function oggPackets(pages, maxPackets) {
+  const out = [];
+  let cur = [], first = -1;
+  const serial = pages.length ? pages[0].serial : 0;
+  for (let pi = 0; pi < pages.length && out.length < maxPackets; pi++) {
+    const pg = pages[pi];
+    if (pg.serial !== serial) continue;
+    let o = 0;
+    for (const l of pg.segs) {
+      if (first < 0) first = pi;
+      cur.push(pg.body.subarray(o, o + l)); o += l;
+      if (l < 255) {
+        const n = cur.reduce((a, c) => a + c.length, 0), d = new Uint8Array(n); let k = 0;
+        for (const c of cur) { d.set(c, k); k += c.length; }
+        out.push({ data: d, firstPage: first, lastPage: pi });
+        cur = []; first = -1;
+        if (out.length >= maxPackets) break;
+      }
+    }
+  }
+  return out;
+}
+const OPUS_TAGS = [0x4f, 0x70, 0x75, 0x73, 0x54, 0x61, 0x67, 0x73];   // "OpusTags"
+function oggCommentPrefix(pkt) {   // byte length of the magic before the vendor string, or -1
+  if (pkt.length >= 8 && OPUS_TAGS.every((v, i) => pkt[i] === v)) return 8;
+  if (pkt.length >= 7 && pkt[0] === 3 && String.fromCharCode(...pkt.subarray(1, 7)) === 'vorbis') return 7;
+  return -1;
+}
+// read the comments: {vendor, comments: [[KEY, value]...], framing} or null when the file is not Ogg Opus/Vorbis
+function parseOggTags(bytes) {
+  const pages = oggPages(bytes), pk = oggPackets(pages, 2);
+  if (pk.length < 2) return null;
+  const d = pk[1].data, pre = oggCommentPrefix(d);
+  if (pre < 0) return null;
+  const dec = new TextDecoder();
+  let p = pre;
+  const vl = le32(d, p); p += 4; const vendor = dec.decode(d.subarray(p, p + vl)); p += vl;
+  const n = le32(d, p); p += 4;
+  const comments = [];
+  for (let i = 0; i < n && p + 4 <= d.length; i++) { const l = le32(d, p); p += 4; const s = dec.decode(d.subarray(p, p + l)); p += l; const eq = s.indexOf('='); comments.push([s.slice(0, eq).toUpperCase(), s.slice(eq + 1)]); }
+  return { vendor, comments, framing: pre === 7 };
+}
+// write the comments back: the pages holding the comment packet are rebuilt, the following ones renumbered
+function rewriteOggTags(bytes, vendor, comments, framing) {
+  const pages = oggPages(bytes), pk = oggPackets(pages, 3);
+  if (pk.length < 2 || oggCommentPrefix(pk[1].data) < 0) throw new Error('pas de bloc de commentaires Ogg');
+  const enc = new TextEncoder(), parts = [];
+  const magic = framing ? new Uint8Array([3, ...'vorbis'.split('').map(c => c.charCodeAt(0))]) : new Uint8Array(OPUS_TAGS);
+  const u32 = v => new Uint8Array([v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >>> 24) & 255]);
+  parts.push(magic); const ve = enc.encode(vendor); parts.push(u32(ve.length), ve); parts.push(u32(comments.length));
+  for (const [k, v] of comments) { const e = enc.encode(k + '=' + v); parts.push(u32(e.length), e); }
+  if (framing) parts.push(new Uint8Array([1]));
+  const total = parts.reduce((a, x) => a + x.length, 0), pkt = new Uint8Array(total); let k = 0; for (const x of parts) { pkt.set(x, k); k += x.length; }
+  // span of pages to rebuild: from the first page of the comment packet to the last page of the last packet that ends in that span
+  const firstPg = pk[1].firstPage; let lastPg = pk[1].lastPage;
+  const spanPackets = [pkt];
+  for (let i = 2; i < pk.length; i++) if (pk[i].firstPage <= lastPg) { spanPackets.push(pk[i].data); lastPg = Math.max(lastPg, pk[i].lastPage); }
+  // a packet continuing beyond lastPg: unsupported (very large headers); the next page would carry the "continued" flag
+  if (pages[lastPg + 1] && (pages[lastPg + 1].flags & 1)) throw new Error('en-têtes Ogg trop longs (paquet à cheval), fichier non modifié');
+  const serial = pages[firstPg].serial, granule = pages[lastPg].granule;
+  // lacing of the span packets, split into pages of at most 255 segments
+  const newPages = []; let seq = pages[firstPg].seq;
+  let lac = [], body = [];
+  const flush = (last) => {
+    const hdr = new Uint8Array(27 + lac.length);
+    hdr.set([0x4f, 0x67, 0x67, 0x53, 0, 0]); hdr.set(last ? granule : new Uint8Array(8), 6); hdr.set(u32(serial), 14); hdr.set(u32(seq++), 18); hdr[26] = lac.length; hdr.set(lac, 27);
+    const bl = body.reduce((a, x) => a + x.length, 0), page = new Uint8Array(hdr.length + bl); page.set(hdr); let o = hdr.length; for (const x of body) { page.set(x, o); o += x.length; }
+    const crc = oggCrc(page); page.set(u32(crc), 22);
+    newPages.push(page); lac = []; body = [];
+  };
+  for (const d of spanPackets) {
+    let o = 0;
+    for (;;) { const l = Math.min(255, d.length - o); lac.push(l); body.push(d.subarray(o, o + l)); o += l; if (lac.length === 255) flush(false); if (l < 255) break; }
+  }
+  if (lac.length) flush(true); else { newPages[newPages.length - 1].set(granule, 6); const pg = newPages[newPages.length - 1]; pg.set(u32(0), 22); pg.set(u32(oggCrc(pg)), 22); }
+  // assemble: pages before the span, new pages, following pages renumbered
+  const out = [];
+  for (let i = 0; i < firstPg; i++) out.push(bytes.subarray(pages[i].ofs, pages[i].ofs + pages[i].hdrLen + pages[i].body.length));
+  for (const pg of newPages) out.push(pg);
+  for (let i = lastPg + 1; i < pages.length; i++) {
+    const pg = pages[i], raw = bytes.slice(pg.ofs, pg.ofs + pg.hdrLen + pg.body.length);
+    if (pg.serial === serial) { raw.set(u32(seq++), 18); raw.set(u32(0), 22); raw.set(u32(oggCrc(raw)), 22); }
+    out.push(raw);
+  }
+  const n = out.reduce((a, x) => a + x.length, 0), res = new Uint8Array(n); let q = 0; for (const x of out) { res.set(x, q); q += x.length; }
+  return res;
+}
+// comments -> GD3-like tags and track number; the other comments are kept aside and written back unchanged
+function tagsFromOgg(og) {
+  const tags = Array(FIELDS).fill(''); let track = null; const others = [];
+  for (const [k, v] of og.comments) {
+    const i = OGG_KEYS.indexOf(k);
+    if (i >= 0) tags[i] = v;
+    else if (k === 'DESCRIPTION') { if (!tags[10]) tags[10] = v; }   // ffmpeg writes the comment as DESCRIPTION
+    else if (k === 'TRACKNUMBER' || k === 'TRACK') { const m = /^\d+/.exec(v); if (m) track = parseInt(m[0], 10); }
+    else others.push([k, v]);
+  }
+  return { tags, track, others };
+}
+function oggCommentsOf(f) {
+  const c = [...(f.oggOthers || [])];
+  f.tags.forEach((v, i) => { if (v) c.push([OGG_KEYS[i], v]); });
+  if (f.tags[10]) c.push(['DESCRIPTION', f.tags[10]]);   // both spellings of the comment, for the players that read one or the other
+  if (f.track != null) c.push(['TRACKNUMBER', String(f.track)]);
+  return c;
+}
+
 // title from the file name: the track number prefix (digits, optional separator) and the extension are removed
 function titleFromName(name) {
   const base = name.replace(/\.(vgm|vgz|gz)$/i, '').replace(/\.vgm$/i, '');
@@ -269,8 +396,13 @@ async function readFile(file, handle) {
     // audio file (ogg/opus/mp3/flac/wav): no tags in it, title and number from the name; duration from the decoder
     let duration = 0;
     try { const ctx = new (window.AudioContext || window.webkitAudioContext)(); duration = (await ctx.decodeAudioData(raw ? raw.buffer.slice(0) : bytes.buffer.slice(0))).duration; ctx.close(); } catch (e) {}
-    const tags = Array(FIELDS).fill(''); tags[0] = titleFromName(file.name);
-    return { name: file.name, size: file.size, bytes: raw || bytes, gz: false, raw: null, tags, volMod: 0, loopMod: 0, loopBase: 0, dirty: false, handle, hadGd3: false, track: trackFromName(file.name), audio: true, duration };
+    const data = raw || bytes;
+    let tags = Array(FIELDS).fill(''), track = trackFromName(file.name), og = null, ogInfo = null;
+    if (isOgg(file.name)) { try { og = parseOggTags(data); } catch (e) {} }
+    if (og) { ogInfo = tagsFromOgg(og); tags = ogInfo.tags; if (ogInfo.track != null) track = ogInfo.track; }
+    if (!tags[0]) tags[0] = titleFromName(file.name);
+    return { name: file.name, size: file.size, bytes: data, gz: false, raw: null, tags, volMod: 0, loopMod: 0, loopBase: 0, dirty: false, handle, hadGd3: !!og, track, audio: true, duration,
+             ogg: !!og, oggVendor: og ? og.vendor : '', oggFraming: og ? og.framing : false, oggOthers: ogInfo ? ogInfo.others : [] };
   }
   const g = parseGd3(bytes);
   return { name: file.name, size: file.size, bytes, gz, raw, tags: g.tags, volMod: volModOf(bytes), ...loopFieldsOf(bytes), dirty: false, handle, hadGd3: !!g.ofs, track: trackFromName(file.name) };
@@ -312,7 +444,7 @@ function renderList() {
     div.className = 'file' + (i === current ? ' active' : '') + (f.dirty ? ' dirty' : '');
     div.innerHTML = '<span class="name"></span><span class="flag"></span><button class="rm" title="Retirer de la liste">×</button>';
     div.querySelector('.name').textContent = (f.track == null ? '' : String(f.track).padStart(2, '0') + ' · ') + f.name;
-    div.querySelector('.flag').textContent = f.audio ? f.name.replace(/^.*\./, '').toLowerCase() : (f.gz ? 'vgz' : 'vgm') + (f.hadGd3 ? '' : ' no-tag');
+    div.querySelector('.flag').textContent = (f.audio ? f.name.replace(/^.*\./, '').toLowerCase() : (f.gz ? 'vgz' : 'vgm')) + (f.hadGd3 ? '' : ' no-tag');
     div.onclick = () => select(i);
     div.querySelector('.rm').onclick = e => { e.stopPropagation(); removeFile(i); };
     box.appendChild(div);
@@ -367,12 +499,13 @@ let pendingClear = false;
 function select(i) {
   current = i;
   const f = files[i];
-  inputs.forEach(inp => { inp.value = f.tags[+inp.dataset.i] || ''; inp.disabled = !!f.audio && inp.dataset.i !== '0'; });
+  inputs.forEach(inp => { inp.value = f.tags[+inp.dataset.i] || ''; inp.disabled = !!f.audio && !f.ogg && inp.dataset.i !== '0'; });
   ['vol', 'loopMul', 'loopBase', 'volAll', 'loopAll'].forEach(id => $(id).disabled = !!f.audio);
   $('trackNo').value = f.track == null ? '' : String(f.track);
   if (f.audio) {
     $('volHint').textContent = ''; $('loopHint').textContent = '';
-    const info = ['audio ' + f.name.replace(/^.*\./, '').toLowerCase(), 'durée ' + fmtTime(Math.round(f.duration * 44100)), (f.size / 1048576).toFixed(2) + ' Mo', 'titre et n° de piste pour le m3u / le pack seulement'];
+    const info = ['audio ' + f.name.replace(/^.*\./, '').toLowerCase(), 'durée ' + fmtTime(Math.round(f.duration * 44100)), (f.size / 1048576).toFixed(2) + ' Mo',
+      f.ogg ? 'tags Ogg (TITLE, TITLE_JA, ALBUM, ARTIST, DATE, COMMENT, TRACKNUMBER…) : enregistrables' : 'pas de tags : titre et n° de piste pour le m3u / le pack seulement'];
     $('info').innerHTML = info.map(t => '<span></span>').join('');
     [...$('info').children].forEach((el, k) => el.textContent = info[k]);
     renderList();
@@ -401,7 +534,7 @@ inputs.forEach(inp => inp.addEventListener('input', () => {
   if (current < 0) return;
   const f = files[current];
   f.tags[+inp.dataset.i] = inp.value;
-  if (!f.dirty && !f.audio) { f.dirty = true; renderList(); }   // audio files have nothing to save: the title only names the track
+  if (!f.dirty && (!f.audio || f.ogg)) { f.dirty = true; renderList(); }   // audio files without tags have nothing to save: the title only names the track
 }));
 
 $('titleFromFile').onclick = e => {
@@ -471,6 +604,7 @@ $('trackNo').addEventListener('input', () => {
   if (current < 0) return;
   const v = $('trackNo').value.trim();
   files[current].track = v === '' ? null : parseInt(v, 10);
+  if (files[current].ogg) files[current].dirty = true;
   renderList();
 });
 $('trackFromFile').onclick = e => {
@@ -521,11 +655,15 @@ $('r_go').onclick = async () => {
 };
 
 async function saveFile(f) {
-  if (f.audio) return;
-  let out = rebuild(f);
-  if (f.gz) {
-    const cs = new CompressionStream('gzip');
-    out = new Uint8Array(await new Response(new Blob([out]).stream().pipeThrough(cs)).arrayBuffer());
+  if (f.audio && !f.ogg) return;
+  let out;
+  if (f.ogg) out = rewriteOggTags(f.bytes, f.oggVendor, oggCommentsOf(f), f.oggFraming);
+  else {
+    out = rebuild(f);
+    if (f.gz) {
+      const cs = new CompressionStream('gzip');
+      out = new Uint8Array(await new Response(new Blob([out]).stream().pipeThrough(cs)).arrayBuffer());
+    }
   }
   if (f.handle) {
     await ensureWritable(f);
@@ -538,8 +676,8 @@ async function saveFile(f) {
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
-  f.bytes = rebuild(f);
-  f.raw = f.gz ? out : null;
+  if (f.ogg) f.bytes = out;
+  else { f.bytes = rebuild(f); f.raw = f.gz ? out : null; }
   f.hadGd3 = true;
   f.dirty = false;
 }

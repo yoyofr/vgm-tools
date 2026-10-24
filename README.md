@@ -68,6 +68,9 @@ the files on disk from a format (default `{nn} {title}`; fields `{n}` `{nn}` `{n
 Audio files (.ogg, .opus, .oga, .mp3, .flac, .wav) can be added to the list next to the VGMs: title and
 number from the file name, duration from the browser's decoder, nothing is written into them. They are
 packed as they are, listed in the m3u and the txt in track order, and renamed with the same format.
+Ogg Opus / Vorbis files have their comments read and written (TITLE, TITLE_JA, ALBUM, ALBUM_JA, SYSTEM,
+SYSTEM_JA, ARTIST, ARTIST_JA, DATE, ENCODED_BY, COMMENT + DESCRIPTION, TRACKNUMBER; other comments are
+kept), so the whole GD3 form and the track number apply to them and save in place.
 
 ## Related repositories
 
