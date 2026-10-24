@@ -309,7 +309,7 @@ function tagsFromOgg(og) {
   for (const [k, v] of og.comments) {
     const i = OGG_KEYS.indexOf(k);
     if (i >= 0) tags[i] = v;
-    else if (k === 'DESCRIPTION') { if (!tags[10]) tags[10] = v; }   // ffmpeg writes the comment as DESCRIPTION
+    else if (k === 'DESCRIPTION') { if (!tags[10]) tags[10] = v; }   // ffmpeg writes the comment as DESCRIPTION; read, not kept (written back as COMMENT only)
     else if (k === 'TRACKNUMBER' || k === 'TRACK') { const m = /^\d+/.exec(v); if (m) track = parseInt(m[0], 10); }
     else others.push([k, v]);
   }
@@ -318,7 +318,6 @@ function tagsFromOgg(og) {
 function oggCommentsOf(f) {
   const c = [...(f.oggOthers || [])];
   f.tags.forEach((v, i) => { if (v) c.push([OGG_KEYS[i], v]); });
-  if (f.tags[10]) c.push(['DESCRIPTION', f.tags[10]]);   // both spellings of the comment, for the players that read one or the other
   if (f.track != null) c.push(['TRACKNUMBER', String(f.track)]);
   return c;
 }
