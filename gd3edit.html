@@ -195,9 +195,7 @@ function formatName(f, fmt) {
   const out = fmt.replace(/\{(\w+)\}/g, (m, k) => k in map ? (map[k] || '') : m).trim();
   return fsSafe(out);
 }
-function sortedFiles() {   // pack / m3u order: by track number, files without one last in list order
-  return files.map((f, i) => ({ f, i })).sort((a, b) => (a.f.track == null) - (b.f.track == null) || (a.f.track ?? 0) - (b.f.track ?? 0) || a.i - b.i).map(x => x.f);
-}
+function sortedFiles() { sortFiles(); return files; }   // pack / m3u order = list order (track number)
 // title from the file name: the track number prefix (digits, optional separator) and the extension are removed
 function titleFromName(name) {
   const base = name.replace(/\.(vgm|vgz|gz)$/i, '').replace(/\.vgm$/i, '');
@@ -290,7 +288,14 @@ async function addFiles(list, handles) {
 function setStatus(msg, cls) { const s = $('status'); s.textContent = msg; s.className = cls || ''; }
 document.addEventListener('click', e => { if (!e.target.closest('.rm, #clear')) { pendingRemove.clear(); pendingClear = false; } }, true);
 
+// the list is kept in track order (files without a number last, then by name); the selection follows its file
+function sortFiles() {
+  const cur = current >= 0 ? files[current] : null;
+  files.sort((a, b) => (a.track == null) - (b.track == null) || (a.track ?? 0) - (b.track ?? 0) || a.name.localeCompare(b.name, undefined, { numeric: true }));
+  current = cur ? files.indexOf(cur) : -1;
+}
 function renderList() {
+  sortFiles();
   const box = $('files');
   box.innerHTML = '';
   if (!files.length) { box.innerHTML = '<div class="empty">Aucun fichier</div>'; return; }
