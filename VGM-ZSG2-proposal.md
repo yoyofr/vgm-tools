@@ -102,7 +102,9 @@ Device ID 0x30, cores `emu/cores/zsg2.c` and `emu/cores/tms57002.cpp` (+ generat
 
 ## Logger (MAME)
 
-`zsg2.cpp` opens the VGM device, dumps its ROM region and logs every 16-bit write; `taito_zm.cpp`
+`zsg2.cpp` opens the VGM device, dumps its ROM region (on the Taito G-NET the samples are in flash
+memories programmed by the game at boot: the memory is dumped as the chip reads it at the first
+key-on, the block appears in the stream at that point) and logs every 16-bit write; `taito_zm.cpp`
 wraps the DSP host port to log the data writes, logs the control lines and the gains, and the reset.
 A capture restarted at run time (`-vgmpause`, hotkey) re-dumps the ROM, the ZSG-2 register image,
 re-keys the voices that are playing at their current block (key on with the start address set to the
