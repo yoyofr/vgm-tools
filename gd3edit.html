@@ -90,6 +90,7 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
   </div>
   <div class="toolbar">
     <button id="open">Ouvrir…</button>
+    <button id="openDir" title="Ouvrir un dossier : une seule autorisation d'écriture pour tous ses fichiers">Dossier…</button>
     <input id="picker" type="file" accept=".vgm,.vgz,.gz" multiple hidden>
     <button id="save" class="primary" disabled>Enregistrer</button>
     <button id="saveAll" disabled>Tout enregistrer</button>
@@ -244,7 +245,11 @@ async function addFiles(list, handles) {
   let skipped = 0;
   for (let i = 0; i < list.length; i++) {
     if (files.some(f => f.name === list[i].name && f.size === list[i].size)) { skipped++; continue; }
-    try { files.push(await readFile(list[i], handles ? handles[i] : null)); }
+    try {
+      const f = await readFile(list[i], handles ? handles[i] : null);
+      f.dir = f.handle ? dirOf.get(f.handle) || null : null;   // directory the file came from (one write permission for all its files)
+      files.push(f);
+    }
     catch (e) { errors.push(e.message); }
   }
   if (current < 0 && files.length) select(0); else renderList();
@@ -396,6 +401,15 @@ document.querySelectorAll('[data-all]').forEach(btn => btn.onclick = () => {
   setStatus('Champ copié dans ' + (files.length - 1) + ' autre(s) fichier(s)', 'ok');
 });
 
+// write permission: asked once per directory (files opened or dropped as a folder), else once per file
+const dirOf = new WeakMap();   // file handle -> directory handle
+async function ensureWritable(f) {
+  const h = f.dir || f.handle;
+  if (!h || !h.queryPermission) return;
+  if ((await h.queryPermission({ mode: 'readwrite' })) === 'granted') return;
+  if ((await h.requestPermission({ mode: 'readwrite' })) !== 'granted') throw new Error('écriture refusée');
+}
+
 async function saveFile(f) {
   let out = rebuild(f);
   if (f.gz) {
@@ -403,6 +417,7 @@ async function saveFile(f) {
     out = new Uint8Array(await new Response(new Blob([out]).stream().pipeThrough(cs)).arrayBuffer());
   }
   if (f.handle) {
+    await ensureWritable(f);
     const w = await f.handle.createWritable();
     await w.write(out); await w.close();
   } else {
@@ -425,6 +440,9 @@ $('save').onclick = async () => {
 };
 $('saveAll').onclick = async () => {
   let n = 0;
+  // permissions first, one prompt per directory, so that the saves then run without any dialog
+  try { for (const f of files) if (f.dirty && f.handle) await ensureWritable(f); }
+  catch (e) { setStatus('Échec : ' + e.message, 'warn'); return; }
   for (const f of files) if (f.dirty) { try { await saveFile(f); n++; } catch (e) { setStatus('Échec ' + f.name + ' : ' + e.message, 'warn'); return; } }
   renderList(); setStatus(n + ' fichier(s) enregistré(s)', 'ok');
 };
@@ -440,6 +458,17 @@ $('open').onclick = async () => {
     } catch (e) { if (e.name !== 'AbortError') setStatus(e.message, 'warn'); }
   } else $('picker').click();
 };
+$('openDir').onclick = async () => {
+  if (!window.showDirectoryPicker) { setStatus('Ouverture de dossier non disponible dans ce navigateur (Chrome/Edge)', 'warn'); return; }
+  try {
+    const dir = await window.showDirectoryPicker({ mode: 'readwrite' });   // one prompt covers every file of the folder
+    const handles = [];
+    await walkDir(dir, handles);
+    const list = [];
+    for (const h of handles) list.push(await h.getFile());
+    await addFiles(list, handles);
+  } catch (e) { if (e.name !== 'AbortError') setStatus(e.message, 'warn'); }
+};
 $('picker').onchange = () => addFiles([...$('picker').files]);
 const drop = $('drop');
 drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
@@ -453,7 +482,7 @@ async function walkDir(dir, out) {
   entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
   for (const h of entries) {
     if (h.kind === 'directory') await walkDir(h, out);
-    else if (isVgm(h.name)) out.push(h);
+    else if (isVgm(h.name)) { dirOf.set(h, dir); out.push(h); }
     else if (/\.png$/i.test(h.name)) pngCandidates.push(h);
   }
 }

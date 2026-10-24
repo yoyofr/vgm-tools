@@ -51,6 +51,10 @@ stripped, shift-click for every file), `.vgm` / `.vgz`, the header volume modifi
 `default × modifier − base` loops), and a vgmrips pack generator (zip with the tracks, `.m3u`, `.txt` in the vgmrips
 layout and the pack `.png`).
 
+Saving in place uses the File System Access API (Chrome/Edge). Open the files with **Dossier…** or drop
+their folder: Chrome then asks the write permission once for the whole folder, and **Tout enregistrer**
+runs without any dialog. Files opened one by one each need their own permission prompt.
+
 ## Related repositories
 
 - MAME VGM logger with the ES55xx extension: github.com/yoyofr/mame, branch `vgmlog0288-es5506`
