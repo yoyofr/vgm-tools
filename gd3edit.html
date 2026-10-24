@@ -281,6 +281,7 @@ async function addFiles(list, handles) {
     }
     catch (e) { errors.push(e.message); }
   }
+  sortFiles();
   if (current < 0 && files.length) select(0); else renderList();
   setStatus((errors.length ? errors.join(' · ') : files.length + ' fichier(s) chargé(s)') + (skipped ? ' · ' + skipped + ' déjà dans la liste' : ''), errors.length ? 'warn' : 'ok');
 }
