@@ -20,9 +20,14 @@ vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --loop 30.0s --cmp --sro
 vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --volume +6dB
 vgm_trim part1.vgz merged.vgz --append part2.vgz
 vgm_trim capture.vgm capture.vgz            # no option: rewrite as is (loop kept); 1.73 files become 1.72
+vgm_trim capture.wav tracks.wav --auto --track all --gap 3s   # a .wav input is split / cut the same way (16-bit PCM out)
 ```
 
 All reductions are output-neutral: rendered audio is byte-identical before and after.
+
+A `.wav` input (for example the `<capture>.wav` that MAME's `-vgmwav` option records alongside each
+capture: same start and stop, same numbering) goes through the same silence split, margins, `--start`
+`--end` and numbering, and comes out as 16-bit PCM wav files; the VGM-only options are ignored.
 
 The console output uses sections, status lines and tables; colours when stdout is a terminal
 (`--color auto|always|never`, `NO_COLOR` honoured).
@@ -59,6 +64,10 @@ Each file has a track number (not stored in the VGM: taken from the file name, "
 "game_track_02.vgz", editable). It orders the m3u and names the pack entries, and **Renommer…** renames
 the files on disk from a format (default `{nn} {title}`; fields `{n}` `{nn}` `{nnn}` `{title}` `{titlej}`
 `{game}` `{gamej}` `{system}` `{author}` `{date}` `{name}`), with a preview and duplicate check.
+
+Audio files (.ogg, .opus, .oga, .mp3, .flac, .wav) can be added to the list next to the VGMs: title and
+number from the file name, duration from the browser's decoder, nothing is written into them. They are
+packed as they are, listed in the m3u and the txt in track order, and renamed with the same format.
 
 ## Related repositories
 

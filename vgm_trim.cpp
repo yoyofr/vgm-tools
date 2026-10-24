@@ -2659,10 +2659,85 @@ static std::string next_track_name(const std::string& output)
 	die("no free track number for " + output);
 }
 
+// ---------------------------------------------------------------------------------------------
+// WAV input: the same silence-based split and cuts, applied to an audio recording (e.g. the -vgmwav
+// companion of a capture); output 16-bit PCM wav files
+// ---------------------------------------------------------------------------------------------
+static void write_wav(const std::string& path, const Wav& w, size_t f0, size_t f1)
+{
+	FILE* f = fopen(path.c_str(), "wb");
+	if (!f) die("cannot write " + path);
+	f0 = std::min(f0, w.frames); f1 = std::min(std::max(f1, f0), w.frames);
+	u32 data_bytes = (u32)((f1 - f0) * w.nch * 2);
+	Bytes h;
+	auto s4 = [&](const char* t) { h.insert(h.end(), t, t + 4); };
+	s4("RIFF"); push_le32(h, 36 + data_bytes); s4("WAVE"); s4("fmt "); push_le32(h, 16);
+	h.push_back(1); h.push_back(0); h.push_back((u8)w.nch); h.push_back(0); push_le32(h, w.sr); push_le32(h, w.sr * w.nch * 2);
+	h.push_back((u8)(w.nch * 2)); h.push_back(0); h.push_back(16); h.push_back(0);
+	s4("data"); push_le32(h, data_bytes);
+	fwrite(h.data(), 1, h.size(), f);
+	fwrite(&w.smp[f0 * w.nch], 2, (f1 - f0) * w.nch, f);
+	fclose(f);
+}
+
+struct WavOpts { bool info, auto_split; std::string output, start, end, track, gap, pre, post, min_length; int silence; bool ignored; };
+static int wav_main(const std::string& input, const WavOpts& o)
+{
+	Wav w;
+	if (!read_wav(input, w)) die("cannot read " + input + " (16-bit PCM wav expected)");
+	const double to_frames = (double)w.sr / SAMPLE_RATE;   // positions are handled in 44100 Hz units like the captures
+	i64 total = (i64)(w.frames / to_frames);
+	ui::section("File");
+	ui::KV kv;
+	kv.add("Format", strf("WAV, %d Hz, %d channel(s), 16-bit PCM", w.sr, w.nch));
+	kv.add("Length", fmt_pos(total) + " (" + ui::secs(total) + ")");
+	kv.add("Size", ui::bytes(w.frames * w.nch * 2 + 44));
+	kv.print();
+	if (o.info || o.output.empty()) { print_loudness(w); return 0; }
+	if (o.ignored) ui::info("--find-loop, --cmp, --sro and --volume do not apply to a wav: ignored");
+
+	struct Job { i64 start, end; std::string output; };
+	std::vector<Job> jobs;
+	if (o.auto_split)
+	{
+		std::vector<std::pair<i64, i64>> segs = find_segments(w, o.silence, parse_pos(o.gap), parse_pos(o.min_length));
+		if (segs.empty()) die("no non-silent segment found");
+		ui::section(strf("Tracks (gap >= %s)", ui::secs(parse_pos(o.gap)).c_str()));
+		ui::Table tt({"Track", "Start", "End", "Length"}, {true, false, false, true});
+		for (size_t i = 0; i < segs.size(); i++)
+			tt.add({strf("%zu", i + 1), fmt_pos(segs[i].first), fmt_pos(segs[i].second), ui::secs(segs[i].second - segs[i].first)});
+		tt.print();
+		if (o.track == "0") { print_loudness(w); return 0; }
+		std::vector<size_t> wanted;
+		if (o.track == "all") for (size_t i = 0; i < segs.size(); i++) wanted.push_back(i);
+		else { int n = atoi(o.track.c_str()); if (n < 1 || n > (int)segs.size()) return 0; wanted.push_back(n - 1); }
+		for (size_t i : wanted)
+			jobs.push_back({std::max<i64>(0, segs[i].first - parse_pos(o.pre)), std::min<i64>(total, segs[i].second + parse_pos(o.post)),
+			                o.track == "all" ? next_track_name(o.output) : o.output});
+	}
+	else
+		jobs.push_back({o.start.empty() ? 0 : parse_pos(o.start), o.end.empty() ? total : std::min(total, parse_pos(o.end)), o.output});
+
+	ui::Table results({"Output", "Start", "End", "Length", "Size"}, {false, false, false, true, true});
+	for (const Job& j : jobs)
+	{
+		if (j.end <= j.start) die("empty range");
+		size_t f0 = (size_t)(j.start * to_frames), f1 = (size_t)(j.end * to_frames);
+		write_wav(j.output, w, f0, f1);
+		results.add({ui::basename(j.output), fmt_pos(j.start), fmt_pos(j.end), ui::secs(j.end - j.start), ui::bytes((f1 - f0) * w.nch * 2 + 44)});
+		ui::ok(strf("%s written (%s)", ui::basename(j.output).c_str(), ui::secs(j.end - j.start).c_str()));
+	}
+	ui::section(strf("Result (%s)", ui::basename(input).c_str()));
+	results.print();
+	return 0;
+}
+
 static void usage()
 {
 	fprintf(stderr,
 	        "usage: vgm_trim input [output] [options]\n"
+	        "  input may be a .wav (e.g. the -vgmwav companion of a capture): same --auto split, --start/--end, margins and\n"
+	        "  numbering, output is 16-bit PCM wav; the VGM-only options are ignored\n"
 	        "  output ending in .vgz is written gzip-compressed; with --track all, tracks are output_NN.vgm/.vgz\n"
 	        "  --info                 print file information and exit\n"
 	        "  --activity             print the running-voice timeline and the silent gaps (from the log) and exit\n"
@@ -2754,6 +2829,12 @@ int main(int argc, char** argv)
 	input = positional[0];
 	if (positional.size() > 1) output = positional[1];
 
+	if (ends_with_nocase(input, ".wav"))
+	{
+		WavOpts o{f_info, f_auto, output, start_s, end_s, track, gap, pre, post, min_length, silence,
+		          f_find_loop || f_cmp || f_sro || g_volume_mod != INT_MIN || !loop_s.empty()};
+		return wav_main(input, o);
+	}
 	VGMFile vgm;
 	vgm.load(input);
 	if (f_activity) { activity(vgm, parse_pos(gap), false); return 0; }
