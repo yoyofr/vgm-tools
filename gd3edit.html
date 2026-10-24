@@ -109,7 +109,7 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
   <section class="panel">
     <div id="form">
       <div class="head"><span></span><span>English</span><span>日本語</span><span></span></div>
-      <div class="row single"><label for="trackNo">N° de piste</label><div class="volbox"><input type="number" id="trackNo" min="0" max="999" step="1" placeholder="—"><span class="hint">non stocké dans le fichier : m3u, nom des fichiers du pack, renommage</span><button type="button" id="renameOne" title="Renommer ce fichier sur le disque d'après le format">Renommer ce fichier…</button></div><button class="all" id="trackFromFile" title="Numéro depuis le préfixe du nom de fichier ; Maj+clic : tous les fichiers">← fichier</button></div>
+      <div class="row single"><label for="trackNo">N° de piste</label><div class="volbox"><input type="number" id="trackNo" min="0" max="999" step="1" placeholder="—"><span class="hint">non stocké dans le fichier : m3u, nom des fichiers du pack, renommage</span><button type="button" id="renameOne" title="Renommer ce fichier sur le disque d'après le format">Renommer ce fichier…</button></div><button class="all" id="trackFromFile" title="Numéro depuis le préfixe du nom de fichier ; Maj+clic : tous les fichiers">← fichier</button><button type="button" id="trackSeq" title="Renuméroter tous les fichiers 1..N dans l'ordre de la liste">1..N</button></div>
       <div class="row"><label for="trackE">Titre</label><input type="text" id="trackE" data-i="0"><input type="text" id="trackJ" data-i="1" lang="ja"><button class="all" id="titleFromFile" title="Titres anglais et japonais depuis le nom du fichier (sans numéro de piste ni extension) ; Maj+clic : tous les fichiers">← fichier</button></div>
       <div class="row"><label for="gameE">Jeu</label><input type="text" id="gameE" data-i="2"><input type="text" id="gameJ" data-i="3" lang="ja"><button class="all" data-all="2,3">→ tous</button></div>
       <div class="row"><label for="systemE">Système</label><input type="text" id="systemE" data-i="4"><input type="text" id="systemJ" data-i="5" lang="ja"><button class="all" data-all="4,5">→ tous</button></div>
@@ -129,16 +129,17 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
     <div class="prow"><label for="p_game">Nom du jeu</label><input type="text" id="p_game"></div>
     <div class="prow"><label for="p_system">Système</label><input type="text" id="p_system"></div>
     <div class="prow"><label for="p_hw">Matériel audio</label><input type="text" id="p_hw"></div>
-    <div class="prow"><label for="p_author">Compositeur</label><input type="text" id="p_author"></div>
+    <div class="prow"><label for="p_author">Compositeur</label><input type="text" id="p_author" placeholder="auteurs séparés par des virgules"></div>
     <div class="prow"><label for="p_dev">Développeur</label><input type="text" id="p_dev"></div>
     <div class="prow"><label for="p_pub">Éditeur</label><input type="text" id="p_pub"></div>
-    <div class="prow"><label for="p_date">Date de sortie</label><input type="text" id="p_date" placeholder="1994-09-19"></div>
+    <div class="prow"><label for="p_date">Date de sortie</label><input type="text" id="p_date" placeholder="AAAA-MM-JJ, AAAA-MM ou AAAA"></div>
     <div class="prow"><label for="p_creator">Pack créé par</label><input type="text" id="p_creator"></div>
     <div class="prow"><label for="p_version">Version du pack</label><input type="text" id="p_version" value="1.00"></div>
     <div class="prow"><label for="p_notes">Notes</label><textarea id="p_notes"></textarea></div>
     <div class="prow"><label for="p_history">Historique</label><textarea id="p_history"></textarea></div>
-    <div class="prow"><label>Image PNG</label><div class="pngbox"><img id="p_pngimg" alt="" hidden><span id="p_pngname">aucune</span><button type="button" id="p_pngpick">Choisir…</button><input id="p_pngfile" type="file" accept=".png" hidden></div></div>
-    <div class="prow"><label>Pistes</label><label class="chk"><input type="checkbox" id="p_rename" checked> Nommer les fichiers du pack d'après le format de renommage (ordre : n° de piste)</label></div>
+    <div class="prow"><label>Images PNG</label><div class="pngbox"><img id="p_pngimg" alt="" hidden><span id="p_pngname">aucune</span><button type="button" id="p_pngpick">Choisir…</button><button type="button" id="p_pngclear">Aucune</button><input id="p_pngfile" type="file" accept=".png" multiple hidden></div></div>
+    <div class="prow"><label></label><div class="hint">Une image : nommée « Nom du jeu.png ». Plusieurs (une par région) : elles gardent leur nom, à nommer d'après le titre de la région.</div></div>
+    <div class="prow"><label>Pistes</label><div><label class="chk"><input type="checkbox" id="p_rename" checked> Nommer les fichiers du pack d'après le format de renommage (ordre : n° de piste)</label><br><label class="chk"><input type="checkbox" id="p_seq" checked> Numéroter 01..N dans l'ordre, sans trou (règle vgmrips : « ## Titre.vgz »)</label></div></div>
     <div class="pfoot"><span class="msg" id="p_msg"></span><button type="button" id="p_cancel">Annuler</button><button type="button" class="primary" id="p_go">Générer le zip</button></div>
   </form>
 </dialog>
@@ -607,6 +608,13 @@ $('trackNo').addEventListener('input', () => {
   if (files[current].ogg) files[current].dirty = true;
   renderList();
 });
+$('trackSeq').onclick = () => {
+  sortFiles();
+  files.forEach((f, i) => { f.track = i + 1; if (f.ogg) f.dirty = true; });
+  if (current >= 0) $('trackNo').value = String(files[current].track);
+  renderList();
+  setStatus(files.length + ' fichier(s) renumérotés 1..' + files.length, 'ok');
+};
 $('trackFromFile').onclick = e => {
   const targets = e.shiftKey ? files : (current >= 0 ? [files[current]] : []);
   for (const f of targets) f.track = trackFromName(f.name);
@@ -803,7 +811,7 @@ function wrap(text, width, indent) {
 }
 function trackEntryName(f, i, rename) {
   if (rename) {
-    const g = { ...f, track: f.track == null ? i + 1 : f.track };   // files without a number: their position
+    const g = { ...f, track: ($('p_seq').checked || f.track == null) ? i + 1 : f.track };   // sequential 01..N, or the file's own number
     const nn = formatName(g, $('r_fmt').value);
     if (nn) return nn + '.vgz';
   }
@@ -831,8 +839,8 @@ function buildTxt(p, tracks) {
     sumTotal += t.total; sumLoop += t.total + (t.loop || 0);
   }
   L.push('', timeRow('Total Length', mmss(sumTotal), mmss(sumLoop)), '', '');
-  if (p.notes.trim()) { L.push('Notes:'); L.push(...wrap(p.notes.trim(), 47, '')); L.push('', ''); }
-  L.push('Package history:'); L.push(...wrap(p.history.trim(), 47, '     ')); L.push('');
+  L.push('Notes:'); L.push(...wrap(p.notes.trim() || '-', 47, '')); L.push('', '');   // vgmrips: a minus when there is nothing to say
+  L.push('Package history:'); L.push(...wrap(p.history.trim(), 47, ' ')); L.push('');   // continuation lines indented by one space
   return L.join('\r\n');
 }
 // ---- stored zip writer
@@ -868,13 +876,20 @@ async function saveBlob(blob, name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 10000); return 'téléchargé';
 }
 
-let packPng = null;   // {name, bytes}
+let packPngs = [];   // [{name, bytes}]: one screenshot named after the game, or one per region keeping its own name
 const pv = id => $(id).value.trim();
-async function setPng(file) {
-  packPng = { name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) };
-  $('p_pngname').textContent = file.name + ' (' + (packPng.bytes.length / 1024).toFixed(1) + ' Ko)';
-  const img = $('p_pngimg'); img.src = URL.createObjectURL(new Blob([packPng.bytes], { type: 'image/png' })); img.hidden = false;
+async function addPng(file) {
+  if (packPngs.some(x => x.name === file.name)) return;
+  packPngs.push({ name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) });
+  showPngs();
 }
+function showPngs() {
+  $('p_pngname').textContent = packPngs.length ? packPngs.map(x => x.name + ' (' + (x.bytes.length / 1024).toFixed(1) + ' Ko)').join(', ') : 'aucune';
+  const img = $('p_pngimg');
+  if (packPngs.length) { img.src = URL.createObjectURL(new Blob([packPngs[packPngs.length - 1].bytes], { type: 'image/png' })); img.hidden = false; }
+  else img.hidden = true;
+}
+$('p_pngclear').onclick = () => { packPngs = []; showPngs(); };
 $('pack').onclick = async () => {
   if (!files.length) return;
   const t = files[0].tags;
@@ -894,22 +909,23 @@ $('pack').onclick = async () => {
     $('p_notes').value = 'This pack was made using MAME 0.288 VGM mod' + (custom.length ? '\n(' + custom.join(', ') + ' custom build).' : '.');
   }
   if (!pv('p_history')) $('p_history').value = (pv('p_version') || '1.00') + ' ' + today + ' ' + (pv('p_creator') || t[9] || '') + ': Initial release.';
-  if (!packPng && pngCandidates.length) { try { await setPng(await pngCandidates[pngCandidates.length - 1].getFile()); } catch (e) {} }
+  if (!packPngs.length && pngCandidates.length) { try { for (const h of pngCandidates) await addPng(await h.getFile()); } catch (e) {} }
   $('p_msg').textContent = files.length + ' piste(s) dans l\'ordre de la liste';
   $('packDlg').showModal();
 };
 $('p_cancel').onclick = () => $('packDlg').close();
 $('p_pngpick').onclick = async () => {
   if (window.showOpenFilePicker) {
-    try { const [h] = await window.showOpenFilePicker({ types: [{ description: 'PNG', accept: { 'image/png': ['.png'] } }] }); await setPng(await h.getFile()); }
+    try { const hs = await window.showOpenFilePicker({ multiple: true, types: [{ description: 'PNG', accept: { 'image/png': ['.png'] } }] }); for (const h of hs) await addPng(await h.getFile()); }
     catch (e) { if (e.name !== 'AbortError') $('p_msg').textContent = e.message; }
   } else $('p_pngfile').click();
 };
-$('p_pngfile').onchange = () => { if ($('p_pngfile').files[0]) setPng($('p_pngfile').files[0]); };
+$('p_pngfile').onchange = async () => { for (const f of [...$('p_pngfile').files]) await addPng(f); };
 $('p_go').onclick = async () => {
   const p = { game: pv('p_game'), system: pv('p_system'), hw: pv('p_hw'), author: pv('p_author'), dev: pv('p_dev'), pub: pv('p_pub'),
     date: pv('p_date'), creator: pv('p_creator'), version: pv('p_version'), notes: $('p_notes').value, history: $('p_history').value };
   if (!p.game) { $('p_msg').textContent = 'Nom du jeu requis'; return; }
+  if (p.date && !/^\d{4}(-\d{2}(-\d{2})?)?$/.test(p.date)) { $('p_msg').textContent = 'Date : AAAA-MM-JJ, AAAA-MM ou AAAA attendu'; return; }
   const rename = $('p_rename').checked, base = packBase(p.game), msg = $('p_msg');
   $('p_go').disabled = true;
   try {
@@ -931,12 +947,13 @@ $('p_go').onclick = async () => {
     }
     const enc = new TextEncoder();
     entries.push({ name: base + '.m3u', data: enc.encode(entries.map(e => e.name).join('\r\n') + '\r\n') });
-    if (packPng) entries.push({ name: base + '.png', data: packPng.bytes });
+    if (packPngs.length === 1) entries.push({ name: base + '.png', data: packPngs[0].bytes });
+    else for (const x of packPngs) entries.push({ name: fsSafe(x.name), data: x.bytes });
     entries.push({ name: base + '.txt', data: enc.encode(buildTxt(p, tracks)) });
     const blob = makeZip(entries), zn = zipName(p.game, p.system);
     msg.textContent = 'Écriture de ' + zn + ' (' + (blob.size / 1048576).toFixed(2) + ' Mo)…';
     const how = await saveBlob(blob, zn);
-    msg.textContent = zn + ' ' + how + (packPng ? '' : ' (sans png)');
+    msg.textContent = zn + ' ' + how + (packPngs.length ? '' : ' (sans png)');
     setStatus('Pack ' + zn + ' ' + how, 'ok');
   } catch (e) { if (e.name !== 'AbortError') msg.textContent = 'Échec : ' + e.message; else msg.textContent = 'Annulé'; }
   $('p_go').disabled = false;

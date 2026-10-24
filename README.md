@@ -72,6 +72,12 @@ Ogg Opus / Vorbis files have their comments read and written (TITLE, TITLE_JA, A
 SYSTEM_JA, ARTIST, ARTIST_JA, DATE, ENCODED_BY, COMMENT (DESCRIPTION is read too), TRACKNUMBER; other
 comments are kept), so the whole GD3 form and the track number apply to them and save in place.
 
+The pack follows the vgmrips submission rules: files `## Track Title.vgz` numbered 01..N in list order
+(option, else the files' own numbers), `Game Name.txt/.m3u/.png`, flat zip, description file with block
+wrapping, a dash for empty notes, history continuation lines indented by one space, release date as
+YYYY-MM-DD / YYYY-MM / YYYY (checked), one screenshot named after the game or several kept by name (one
+per region). The `1..N` button renumbers the tracks in list order.
+
 ## Related repositories
 
 - MAME VGM logger with the ES55xx extension: github.com/yoyofr/mame, branch `vgmlog0288-es5506`
