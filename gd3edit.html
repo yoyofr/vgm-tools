@@ -109,7 +109,7 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
   <section class="panel">
     <div id="form">
       <div class="head"><span></span><span>English</span><span>日本語</span><span></span></div>
-      <div class="row single"><label for="trackNo">N° de piste</label><div class="volbox"><input type="number" id="trackNo" min="0" max="999" step="1" placeholder="—"><span class="hint">non stocké dans le fichier : m3u, nom des fichiers du pack, renommage</span></div><button class="all" id="trackFromFile" title="Numéro depuis le préfixe du nom de fichier ; Maj+clic : tous les fichiers">← fichier</button></div>
+      <div class="row single"><label for="trackNo">N° de piste</label><div class="volbox"><input type="number" id="trackNo" min="0" max="999" step="1" placeholder="—"><span class="hint">non stocké dans le fichier : m3u, nom des fichiers du pack, renommage</span><button type="button" id="renameOne" title="Renommer ce fichier sur le disque d'après le format">Renommer ce fichier…</button></div><button class="all" id="trackFromFile" title="Numéro depuis le préfixe du nom de fichier ; Maj+clic : tous les fichiers">← fichier</button></div>
       <div class="row"><label for="trackE">Titre</label><input type="text" id="trackE" data-i="0"><input type="text" id="trackJ" data-i="1" lang="ja"><button class="all" id="titleFromFile" title="Titres anglais et japonais depuis le nom du fichier (sans numéro de piste ni extension) ; Maj+clic : tous les fichiers">← fichier</button></div>
       <div class="row"><label for="gameE">Jeu</label><input type="text" id="gameE" data-i="2"><input type="text" id="gameJ" data-i="3" lang="ja"><button class="all" data-all="2,3">→ tous</button></div>
       <div class="row"><label for="systemE">Système</label><input type="text" id="systemE" data-i="4"><input type="text" id="systemJ" data-i="5" lang="ja"><button class="all" data-all="4,5">→ tous</button></div>
@@ -146,6 +146,7 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
   <form method="dialog" id="renameForm">
     <h2>Renommer les fichiers</h2>
     <div class="prow"><label for="r_fmt">Format</label><input type="text" id="r_fmt" value="{nn} {title}"></div>
+    <div class="prow"><label>Portée</label><label class="chk"><input type="checkbox" id="r_current"> Seulement le fichier sélectionné</label></div>
     <div class="prow"><label>Champs</label><div class="hint">{n} {nn} {nnn} numéro de piste (1, 2 ou 3 chiffres) · {title} {titlej} titre · {game} {gamej} · {system} · {author} · {date} · {name} nom actuel sans extension · l'extension est conservée</div></div>
     <div class="prow"><label>Aperçu</label><div id="r_preview" class="preview"></div></div>
     <div class="pfoot"><span class="msg" id="r_msg"></span><button type="button" id="r_cancel">Annuler</button><button type="button" class="primary" id="r_go">Renommer</button></div>
@@ -308,6 +309,7 @@ function renderList() {
   $('clear').disabled = !files.length;
   $('pack').disabled = !files.length;
   $('rename').disabled = !files.some(f => f.handle);
+  $('renameOne').disabled = current < 0 || !files[current].handle;
 }
 
 function clearForm() {
@@ -462,7 +464,8 @@ const FMT_KEY = 'gd3edit.renameFormat';
 try { $('r_fmt').value = localStorage.getItem(FMT_KEY) || '{nn} {title}'; } catch (e) {}
 function renamePlan() {
   const fmt = $('r_fmt').value;
-  return files.map(f => { const ext = (/\.(vgm|vgz)$/i.exec(f.name) || ['.vgz'])[0]; const nn = formatName(f, fmt) + ext; return { f, nn, same: nn === f.name }; });
+  const scope = $('r_current').checked && current >= 0 ? [files[current]] : files;
+  return scope.map(f => { const ext = (/\.(vgm|vgz)$/i.exec(f.name) || ['.vgz'])[0]; const nn = formatName(f, fmt) + ext; return { f, nn, same: nn === f.name }; });
 }
 function renamePreview() {
   const plan = renamePlan();
@@ -472,7 +475,9 @@ function renamePreview() {
   $('r_go').disabled = dups.length > 0;
 }
 $('r_fmt').addEventListener('input', () => { try { localStorage.setItem(FMT_KEY, $('r_fmt').value); } catch (e) {} renamePreview(); });
-$('rename').onclick = () => { renamePreview(); $('renameDlg').showModal(); };
+$('r_current').addEventListener('change', renamePreview);
+$('rename').onclick = () => { $('r_current').checked = false; renamePreview(); $('renameDlg').showModal(); };
+$('renameOne').onclick = () => { if (current < 0) return; $('r_current').checked = true; renamePreview(); $('renameDlg').showModal(); };
 $('r_cancel').onclick = () => $('renameDlg').close();
 $('r_go').onclick = async () => {
   const plan = renamePlan().filter(x => x.f.handle && !x.same);
