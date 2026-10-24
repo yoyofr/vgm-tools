@@ -53,6 +53,8 @@ main { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; mi
 .row label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em }
 .row.single { grid-template-columns: 130px minmax(0, 1fr) auto }
 .volbox { display: flex; gap: 10px; align-items: center; min-width: 0 }
+.hint { color: var(--muted); font-size: 12px }
+.preview { font-size: 12px; max-height: 240px; overflow: auto; white-space: pre; font-family: ui-monospace, Menlo, monospace }
 .volbox input { width: 7em; flex: none }
 .volbox span:not([id]) { color: var(--fg) }
 .volbox span { font-family: var(--mono); font-size: 12px; color: var(--muted) }
@@ -95,6 +97,7 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
     <button id="save" class="primary" disabled>Enregistrer</button>
     <button id="saveAll" disabled>Tout enregistrer</button>
     <button id="clear" disabled>Vider la liste</button>
+    <button id="rename" disabled title="Renommer les fichiers sur le disque d'après le numéro de piste et le titre">Renommer…</button>
     <button id="pack" disabled>Générer le pack…</button>
   </div>
 </header>
@@ -106,6 +109,7 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
   <section class="panel">
     <div id="form">
       <div class="head"><span></span><span>English</span><span>日本語</span><span></span></div>
+      <div class="row single"><label for="trackNo">N° de piste</label><div class="volbox"><input type="number" id="trackNo" min="0" max="999" step="1" placeholder="—"><span class="hint">non stocké dans le fichier : m3u, nom des fichiers du pack, renommage</span></div><button class="all" id="trackFromFile" title="Numéro depuis le préfixe du nom de fichier ; Maj+clic : tous les fichiers">← fichier</button></div>
       <div class="row"><label for="trackE">Titre</label><input type="text" id="trackE" data-i="0"><input type="text" id="trackJ" data-i="1" lang="ja"><button class="all" id="titleFromFile" title="Titres anglais et japonais depuis le nom du fichier (sans numéro de piste ni extension) ; Maj+clic : tous les fichiers">← fichier</button></div>
       <div class="row"><label for="gameE">Jeu</label><input type="text" id="gameE" data-i="2"><input type="text" id="gameJ" data-i="3" lang="ja"><button class="all" data-all="2,3">→ tous</button></div>
       <div class="row"><label for="systemE">Système</label><input type="text" id="systemE" data-i="4"><input type="text" id="systemJ" data-i="5" lang="ja"><button class="all" data-all="4,5">→ tous</button></div>
@@ -134,8 +138,17 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
     <div class="prow"><label for="p_notes">Notes</label><textarea id="p_notes"></textarea></div>
     <div class="prow"><label for="p_history">Historique</label><textarea id="p_history"></textarea></div>
     <div class="prow"><label>Image PNG</label><div class="pngbox"><img id="p_pngimg" alt="" hidden><span id="p_pngname">aucune</span><button type="button" id="p_pngpick">Choisir…</button><input id="p_pngfile" type="file" accept=".png" hidden></div></div>
-    <div class="prow"><label>Pistes</label><label class="chk"><input type="checkbox" id="p_rename" checked> Nommer les fichiers « NN Titre.vgz » d'après le tag titre</label></div>
+    <div class="prow"><label>Pistes</label><label class="chk"><input type="checkbox" id="p_rename" checked> Nommer les fichiers du pack d'après le format de renommage (ordre : n° de piste)</label></div>
     <div class="pfoot"><span class="msg" id="p_msg"></span><button type="button" id="p_cancel">Annuler</button><button type="button" class="primary" id="p_go">Générer le zip</button></div>
+  </form>
+</dialog>
+<dialog id="renameDlg">
+  <form method="dialog" id="renameForm">
+    <h2>Renommer les fichiers</h2>
+    <div class="prow"><label for="r_fmt">Format</label><input type="text" id="r_fmt" value="{nn} {title}"></div>
+    <div class="prow"><label>Champs</label><div class="hint">{n} {nn} {nnn} numéro de piste (1, 2 ou 3 chiffres) · {title} {titlej} titre · {game} {gamej} · {system} · {author} · {date} · {name} nom actuel sans extension · l'extension est conservée</div></div>
+    <div class="prow"><label>Aperçu</label><div id="r_preview" class="preview"></div></div>
+    <div class="pfoot"><span class="msg" id="r_msg"></span><button type="button" id="r_cancel">Annuler</button><button type="button" class="primary" id="r_go">Renommer</button></div>
   </form>
 </dialog>
 <script>
@@ -167,6 +180,23 @@ function loopText(f) {
 }
 function volText(n) { return n ? (n * VOL_DB >= 0 ? '+' : '') + (n * VOL_DB).toFixed(2) + ' dB (×' + Math.pow(2, n / 32).toFixed(3) + ')' : ''; }
 
+// track number from the file name: leading digits ("03-title.vgz"), else a "_NN" suffix ("game_track_02.vgz"); null when absent; not stored in the file
+function trackFromName(name) {
+  const base = name.replace(/\.(vgm|vgz|gz)$/i, '');
+  const m = /^(\d{1,3})(?!\d)/.exec(base) || /[_ -](\d{1,3})$/.exec(base);
+  return m ? parseInt(m[1], 10) : null;
+}
+// name from a format: {n} {nn} {nnn} {title} {titlej} {game} {gamej} {system} {author} {date} {name}
+function formatName(f, fmt) {
+  const n = f.track == null ? '' : String(f.track);
+  const map = { n, nn: n && n.padStart(2, '0'), nnn: n && n.padStart(3, '0'), title: f.tags[0], titlej: f.tags[1], game: f.tags[2], gamej: f.tags[3],
+    system: f.tags[4], author: f.tags[6], date: f.tags[8], name: f.name.replace(/\.(vgm|vgz)$/i, '') };
+  const out = fmt.replace(/\{(\w+)\}/g, (m, k) => k in map ? (map[k] || '') : m).trim();
+  return fsSafe(out);
+}
+function sortedFiles() {   // pack / m3u order: by track number, files without one last in list order
+  return files.map((f, i) => ({ f, i })).sort((a, b) => (a.f.track == null) - (b.f.track == null) || (a.f.track ?? 0) - (b.f.track ?? 0) || a.i - b.i).map(x => x.f);
+}
 // title from the file name: the track number prefix (digits, optional separator) and the extension are removed
 function titleFromName(name) {
   const base = name.replace(/\.(vgm|vgz|gz)$/i, '').replace(/\.vgm$/i, '');
@@ -237,7 +267,7 @@ async function readFile(file, handle) {
   }
   if (bytes.length < 0x40 || String.fromCharCode(...bytes.subarray(0, 4)) !== 'Vgm ') throw new Error(file.name + ' : pas un fichier VGM');
   const g = parseGd3(bytes);
-  return { name: file.name, size: file.size, bytes, gz, raw, tags: g.tags, volMod: volModOf(bytes), ...loopFieldsOf(bytes), dirty: false, handle, hadGd3: !!g.ofs };
+  return { name: file.name, size: file.size, bytes, gz, raw, tags: g.tags, volMod: volModOf(bytes), ...loopFieldsOf(bytes), dirty: false, handle, hadGd3: !!g.ofs, track: trackFromName(file.name) };
 }
 
 async function addFiles(list, handles) {
@@ -267,7 +297,7 @@ function renderList() {
     const div = document.createElement('div');
     div.className = 'file' + (i === current ? ' active' : '') + (f.dirty ? ' dirty' : '');
     div.innerHTML = '<span class="name"></span><span class="flag"></span><button class="rm" title="Retirer de la liste">×</button>';
-    div.querySelector('.name').textContent = f.name;
+    div.querySelector('.name').textContent = (f.track == null ? '' : String(f.track).padStart(2, '0') + ' · ') + f.name;
     div.querySelector('.flag').textContent = (f.gz ? 'vgz' : 'vgm') + (f.hadGd3 ? '' : ' no-tag');
     div.onclick = () => select(i);
     div.querySelector('.rm').onclick = e => { e.stopPropagation(); removeFile(i); };
@@ -277,11 +307,13 @@ function renderList() {
   $('saveAll').disabled = !files.some(f => f.dirty);
   $('clear').disabled = !files.length;
   $('pack').disabled = !files.length;
+  $('rename').disabled = !files.some(f => f.handle);
 }
 
 function clearForm() {
   current = -1;
   inputs.forEach(inp => { inp.value = ''; });
+  $('trackNo').value = '';
   $('info').innerHTML = '';
   renderList();
 }
@@ -321,6 +353,7 @@ function select(i) {
   current = i;
   const f = files[i];
   inputs.forEach(inp => { inp.value = f.tags[+inp.dataset.i] || ''; });
+  $('trackNo').value = f.track == null ? '' : String(f.track);
   $('vol').value = f.volMod ? (f.volMod * VOL_DB).toFixed(2).replace(/\.?0+$/, '') : '';
   $('volHint').textContent = volText(f.volMod);
   $('loopMul').value = f.loopMod ? String(f.loopMod / 16) : '';
@@ -409,6 +442,56 @@ async function ensureWritable(f) {
   if ((await h.queryPermission({ mode: 'readwrite' })) === 'granted') return;
   if ((await h.requestPermission({ mode: 'readwrite' })) !== 'granted') throw new Error('écriture refusée');
 }
+
+$('trackNo').addEventListener('input', () => {
+  if (current < 0) return;
+  const v = $('trackNo').value.trim();
+  files[current].track = v === '' ? null : parseInt(v, 10);
+  renderList();
+});
+$('trackFromFile').onclick = e => {
+  const targets = e.shiftKey ? files : (current >= 0 ? [files[current]] : []);
+  for (const f of targets) f.track = trackFromName(f.name);
+  if (current >= 0) $('trackNo').value = files[current].track == null ? '' : String(files[current].track);
+  renderList();
+  setStatus('Numéro de piste repris du nom de ' + targets.length + ' fichier(s)', 'ok');
+};
+
+// rename on disk (File System Access: handle.move)
+const FMT_KEY = 'gd3edit.renameFormat';
+try { $('r_fmt').value = localStorage.getItem(FMT_KEY) || '{nn} {title}'; } catch (e) {}
+function renamePlan() {
+  const fmt = $('r_fmt').value;
+  return files.map(f => { const ext = (/\.(vgm|vgz)$/i.exec(f.name) || ['.vgz'])[0]; const nn = formatName(f, fmt) + ext; return { f, nn, same: nn === f.name }; });
+}
+function renamePreview() {
+  const plan = renamePlan();
+  $('r_preview').textContent = plan.map(x => (x.f.handle ? (x.same ? '=  ' : '→  ') : '✗  ') + x.f.name + (x.same ? '' : '  →  ' + x.nn)).join('\n');
+  const seen = new Set(), dups = plan.filter(x => { const k = x.nn.toLowerCase(); if (seen.has(k)) return true; seen.add(k); return false; });
+  $('r_msg').textContent = dups.length ? 'Doublons : ' + dups.map(x => x.nn).join(', ') : (plan.some(x => !x.f.handle) ? 'Fichiers ✗ : ouverts sans accès disque, non renommés' : '');
+  $('r_go').disabled = dups.length > 0;
+}
+$('r_fmt').addEventListener('input', () => { try { localStorage.setItem(FMT_KEY, $('r_fmt').value); } catch (e) {} renamePreview(); });
+$('rename').onclick = () => { renamePreview(); $('renameDlg').showModal(); };
+$('r_cancel').onclick = () => $('renameDlg').close();
+$('r_go').onclick = async () => {
+  const plan = renamePlan().filter(x => x.f.handle && !x.same);
+  let n = 0;
+  $('r_go').disabled = true;
+  try {
+    for (const x of plan) {
+      if (!x.f.handle.move) throw new Error('renommage non disponible dans ce navigateur (handle.move)');
+      await ensureWritable(x.f);
+      await x.f.handle.move(x.nn);
+      x.f.name = x.nn; n++;
+      $('r_msg').textContent = n + '/' + plan.length;
+    }
+    renderList(); if (current >= 0) select(current);
+    $('renameDlg').close();
+    setStatus(n + ' fichier(s) renommé(s)', 'ok');
+  } catch (e) { $('r_msg').textContent = 'Échec : ' + e.message; }
+  $('r_go').disabled = false;
+};
 
 async function saveFile(f) {
   let out = rebuild(f);
@@ -551,9 +634,11 @@ function wrap(text, width, indent) {
   return out;
 }
 function trackEntryName(f, i, rename) {
-  const nn = String(i + 1).padStart(files.length >= 100 ? 3 : 2, '0');
-  const title = (f.tags[0] || '').trim();
-  if (rename && title) return nn + ' ' + fsSafe(title) + '.vgz';
+  if (rename) {
+    const g = { ...f, track: f.track == null ? i + 1 : f.track };   // files without a number: their position
+    const nn = formatName(g, $('r_fmt').value);
+    if (nn) return nn + '.vgz';
+  }
   return f.name.replace(/\.(vgm|vgz)$/i, '') + '.vgz';
 }
 // name column + total (ends col 40) + loop (ends col 47); a 7-char loop (over an hour) shifts total left by one
@@ -653,9 +738,9 @@ $('p_go').onclick = async () => {
   const rename = $('p_rename').checked, base = packBase(p.game), msg = $('p_msg');
   $('p_go').disabled = true;
   try {
-    const entries = [], tracks = [], names = new Set();
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
+    const entries = [], tracks = [], names = new Set(), order = sortedFiles();
+    for (let i = 0; i < order.length; i++) {
+      const f = order[i];
       let name = trackEntryName(f, i, rename);
       if (names.has(name)) name = name.replace(/\.vgz$/, ' (' + (i + 1) + ').vgz');
       names.add(name);

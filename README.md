@@ -55,6 +55,11 @@ Saving in place uses the File System Access API (Chrome/Edge). Open the files wi
 their folder: Chrome then asks the write permission once for the whole folder, and **Tout enregistrer**
 runs without any dialog. Files opened one by one each need their own permission prompt.
 
+Each file has a track number (not stored in the VGM: taken from the file name, "03-title.vgz" or
+"game_track_02.vgz", editable). It orders the m3u and names the pack entries, and **Renommer…** renames
+the files on disk from a format (default `{nn} {title}`; fields `{n}` `{nn}` `{nnn}` `{title}` `{titlej}`
+`{game}` `{gamej}` `{system}` `{author}` `{date}` `{name}`), with a preview and duplicate check.
+
 ## Related repositories
 
 - MAME VGM logger with the ES55xx extension: github.com/yoyofr/mame, branch `vgmlog0288-es5506`
