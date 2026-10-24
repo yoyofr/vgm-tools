@@ -522,7 +522,8 @@ function select(i) {
   const info = ['VGM ' + (ver >> 8).toString(16) + '.' + (ver & 255).toString(16).padStart(2, '0'),
     'durée ' + fmtTime(total), loop ? 'boucle ' + fmtTime(loop) : 'sans boucle',
     (b.length / 1048576).toFixed(2) + ' Mo'];
-  if (clk) info.push((clk & 0x80000000 ? 'ES5506' : 'ES5505') + ' ' + ((clk & 0x3FFFFFFF) / 1e6).toFixed(3) + ' MHz');
+  const chipList = chipsOf(b);
+  if (chipList.length) info.push(chipList.join(', ') + (clk ? ' ' + ((clk & 0x3FFFFFFF) / 1e6).toFixed(3) + ' MHz' : ''));
   if (f.volMod) info.push('volume ' + volText(f.volMod));
   if (f.loopMod || f.loopBase) info.push('boucles ' + loopText(f));
   $('info').innerHTML = info.map(t => '<span></span>').join('');
@@ -767,7 +768,8 @@ const CHIPS = [[0x0C, 'SN76489'], [0x10, 'YM2413'], [0x2C, 'YM2612'], [0x30, 'YM
   [0x84, 'NES APU'], [0x88, 'MultiPCM'], [0x8C, 'uPD7759'], [0x90, 'OKIM6258'], [0x98, 'OKIM6295'], [0x9C, 'K051649'],
   [0xA0, 'K054539'], [0xA4, 'HuC6280'], [0xA8, 'C140'], [0xAC, 'K053260'], [0xB0, 'Pokey'], [0xB4, 'QSound'], [0xB8, 'SCSP'],
   [0xC0, 'WonderSwan'], [0xC4, 'VSU'], [0xC8, 'SAA1099'], [0xCC, 'ES5503'], [0xD0, 'ES5505'], [0xD8, 'X1-010'], [0xDC, 'C352'],
-  [0xE0, 'GA20'], [0xE4, 'Mikey']];
+  [0xE0, 'GA20'], [0xE4, 'Mikey'], [0xE8, 'K007232'], [0xEC, 'K005289'], [0xF0, 'MSM5205'], [0xF4, 'MSM5232'], [0xF8, 'BSMT2000'],
+  [0xFC, 'ICS2115'], [0x100, 'ZSG-2 + TMS57002']];
 function chipsOf(b) {
   const dataOfs = le32(b, 0x34) + 0x34, hdrEnd = Math.min(dataOfs, b.length), out = [];
   for (const [o, n] of CHIPS) {
@@ -880,11 +882,18 @@ $('pack').onclick = async () => {
   const today = new Date().toISOString().slice(0, 10);
   if (!pv('p_game')) $('p_game').value = t[2] || '';
   if (!pv('p_system')) $('p_system').value = t[4] || '';
-  if (!pv('p_hw')) $('p_hw').value = [...new Set(files.flatMap(f => chipsOf(f.bytes)))].join(', ');
+  const chips = [...new Set(files.filter(f => !f.audio).flatMap(f => chipsOf(f.bytes)))];
+  if (!pv('p_hw')) $('p_hw').value = chips.join(', ');
   if (!pv('p_author')) $('p_author').value = t[6] || '';
   if (!pv('p_date')) $('p_date').value = (t[8] || '').replace(/\//g, '-');
   if (!pv('p_creator')) $('p_creator').value = t[9] || '';
-  if (!pv('p_notes')) $('p_notes').value = (t[10] || '').split('\n').find(l => /MAME/.test(l)) ? 'This pack was made using MAME 0.288 VGM mod\n(ES5505/ES5506/ES5510 custom build).' : '';
+  if (!pv('p_notes') && (t[10] || '').split('\n').find(l => /MAME/.test(l))) {
+    // the custom chips of this logger, from the chips actually present in the pack
+    const custom = [];
+    if (chips.some(c => /ES550[56]/.test(c))) custom.push('ES5505/ES5506/ES5510');
+    if (chips.some(c => /ZSG-2/.test(c))) custom.push('ZSG-2/TMS57002');
+    $('p_notes').value = 'This pack was made using MAME 0.288 VGM mod' + (custom.length ? '\n(' + custom.join(', ') + ' custom build).' : '.');
+  }
   if (!pv('p_history')) $('p_history').value = (pv('p_version') || '1.00') + ' ' + today + ' ' + (pv('p_creator') || t[9] || '') + ': Initial release.';
   if (!packPng && pngCandidates.length) { try { await setPng(await pngCandidates[pngCandidates.length - 1].getFile()); } catch (e) {} }
   $('p_msg').textContent = files.length + ' piste(s) dans l\'ordre de la liste';
