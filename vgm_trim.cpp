@@ -2365,6 +2365,56 @@ static int loop_cut_voices(const VGMFile& vgm, i64 loop, i64 end)
 	return cut;
 }
 
+// ZSG-2: first time after `at` when every voice audible at `at` (tails of the previous repetition) has been
+// re-keyed, keyed off or has faded below `thr`; -1 when that does not happen before `limit`
+static i64 zsg2_tails_end(const VGMFile& vgm, i64 at, i64 limit, u16 thr = 0x100)
+{
+	const u8* d = vgm.data.data();
+	ZSG2State st;
+	st.set_clock(vgm.zsg2_clock);
+	std::set<int> tails;
+	bool collected = false;
+	i64 result = -1, next_check = at;
+	auto loud = [&](int vi, i64 t) { return st.playing(vi, t) && st.voice[vi].vol >= thr; };
+	auto check = [&](i64 t) {
+		for (auto it = tails.begin(); it != tails.end();) it = loud(*it, t) ? std::next(it) : tails.erase(it);
+		if (tails.empty()) { result = t; return false; }
+		return true;
+	};
+	vgm.commands([&](const Cmd& c) {
+		if (c.op == 0x66 || c.t >= limit) return false;
+		if (c.t >= at && !collected)
+		{
+			collected = true;
+			for (int vi = 0; vi < 48; vi++) if (loud(vi, at)) tails.insert(vi);
+			if (getenv("VGM_TRIM_DEBUG"))
+				for (int vi : tails) fprintf(stderr, "tail voice %d vol %04x target %04x keyed %s\n", vi, st.voice[vi].vol, st.voice[vi].vol_target, fmt_pos(st.voice[vi].t_on).c_str());
+			if (!check(at)) return false;
+		}
+		if (collected)
+			while (next_check < c.t) { if (!check(next_check)) return false; next_check += SAMPLE_RATE / 100; }
+		if (c.op == 0xE4)
+		{
+			u8 sub = d[c.p + 1] & 0x0F;
+			u16 data = (d[c.p + 3] << 8) | d[c.p + 4];
+			st.now = c.t;
+			if (sub <= 3)
+			{
+				u16 ofs = ((sub & 3) << 8) | d[c.p + 2];
+				st.write(ofs, data);
+				// a key-on or key-off ends the tail on that voice
+				int reg = ofs - 0x300;
+				if (collected && (reg <= 2 || (reg >= 4 && reg <= 6)) && ofs >= 0x300)
+					for (int i = 0; i < 16; i++) if (data & (1 << i)) tails.erase(((reg & 3) << 4) | i);
+			}
+			else st.ext(sub, d[c.p + 2], data);
+			if (collected && !check(c.t)) return false;
+		}
+		return true;
+	});
+	return result;
+}
+
 // ---------------------------------------------------------------------------------------------
 // WAV based track splitting
 // ---------------------------------------------------------------------------------------------
@@ -2935,7 +2985,29 @@ int main(int argc, char** argv)
 				{
 					// the driver keeps every voice allocated: the loop body is taken from the second repetition
 					// whenever it was captured, so that both ends of the loop are "end of a repetition" states
-					if (lr.has2) pass = 2;
+					if (lr.has2)
+					{
+						pass = 2;
+						// no intro: the splice would sit at the very start and play the tails that end the first
+						// repetition before the first note. Loop on the first repetition instead, with the loop point
+						// moved past the time these tails take to die out in the second one, so that the state at
+						// the loop point (first repetition, started from silence) matches the end of the body
+						if (lr.start == lr.loop1)
+						{
+							i64 x = zsg2_tails_end(vgm, lr.loop2, std::min(job.end, lr.loop2 + 30 * SAMPLE_RATE));
+							if (x >= 0)
+							{
+								x = x - lr.loop2 + SAMPLE_RATE / 20;
+								if (lr.end1 + x <= job.end)
+								{
+									pass = 1;
+									lr.loop1 += x; lr.end1 += x;
+									ui::info(strf("no intro: loop point moved %.2f s into the first repetition, past the tails of the previous one",
+									              (double)x / SAMPLE_RATE));
+								}
+							}
+						}
+					}
 					else
 					{
 						pass = 1;
