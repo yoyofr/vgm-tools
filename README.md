@@ -7,7 +7,8 @@ Tools around VGM logging and packaging, written for the ES5505 / ES5506 / ES5510
 ## vgm_trim
 
 Post-processing for raw MAME VGM captures: cut, split a session into tracks on silence, find loop
-points from the note-on sequence, drop register writes that do not change the chip state, keep only
+points from the note-on sequence (the loop starts where the song becomes periodic: everything
+before, intro or build-up, is kept), drop register writes that do not change the chip state, keep only
 the sample ROM ranges that are played, upgrade the header to VGM 1.72, read and write `.vgz`.
 
 ```sh
@@ -45,7 +46,9 @@ ZSG-2 logs (Taito FX-1B / G-NET, VGM 1.72 with a 0x110-byte header) are handled 
 board gains, the DSP (simulated from the start of the capture with libvgm's TMS57002 core, a copy of
 which lives in `libvgm/`, and written as a state block 0x98 that loads instantly), the register image and re-keys the
 voices still playing at their computed position; `--cmp`, `--sro`, `--find-loop` and `--split log` use
-a ZSG-2 voice model; the loop body is taken from the second repetition when captured (seamless loop).
+a ZSG-2 voice model; the loop detection also follows the pitch, volume, filter and gain changes
+on sustained voices (Ray Crisis plays most of a song that way, with the drums keyed from the
+first bar); the loop body is taken from the second repetition when captured (seamless loop).
 
 ## gd3edit.html
 

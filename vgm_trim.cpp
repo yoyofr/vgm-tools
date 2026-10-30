@@ -2,7 +2,7 @@
 // extension aware.
 // Output ending in .vgz is gzip-compressed (zlib).
 //
-// build: c++ -O2 -std=c++17 -o vgm_trim vgm_trim.cpp -lz
+// build: c++ -O2 -std=c++17 -o vgm_trim vgm_trim.cpp libvgm/emu/cores/tms57002.cpp -lz
 //
 // usage:
 //   vgm_trim in.vgm out.vgz --start 18.2s --end 1:05.5 [--loop 30.0s] [--cmp] [--sro]
@@ -1787,26 +1787,48 @@ struct ZSG2State
 };
 
 // note-on events of a ZSG-2 log (for the loop finder): key-on with the sample of the voice
-static void zsg2_notes(const VGMFile& vgm, bool bounded, i64 search_to, std::vector<NoteEvent>& events)
+// Note events of a ZSG-2 capture. keyons: the key-ons (the structure of the song, the loop period
+// comes from them). all, when given: the key-ons plus every parameter change on a voice (pitch,
+// volume, filter, gains, sample window), so that melodies and mixes played on sustained voices
+// without a key-on count too: Ray Crisis keys a drum loop from the first bar, the rest of the song
+// is pitch and volume writes on voices that stay keyed.
+static void zsg2_notes(const VGMFile& vgm, bool bounded, i64 search_to, std::vector<NoteEvent>& keyons,
+                       std::vector<NoteEvent>* all = nullptr)
 {
 	const u8* d = vgm.data.data();
 	ZSG2State st;
 	st.set_clock(vgm.zsg2_clock);
+	auto start_of = [](const ZSG2Voice& w) -> i64 { return ((u32)(w.v[1] & 0xFF00) << 8) | (w.v[0] >> 8) | ((w.v[1] & 0xFF) << 8); };
 	vgm.commands([&](const Cmd& c) {
 		if (c.op == 0x66 || (bounded && c.t >= search_to)) return false;
 		if (c.op != 0xE4 || (d[c.p + 1] & 0x0F) > 3) return true;
 		u16 ofs = ((d[c.p + 1] & 3) << 8) | d[c.p + 2], data = (d[c.p + 3] << 8) | d[c.p + 4];
 		st.now = c.t;
-		if (ofs >= 0x300 && ofs <= 0x302 && data)
+		if (ofs < 0x300)
+		{
+			if (all)
+			{
+				// 4 frequency, 5/7 loop address + direct gains, 6 end, 8 filter, A volume, C filter target,
+				// E volume target. Not D/F (ramp speeds: the G-Darius driver derives them from the current
+				// level, so they differ from one repetition to the next), nor 9/B (zeroed at key-on)
+				static const u16 tracked = (1 << 0x4) | (1 << 0x5) | (1 << 0x6) | (1 << 0x7) | (1 << 0x8) | (1 << 0xA) | (1 << 0xC) | (1 << 0xE);
+				int reg = ofs & 15;
+				const ZSG2Voice& w = st.voice[ofs >> 4];
+				if (((tracked >> reg) & 1) && (!w.known[reg] || w.v[reg] != data))
+					all->push_back({c.t, NoteKey{start_of(w), 0x100 + reg, data, -1}});
+			}
+		}
+		else if (ofs >= 0x300 && ofs <= 0x302 && data)
 		{
 			int base = (ofs - 0x300) << 4;
 			for (int i = 0; i < 16; i++)
 			{
 				if (!(data & (1 << i))) continue;
 				const ZSG2Voice& w = st.voice[base | i];
-				i64 start = ((u32)(w.v[1] & 0xFF00) << 8) | (w.v[0] >> 8) | ((w.v[1] & 0xFF) << 8);
 				i64 loop = (w.v[5] & 0xFF) | ((w.v[7] & 0xFF) << 8);
-				events.push_back({c.t, NoteKey{start, w.v[6], loop, (i64)w.v[4]}});
+				NoteEvent e{c.t, NoteKey{start_of(w), w.v[6], loop, (i64)w.v[4]}};
+				keyons.push_back(e);
+				if (all) all->push_back(e);
 			}
 		}
 		st.write(ofs, data);
@@ -2062,8 +2084,9 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 {
 	const u8* d = vgm.data.data();
 	ES55xxState st(vgm.is_es5506);
-	std::vector<NoteEvent> events;
-	if (vgm.is_zsg2) zsg2_notes(vgm, bounded, search_to, events);
+	std::vector<NoteEvent> events;   // key-ons: the structure of the song, the candidate periods
+	std::vector<NoteEvent> all;      // key-ons + parameter changes on sustained voices: all of it must recur
+	if (vgm.is_zsg2) zsg2_notes(vgm, bounded, search_to, events, &all);
 	else vgm.commands([&](const Cmd& c) {
 		if (c.op == 0x66 || (bounded && c.t >= search_to)) return false;
 		RegWrite w;
@@ -2084,6 +2107,7 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 		}
 		return true;
 	});
+	if (!vgm.is_zsg2) all = events;
 	size_t n = events.size();
 	if (n < (size_t)window * 2) return false;
 
@@ -2129,22 +2153,67 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 		}
 	}
 	if (pairs.empty()) return false;
+
+	// recurrence of an event one period later (same key within 30 ms)
 	std::map<NoteKey, std::vector<i64>> by_key;
-	for (const NoteEvent& e : events) by_key[e.k].push_back(e.t);
+	for (const NoteEvent& e : all) by_key[e.k].push_back(e.t);
 	const i64 tol = (i64)(0.03 * SAMPLE_RATE);
+	const size_t na = all.size();
+	const i64 last_t = all.back().t;
 	auto recurrence_at = [&](size_t i, i64 per, i64& out) {
-		const NoteEvent& e = events[i];
+		const NoteEvent& e = all[i];
 		const std::vector<i64>& ts = by_key[e.k];
 		auto it = std::lower_bound(ts.begin(), ts.end(), e.t + per - tol);
 		if (it != ts.end() && *it <= e.t + per + tol) { out = *it; return true; }
 		return false;
 	};
+	// The loop starts where the song becomes periodic: from that point on every event recurs one
+	// period later. What comes before (an intro, a build-up whose layers come in one by one) is
+	// kept as the intro. The non-periodic part ends with the last 1 s bin where more than 20 % of
+	// the events (4 at least) do not recur; the loop start is the first recurring event after it
+	// from which the next 40 events recur too. The capture must hold two full periods after it.
+	struct Eval { bool ok = false; size_t onset = SIZE_MAX; double cover = 0; };
+	auto evaluate = [&](i64 per) -> Eval {
+		Eval ev;
+		std::vector<char> hit;
+		i64 dummy;
+		for (size_t m = 0; m < na && all[m].t + per + tol < last_t; m++) hit.push_back(recurrence_at(m, per, dummy));
+		size_t m_end = hit.size();
+		if (!m_end) return ev;
+		std::map<i64, std::pair<int, int>> bins;   // second -> events, misses
+		for (size_t m = 0; m < m_end; m++)
+		{
+			auto& b = bins[all[m].t / SAMPLE_RATE];
+			b.first++;
+			if (!hit[m]) b.second++;
+		}
+		i64 last_bad = -1;
+		for (auto& b : bins) if (b.second.second >= 4 && b.second.second * 5 > b.second.first) last_bad = b.first;
+		for (size_t i = 0; i < m_end; i++)
+		{
+			if (all[i].t < search_from || all[i].t / SAMPLE_RATE <= last_bad || !hit[i]) continue;
+			int hits = 0, cnt = 0;
+			for (size_t m = i; m < std::min(i + 40, m_end); m++) { cnt++; hits += hit[m]; }
+			if (hits * 5 >= cnt * 4) { ev.onset = i; break; }
+		}
+		if (ev.onset == SIZE_MAX) return ev;
+		i64 hits = 0;
+		for (size_t m = ev.onset; m < m_end; m++) hits += hit[m];
+		ev.cover = (double)hits / (m_end - ev.onset);
+		// the periodic part verified by the capture (what follows it within one period of the end
+		// cannot be checked) must be a real stretch of the song: one period, or a fifth of the range
+		// when the capture stops before the second repetition (the loop then runs on the first one)
+		i64 verified = (last_t - per) - all[ev.onset].t;
+		i64 range = last_t - std::max(search_from, all[0].t);
+		ev.ok = ev.cover >= 0.8 && verified >= std::max<i64>(2 * SAMPLE_RATE, std::min<i64>(per, range / 5));
+		return ev;
+	};
 	// every well-supported 0.5 s bucket is a candidate (musical phrases repeat too, and a capture
 	// stopped shortly after the loop gives the real period only a few windows); the decisive
-	// criterion is the share of ALL note-ons of the first pass that recur at the exact offset
+	// criterion is where the song becomes periodic for that period, and whether it does at all
 	std::vector<i64> by_count(period_order);
 	std::stable_sort(by_count.begin(), by_count.end(), [&](i64 x, i64 y) { return periods[x] > periods[y]; });
-	struct Cand { i64 per; double cover; size_t windows; };
+	struct Cand { i64 per; Eval ev; size_t windows; };
 	std::vector<Cand> cands;
 	for (size_t bi = 0; bi < by_count.size() && bi < 12; bi++)
 	{
@@ -2154,17 +2223,14 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 			if (std::llabs(pr.dt / (SAMPLE_RATE / 2) - bucket) <= 1) sel_b.push_back(pr);
 		std::map<i64, i64> fine;
 		std::vector<i64> fine_order;
-		size_t first_i = SIZE_MAX;
 		for (const Pair& pr : sel_b)
 		{
 			i64 b = pr.dt / (SAMPLE_RATE / 100);
 			if (!fine.count(b)) fine_order.push_back(b);
 			fine[b]++;
-			first_i = std::min(first_i, pr.i);
 		}
 		std::stable_sort(fine_order.begin(), fine_order.end(), [&](i64 x, i64 y) { return fine[x] > fine[y]; });
-		double best_cover = -1;
-		i64 best_per = 0;
+		Cand best{0, Eval{}, sel_b.size()};
 		for (size_t k = 0; k < fine_order.size() && k < 6; k++)
 		{
 			std::vector<i64> near;
@@ -2172,107 +2238,59 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 				if (std::llabs(pr.dt / (SAMPLE_RATE / 100) - fine_order[k]) <= 1) near.push_back(pr.dt);
 			std::sort(near.begin(), near.end());
 			i64 per = near[near.size() / 2];
-			i64 span = 0, hits = 0, dummy;
-			for (size_t m = first_i; m < n; m++)
-			{
-				if (events[m].t + per + tol < events[n - 1].t)
-				{
-					span++;
-					if (recurrence_at(m, per, dummy)) hits++;
-				}
-			}
-			double cover = (double)hits / std::max<i64>(1, span);
-			if (best_cover < 0 || cover > best_cover) { best_cover = cover; best_per = per; }
+			Eval ev = evaluate(per);
+			bool better = !best.per || (ev.ok && !best.ev.ok) ||
+			              (ev.ok == best.ev.ok && (ev.ok ? ev.onset < best.ev.onset : ev.cover > best.ev.cover));
+			if (better) { best.per = per; best.ev = ev; }
 		}
-		cands.push_back({best_per, best_cover, sel_b.size()});
+		cands.push_back(best);
 	}
 	ui::section("Loop detection");
 	std::map<const Cand*, double> cand_corr;   // audio correlation of the second pass, when measured
 	auto print_cands = [&](const Cand* chosen_c) {
-		ui::Table t({"Period", "Windows", "Note-on recurrence", "Audio corr.", ""}, {true, true, true, true, false});
+		ui::Table t({"Period", "Windows", "Periodic from", "Recurrence", "Audio corr.", ""}, {true, true, true, true, true, false});
 		std::set<i64> shown;
 		for (const Cand& c : cands)
 		{
 			if (!shown.insert(c.per).second) continue;
 			auto it = cand_corr.find(&c);
-			t.add({strf("%.3f s", (double)c.per / SAMPLE_RATE), strf("%zu", c.windows), strf("%.0f%%", 100 * c.cover),
-			       it == cand_corr.end() ? "-" : strf("%.2f", it->second), &c == chosen_c ? std::string(ui::esc(ui::C_GREEN)) + "\u2714 chosen" + ui::esc(ui::C_RESET) : ""});
+			std::string from = c.ev.onset == SIZE_MAX ? "never" : fmt_pos(all[c.ev.onset].t);
+			if (c.ev.onset != SIZE_MAX && !c.ev.ok) from += " (too late)";
+			t.add({strf("%.3f s", (double)c.per / SAMPLE_RATE), strf("%zu", c.windows), from, c.ev.onset == SIZE_MAX ? "-" : strf("%.0f%%", 100 * c.ev.cover),
+			       it == cand_corr.end() ? "-" : strf("%.2f", it->second), &c == chosen_c ? std::string(ui::esc(ui::C_GREEN)) + "✔ chosen" + ui::esc(ui::C_RESET) : ""});
 		}
 		t.print();
 	};
-	double best_cover = -1;
-	for (const Cand& c : cands) best_cover = std::max(best_cover, c.cover);
-	if (best_cover < 0.6)
+	std::vector<const Cand*> order;
+	for (const Cand& c : cands) if (c.ev.ok) order.push_back(&c);
+	if (order.empty())
 	{
 		print_cands(nullptr);
-		ui::warn(strf("no repetition covers the song (best %.0f%%): repeated phrases only, no loop", 100 * best_cover));
+		ui::warn("the song never becomes periodic within the capture (repeated phrases only, or the capture stops before the second full repetition): no loop");
 		return false;
 	}
-	// preference from the note-ons: the best covered period, then more matching windows, then
-	// shorter (a multiple of the loop covers as well with fewer windows, a period shifted by one
-	// phrase covers a little less); the rest by coverage
-	std::vector<const Cand*> order;
-	for (const Cand& c : cands) order.push_back(&c);
-	// a multiple of the loop (2x, 3x, 4x) covers as well as the loop itself but matches fewer
-	// windows: it goes behind its base period
-	auto is_multiple_of_shorter = [&](const Cand* c) {
-		for (const Cand& o : cands)
-		{
-			if (o.per >= c->per || o.cover < best_cover - 0.05 || o.windows <= c->windows) continue;
-			double k = (double)c->per / o.per;
-			int ki = (int)std::llround(k);
-			if (ki >= 2 && ki <= 4 && fabs(k - ki) < 0.01 * ki) return true;
-		}
-		return false;
-	};
+	// earliest start of the periodic part (a shorter period that only fits the last bars starts
+	// later), then the shorter period (a multiple of the loop is periodic from the same point)
 	std::stable_sort(order.begin(), order.end(), [&](const Cand* a, const Cand* b) {
-		bool ga = a->cover >= best_cover - 0.05, gb = b->cover >= best_cover - 0.05;
-		if (ga != gb) return ga;
-		if (ga)
-		{
-			bool ma = is_multiple_of_shorter(a), mb = is_multiple_of_shorter(b);
-			if (ma != mb) return !ma;
-			return a->windows != b->windows ? a->windows > b->windows : a->per < b->per;
-		}
-		return a->cover > b->cover;
+		i64 ta = all[a->ev.onset].t, tb = all[b->ev.onset].t;
+		if (std::llabs(ta - tb) > SAMPLE_RATE) return ta < tb;
+		if (a->per != b->per) return a->per < b->per;
+		return a->windows > b->windows;
 	});
-	// first repeated note-on and its recurrence for a period
-	auto first_of = [&](i64 t) -> size_t { for (size_t m = 0; m < n; m++) if (events[m].t == t) return m; return 0; };
-	auto locate = [&](i64 period, i64& t1, i64& t2) -> bool {
-		size_t first = SIZE_MAX;
-		i64 dummy;
-		for (size_t i = 0; i < n; i++)
-		{
-			if (events[i].t < search_from) continue;
-			int hits = 0;
-			for (size_t m = i; m < std::min(i + 40, n); m++)
-				if (recurrence_at(m, period, dummy)) hits++;
-			if (hits >= 32)
-			{
-				for (size_t m = i; m < n; m++)
-					if (recurrence_at(m, period, dummy)) { first = m; break; }
-				break;
-			}
-		}
-		if (first == SIZE_MAX) return false;
-		t1 = events[first].t;
-		recurrence_at(first, period, t2);
-		return true;
-	};
 	const Cand* chosen = nullptr;
 	i64 t1 = 0, t2 = 0;
+	auto locate = [&](const Cand* c, i64& a, i64& b) { a = all[c->ev.onset].t; recurrence_at(c->ev.onset, c->per, b); };
 	if (wav)
 	{
-		// the rendered audio vetoes: the loop body must sound alike the second time (note-ons alone
-		// miss melodies played by pitch or volume changes on sustained voices, and a short capture
+		// the rendered audio vetoes: the loop body must sound alike the second time (a short capture
 		// may repeat only a riff). The waveform correlation is too sensitive to the effect DSP's
-		// modulation to rank candidates, so the note-on preference order is kept among the survivors
+		// modulation to rank candidates, so the preference order is kept among the survivors
 		struct Scored { const Cand* c; i64 t1, t2; double corr; };
 		std::vector<Scored> scored;
 		for (const Cand* c : order)
 		{
 			i64 a, b;
-			if (!locate(c->per, a, b)) continue;
+			locate(c, a, b);
 			i64 len = std::min<i64>(std::min<i64>(b - a, search_to - b), 10 * SAMPLE_RATE);
 			if (len < SAMPLE_RATE) continue;   // the capture does not reach far enough into the second pass
 			double corr = audio_corr(*wav, a, b, len);
@@ -2290,22 +2308,58 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 	}
 	else
 	{
-		for (const Cand* c : order)
-			if (locate(c->per, t1, t2)) { chosen = c; break; }
+		chosen = order[0];
+		locate(chosen, t1, t2);
 		print_cands(chosen);
 	}
-	if (!chosen) { ui::warn("no loop found"); return false; }
+	// the volume and filter writes may settle a few seconds (up to 5) after the first repeated note (the
+	// first repetition starts over the intro's tails, which the driver still ramps on voices the
+	// repetition re-uses): the loop then starts on that note, as a musician would place it, provided
+	// the notes themselves (key-ons and pitch changes) already recur from there
+	{
+		auto keyon_recurs = [&](size_t i) {
+			const std::vector<i64>& ts = by_key[events[i].k];
+			auto it = std::lower_bound(ts.begin(), ts.end(), events[i].t + chosen->per - tol);
+			return it != ts.end() && *it <= events[i].t + chosen->per + tol;
+		};
+		auto notes_recur = [&](i64 from, i64 to) {
+			int hits = 0, cnt = 0;
+			i64 dummy;
+			for (size_t m = 0; m < na; m++)
+			{
+				if (all[m].t < from) continue;
+				if (all[m].t >= to) break;
+				if (all[m].k.f == -1 && all[m].k.b != 0x104) continue;   // volume, filter, gains, sample window
+				cnt++;
+				hits += recurrence_at(m, chosen->per, dummy);
+			}
+			return hits * 5 >= cnt * 4;
+		};
+		for (size_t i = 0; i < n && events[i].t < t1; i++)
+		{
+			if (events[i].t < search_from || events[i].t < t1 - 5 * SAMPLE_RATE) continue;
+			int hits = 0, cnt = 0;
+			for (size_t m = i; m < std::min(i + 40, n); m++) { cnt++; hits += keyon_recurs(m); }
+			if (hits * 5 < cnt * 4 || !keyon_recurs(i) || !notes_recur(events[i].t, t1)) continue;
+			ui::info(strf("the parameter writes settle %.2f s after the first repeated note: loop start moved back to it", (double)(t1 - events[i].t) / SAMPLE_RATE));
+			t1 = events[i].t;
+			const std::vector<i64>& ts = by_key[events[i].k];
+			t2 = *std::lower_bound(ts.begin(), ts.end(), t1 + chosen->per - tol);
+			break;
+		}
+	}
 	i64 t0 = t1;   // first note-on of the range: the intro before the loop body is kept
 	for (size_t i = 0; i < n; i++) if (events[i].t >= search_from) { t0 = events[i].t; break; }
-	ui::ok(strf("loop found: period %s (%.4f s), %.0f%% of the note-ons recur, %zu matching windows", fmt_pos(chosen->per).c_str(),
-	            (double)chosen->per / SAMPLE_RATE, 100 * chosen->cover, chosen->windows));
-	ui::info(strf("first note-on at %s, first repeated note-on at %s, recurs at %s", fmt_pos(t0).c_str(), fmt_pos(t1).c_str(), fmt_pos(t2).c_str()));
+	if (t1 < t0) t0 = t1;   // the loop starts on the parameter writes that set up the first note
+	ui::ok(strf("loop found: period %s (%.4f s), the song is periodic from %s on (%.0f%% of the events recur), %zu matching windows", fmt_pos(chosen->per).c_str(),
+	            (double)chosen->per / SAMPLE_RATE, fmt_pos(t1).c_str(), 100 * chosen->ev.cover, chosen->windows));
+	ui::info(strf("first note-on at %s, loop start at %s, recurs at %s", fmt_pos(t0).c_str(), fmt_pos(t1).c_str(), fmt_pos(t2).c_str()));
 	lr.start = std::max<i64>(0, t0 - pre);
 	// the loop length is the median period of all recurring note-ons (sample exact when the
 	// driver is frame locked), not the recurrence of one note, which may carry its own jitter
 	i64 period = chosen->per;
 	if (std::llabs((t2 - t1) - period) > SAMPLE_RATE / 1000)
-		ui::info(strf("the first repeated note recurs %.1f ms off the median period, loop length taken from the median", (double)((t2 - t1) - period) * 1000 / SAMPLE_RATE));
+		ui::info(strf("the loop start event recurs %.1f ms off the median period, loop length taken from the median", (double)((t2 - t1) - period) * 1000 / SAMPLE_RATE));
 	// two constructions: loop body = first repetition (file = intro + 1 repetition), or = second
 	// repetition when the capture holds it (the first one is left out of the stream)
 	lr.loop1 = std::max<i64>(0, t1 - pre);
