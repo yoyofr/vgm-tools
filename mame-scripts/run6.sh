@@ -6,7 +6,7 @@ M=/Users/yohann/Documents/Dev/vgmrips/mame
 TAG=$1; BIN=$2; SONG=${3:-6}
 R=$OUT/run_$TAG; rm -rf $R; mkdir -p $R/nvram $R/cfg; cp -r $M/nvram/raycrisj $R/nvram/; cp $M/cfg/*.cfg $R/cfg/ 2>/dev/null
 cd $R
-ZDIR=$R $BIN raycrisj -rompath $M/roms -bgfx_path $M/bgfx -nvram_directory $R/nvram -cfg_directory $R/cfg -inipath $Z/ini -homepath $M -skip_gameinfo -snapshot_directory $R/snap -autoboot_script $Z/ctl.lua -window -sound none -vgmwrite 1 ${=EXTRA} > $R/mame.log 2>&1 &
+ZDIR=$R SDL_MAC_BACKGROUND_APP=1 $BIN raycrisj -rompath $M/roms -bgfx_path $M/bgfx -nvram_directory $R/nvram -cfg_directory $R/cfg -inipath $Z/ini -homepath $M -skip_gameinfo -snapshot_directory $R/snap -autoboot_script $Z/ctl.lua -window -sound none -vgmwrite 1 ${=EXTRA} > $R/mame.log 2>&1 &
 PID=$!
 cmd(){ printf '%s\n' "$1" > $R/cmd.tmp; mv $R/cmd.tmp $R/cmd.txt; sleep 0.7; }
 tap(){ cmd "tap $1"; }
