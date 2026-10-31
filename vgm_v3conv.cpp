@@ -84,7 +84,10 @@ struct Conv
 	bool es = false, zsg = false;
 	bool espUsed[2] = {false, false};
 	bool espCreated[2] = {false, false};
-	bool routeTouched[2] = {false, false};
+	// v1 ESP routing state, simulated so that presets can be expressed as 0xE2 commands
+	uint8_t routeIn[2][6] = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+	bool direct[2][12] = {{true, true, true, true, true, true, true, true, true, true, true, true},
+	                      {true, true, true, true, true, true, true, true, true, true, true, true}};
 	uint8_t dramLog2 = 0;
 	uint8_t window[2][4] = {}, alias[2][4] = {{0, 1, 2, 3}, {0, 1, 2, 3}};
 	std::map<std::string, unsigned> stats;
@@ -94,18 +97,31 @@ struct Conv
 	void put(std::initializer_list<uint8_t> b) { out.insert(out.end(), b); }
 	void count(const std::string& k) { stats[k]++; }
 
-	void es_preset(uint8_t chip, uint8_t preset)
+	// v3 0xE2 (as the player applies it): input ii <- channel cc, and that channel leaves the direct mix
+	void route(uint8_t chip, uint8_t ii, uint8_t cc)
 	{
 		uint8_t c7 = chip << 7;
-		if (routeTouched[chip]) fail("ES5510 routing preset after other routing changes: not representable in v3");
-		routeTouched[chip] = true;
+		put({0xE2, (uint8_t)(0x35 | c7), ii, (uint8_t)(0x25 | c7), cc});
+		if (ii < 6) { routeIn[chip][ii] = cc; if (cc < 12) direct[chip][cc] = false; }
+	}
+
+	// v1 preset = reset (all channels direct, no input) + preset routes. Representable when no channel that
+	// the preset makes direct again is currently routed away from the direct mix (0xE2 cannot restore it).
+	void es_preset(uint8_t chip, uint8_t preset)
+	{
+		uint8_t tIn[6]; bool tDir[12];
+		for (int c = 0; c < 12; c++) tDir[c] = true;
+		for (int i = 0; i < 6; i++) tIn[i] = 0xFF;
+		if (preset == 0) for (int i = 0; i < 6; i++) { tIn[i] = (uint8_t)(i + 2); tDir[i + 2] = false; }
+		else if (preset == 1) for (int i = 0; i < 6; i++) { tIn[i] = (uint8_t)i; tDir[i] = false; }
+		for (int c = 0; c < 12; c++)
+			if (tDir[c] && !direct[chip][c]) fail("ES5510 routing preset would put channel " + std::to_string(c) + " back in the direct mix: not representable in v3");
 		espCreated[chip] = espUsed[chip] = true;
-		if (preset == 0)
-			for (uint8_t ii = 0; ii < 6; ii++) put({0xE2, (uint8_t)(0x35 | c7), ii, (uint8_t)(0x25 | c7), (uint8_t)(ii + 2)});
-		else if (preset == 1)
-			for (uint8_t ii = 0; ii < 6; ii++) put({0xE2, (uint8_t)(0x35 | c7), ii, (uint8_t)(0x25 | c7), ii});
-		else    // all direct (the default): a no-op route still creates the ESP like the v1 command did
-			put({0xE2, (uint8_t)(0x35 | c7), 0x00, (uint8_t)(0x25 | c7), 0xFF});
+		bool any = false;
+		for (uint8_t i = 0; i < 6; i++)
+			if (routeIn[chip][i] != tIn[i] || (tIn[i] < 12 && direct[chip][tIn[i]])) { route(chip, i, tIn[i]); any = true; }
+		if (!any)   // nothing changes: a no-op route still creates the ESP like the v1 command did
+			put({0xE2, (uint8_t)(0x35 | (chip << 7)), 0x00, (uint8_t)(0x25 | (chip << 7)), routeIn[chip][0]});
 	}
 
 	void es_d7(uint8_t pp, uint8_t aa, uint8_t dd)
@@ -147,8 +163,8 @@ struct Conv
 		case 0x00: put({0xCC, c7, aa, dd}); count("D8 00 host -> CC"); break;
 		case 0x01: put({0x4B, c7, (uint8_t)(dd ? 1 : 0)}); count("D8 01 halt -> 4B"); break;
 		case 0x02:
-			routeTouched[chip] = true;
-			put({0xE2, (uint8_t)(0x35 | c7), aa, (uint8_t)(0x25 | c7), dd}); count("D8 02 route -> E2"); break;
+			if (aa >= 6) { count("D8 02 route of a missing input (dropped)"); break; }
+			route(chip, aa, dd); count("D8 02 route -> E2"); break;
 		case 0x03:
 			if ((aa != 6 && aa != 7) || (dd & 1) != (aa & 1)) fail("ES5510 output routed to the other side: not representable in v3");
 			count("D8 03 route out (default, dropped)"); break;
