@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GD3 Tag Editor</title>
+<title>VGM Studio</title>
 <style>
 /* layout: file list on the left, tag form on the right; one column under 760px */
 :root {
@@ -82,12 +82,39 @@ dialog h2 { margin: 0 0 4px; font-size: 16px }
 .pngbox img { height: 40px; border: 1px solid var(--line); border-radius: 4px; image-rendering: pixelated }
 .prow label.chk { display: flex; gap: 6px; align-items: center; font-size: 13px; text-transform: none; letter-spacing: 0; color: var(--fg) }
 kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px }
+.titlebar { display: flex; gap: 14px; align-items: center; flex-wrap: wrap }
+.tabs { display: flex; gap: 2px; border: 1px solid var(--line); border-radius: 6px; padding: 2px; background: var(--field) }
+.tabs button { border: 0; padding: 4px 12px; border-radius: 4px; background: none }
+.tabs button.on { background: var(--accent); color: var(--accent-fg); font-weight: 600 }
+.mod[hidden] { display: none }
+#asm { padding: 16px; display: grid; gap: 14px }
+#asm h2 { font-size: 14px; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-weight: 600 }
+.parts { display: grid; gap: 6px }
+.part { display: grid; grid-template-columns: 2.2em minmax(0, 1fr) 9em 8em 8em 7em 2em; gap: 8px; align-items: center; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); font-variant-numeric: tabular-nums }
+.part .n { color: var(--muted); font-family: var(--mono) }
+.part select { font: inherit; min-width: 0; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg) }
+.part input { width: 100%; font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg) }
+.part .t { font-family: var(--mono); font-size: 12px; color: var(--muted) }
+.part .rm { border: 0; background: none; color: inherit; opacity: .55; cursor: pointer; font-size: 14px }
+.part .rm:hover { opacity: 1; color: var(--warn) }
+.parthead { display: grid; grid-template-columns: 2.2em minmax(0, 1fr) 9em 8em 8em 7em 2em; gap: 8px; padding: 0 8px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em }
+@media (max-width: 900px) { .part, .parthead { grid-template-columns: 2em minmax(0, 1fr) 7em 2em } .part .t:not(.keep), .parthead .t:not(.keep) { display: none } }
+.asmbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
+.asmbar input[type=text] { flex: 1; min-width: 12em }
+#asmLog { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; max-height: 260px; overflow: auto; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--muted) }
+#asmLog:empty { display: none }
+.player { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 6px }
+.player audio { width: 100%; height: 36px }
+.player .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
+.player select { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--fg) }
+.spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -2px }
+@keyframes spin { to { transform: rotate(360deg) } }
 </style>
 </head>
 <body>
 <header>
   <div>
-    <h1>GD3 Tag Editor</h1>
+    <div class="titlebar"><h1>VGM Studio</h1><nav class="tabs" id="tabs"><button type="button" data-mod="tags" class="on">Tags</button><button type="button" data-mod="asm">Assemblage</button></nav><span id="srv" class="hint" title="Serveur local vgmstudio.py : assemblage et écoute"></span></div>
     <div id="status">Ouvre des fichiers .vgm ou .vgz. Les tags japonais sont en UTF-16, saisie directe.</div>
   </div>
   <div class="toolbar">
@@ -107,6 +134,7 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
     <div class="drop" id="drop">Glisser des fichiers ou des dossiers ici</div>
   </section>
   <section class="panel">
+    <div class="mod" id="mod-tags">
     <div id="form">
       <div class="head"><span></span><span>English</span><span>日本語</span><span></span></div>
       <div class="row single"><label for="trackNo">N° de piste</label><div class="volbox"><input type="number" id="trackNo" min="0" max="999" step="1" placeholder="—"><span class="hint">non stocké dans le fichier : m3u, nom des fichiers du pack, renommage</span><button type="button" id="renameOne" title="Renommer ce fichier sur le disque d'après le format">Renommer ce fichier…</button></div><button class="all" id="trackFromFile" title="Numéro depuis le préfixe du nom de fichier ; Maj+clic : tous les fichiers">← fichier</button><button type="button" id="trackSeq" title="Renuméroter tous les fichiers 1..N dans l'ordre de la liste">1..N</button></div>
@@ -121,6 +149,25 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
       <div class="row single"><label for="loopMul">Boucles</label><div class="volbox"><span>×</span><input type="number" id="loopMul" step="0.25" min="0.0625" max="15.9375" placeholder="1"><span>−</span><input type="number" id="loopBase" step="1" min="-128" max="127" placeholder="0"><span id="loopHint"></span></div><button class="all" id="loopAll">→ tous</button></div>
     </div>
     <div id="info"></div>
+    </div>
+    <div class="mod" id="mod-asm" hidden>
+      <div id="asm">
+        <div>
+          <h2>Parties</h2>
+          <div class="hint">Chaque partie est un fichier de la liste. « Boucles » = nombre de passages du corps de boucle avant la partie suivante (0 = l'intro seule) ; vide = la partie garde sa boucle (la dernière partie, normalement). Les parties s'enchaînent sans silence : les voix encore actives à la jonction s'éteignent en 0,1 s pendant que la suite démarre, le DSP (réverbération) continue.</div>
+        </div>
+        <div class="parthead"><span>#</span><span>Fichier</span><span class="t keep">Boucles</span><span class="t">Début</span><span class="t">Durée</span><span class="t">Boucle</span><span></span></div>
+        <div class="parts" id="asmParts"></div>
+        <div class="asmbar"><button type="button" id="asmAdd">+ Partie</button><span class="hint" id="asmTotal"></span></div>
+        <div class="asmbar"><label for="asmName" class="hint">Résultat</label><input type="text" id="asmName" placeholder="nom du fichier .vgz"><button type="button" class="primary" id="asmGo" disabled>Assembler</button><span class="hint" id="asmMsg"></span></div>
+        <pre id="asmLog"></pre>
+        <div class="player">
+          <div class="bar"><strong>Écoute</strong><select id="playWhat"></select><button type="button" id="playGo" disabled>▶ Rendre et écouter</button><span class="hint" id="playMsg"></span></div>
+          <audio id="player" controls preload="none"></audio>
+          <div class="hint">Rendu par vgm2wav (le moteur de lecture de libvgm) via le serveur local ; une fenêtre de jonction = 5 s avant et après.</div>
+        </div>
+      </div>
+    </div>
   </section>
 </main>
 <dialog id="packDlg">
@@ -677,6 +724,11 @@ async function saveFile(f) {
     await ensureWritable(f);
     const w = await f.handle.createWritable();
     await w.write(out); await w.close();
+  } else if (window.showSaveFilePicker && !f.audio) {
+    const ext = f.gz ? '.vgz' : '.vgm';
+    const h = await window.showSaveFilePicker({ suggestedName: f.name, types: [{ description: 'VGM', accept: { 'application/octet-stream': [ext] } }] });
+    const w = await h.createWritable(); await w.write(out); await w.close();
+    f.handle = h; f.name = h.name || f.name;
   } else {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([out], { type: 'application/octet-stream' }));
@@ -960,6 +1012,151 @@ $('p_go').onclick = async () => {
 };
 
 document.addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); $('save').click(); } });
+
+// ---------------------------------------------------------------------------------------------
+// modules (tabs) and the local server (vgmstudio.py): assembling parts and listening
+// ---------------------------------------------------------------------------------------------
+let serverOk = false;
+function showModule(m) {
+  for (const b of $('tabs').querySelectorAll('button')) b.classList.toggle('on', b.dataset.mod === m);
+  $('mod-tags').hidden = m !== 'tags'; $('mod-asm').hidden = m !== 'asm';
+  try { localStorage.setItem('vgmstudio.module', m); } catch (e) {}
+  if (m === 'asm') renderAsm();
+}
+$('tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) showModule(b.dataset.mod); });
+async function pingServer() {
+  try { const r = await fetch('/api/ping', { cache: 'no-store' }); const j = await r.json(); serverOk = !!j.ok; }
+  catch (e) { serverOk = false; }
+  $('srv').textContent = serverOk ? 'serveur local : connecté' : 'serveur local absent : lance « python3 vgmstudio.py » et ouvre http://127.0.0.1:8765/ pour assembler et écouter';
+  $('srv').className = serverOk ? 'hint ok' : 'hint warn';
+  renderAsm();
+}
+function totalOf(b) { return le32(b, 0x18); }
+function loopOf(b) { return le32(b, 0x20); }
+function b64(bytes) { let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(s); }
+function unb64(str) { const bin = atob(str), out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
+const vgmFiles = () => files.map((f, i) => ({ f, i })).filter(x => !x.f.audio);
+
+// the sequence: parts refer to files by name + size (the list is re-sorted); repeat '' = keep the loop
+const asm = { parts: [], result: null, junctions: [] };
+let asmNameAuto = true;   // the result name follows the parts until the user edits it
+$('asmName').addEventListener('input', () => { asmNameAuto = $('asmName').value.trim() === ''; if (asmNameAuto) renderAsm(); });
+function uniqueName(name, keep) { let n = name, k = 2; while (files.some(f => f.name === n && f !== keep)) n = name.replace(/(\.vgz)$/i, '') + ' (' + k++ + ').vgz'; return n; }
+function partFile(p) { return files.find(f => f.name === p.name && f.size === p.size) || null; }
+function partLength(f, repeat) {
+  const total = totalOf(f.bytes), loop = loopOf(f.bytes);
+  if (repeat === '' || repeat == null || !loop) return { len: total, loops: loop ? 'garde sa boucle' : 'sans boucle' };
+  const n = Math.max(0, Math.floor(+repeat));
+  return { len: total - loop + n * loop, loops: n === 0 ? 'intro seule' : 'intro + ' + n + ' × ' + fmtTime(loop) };
+}
+function renderAsm() {
+  const box = $('asmParts');
+  box.innerHTML = '';
+  const list = vgmFiles();
+  let t = 0, loopKept = null;
+  asm.junctions = [];
+  asm.parts.forEach((p, k) => {
+    const f = partFile(p);
+    const row = document.createElement('div'); row.className = 'part';
+    const sel = document.createElement('select');
+    sel.innerHTML = '<option value="">— choisir —</option>' + list.map(x => `<option value="${x.i}" ${f === x.f ? 'selected' : ''}>${x.f.name}</option>`).join('');
+    sel.addEventListener('change', () => { const x = files[+sel.value]; if (x) { p.name = x.name; p.size = x.size; } else { p.name = null; } renderAsm(); });
+    const rep = document.createElement('input'); rep.type = 'number'; rep.min = '0'; rep.step = '1'; rep.placeholder = k === asm.parts.length - 1 ? 'boucle' : '1'; rep.value = p.repeat;
+    rep.title = 'Passages du corps de boucle (0 = intro seule) ; vide = garde la boucle du fichier';
+    rep.addEventListener('input', () => { p.repeat = rep.value; renderAsm(); });
+    let start = '', len = '', lp = '';
+    if (f) {
+      if (k) asm.junctions.push(t);
+      const L = partLength(f, p.repeat);
+      start = fmtTime(t); len = fmtTime(L.len); lp = L.loops; t += L.len;
+      if (loopOf(f.bytes) && (p.repeat === '' || p.repeat == null)) loopKept = k;
+    }
+    const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'rm'; rm.textContent = '×'; rm.title = 'Retirer';
+    rm.addEventListener('click', () => { asm.parts.splice(k, 1); renderAsm(); });
+    row.append(Object.assign(document.createElement('span'), { className: 'n', textContent: k + 1 }), sel, rep,
+      Object.assign(document.createElement('span'), { className: 't', textContent: start }),
+      Object.assign(document.createElement('span'), { className: 't', textContent: len }),
+      Object.assign(document.createElement('span'), { className: 't', textContent: lp, title: lp }), rm);
+    box.appendChild(row);
+  });
+  const ready = asm.parts.length >= 1 && asm.parts.every(p => partFile(p));
+  const warn = loopKept != null && loopKept !== asm.parts.length - 1 ? ' · la boucle de la partie ' + (loopKept + 1) + ' n’est pas sur la dernière partie : le fichier bouclera jusqu’à la fin' : '';
+  $('asmTotal').textContent = ready ? 'durée totale ' + fmtTime(t) + (loopKept != null ? ' · boucle = celle de la partie ' + (loopKept + 1) : ' · sans boucle') + warn : '';
+  $('asmGo').disabled = !(ready && serverOk);
+  if (ready && asmNameAuto) {
+    const names = asm.parts.map(p => partFile(p).name.replace(/\.(vgm|vgz)$/i, ''));
+    const base = (names.length > 1 ? names[0] + '+' + names.slice(1).map(n => /\d/.test(n) ? n.replace(/^.*?(\d+)[^\d]*$/, '$1') : n).join('+') : names[0] + ' (assemblage)') + '.vgz';
+    $('asmName').value = uniqueName(base, asm.result);
+  }
+  // listening choices: any loaded file, the result and its junctions
+  const pw = $('playWhat'), prev = pw.value;
+  pw.innerHTML = list.map(x => `<option value="f:${x.i}">${x.f.name}</option>`).join('') +
+    asm.junctions.map((j, k) => `<option value="j:${k}">jonction ${k + 1} → ${k + 2} (${fmtTime(j)}) ±5 s</option>`).join('');
+  if ([...pw.options].some(o => o.value === prev)) pw.value = prev;
+  $('playGo').disabled = !(serverOk && pw.options.length);
+}
+$('asmAdd').addEventListener('click', () => {
+  const list = vgmFiles();
+  const used = new Set(asm.parts.map(p => p.name + '|' + p.size));
+  const next = list.find(x => !used.has(x.f.name + '|' + x.f.size)) || list[0];
+  asm.parts.push(next ? { name: next.f.name, size: next.f.size, repeat: '' } : { name: null, size: 0, repeat: '' });
+  if (asm.parts.length >= 2) { const prev = asm.parts[asm.parts.length - 2]; if (prev.repeat === '') prev.repeat = '1'; }
+  renderAsm();
+});
+async function postJson(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const ct = r.headers.get('Content-Type') || '';
+  if (ct.startsWith('audio/')) return { blob: await r.blob() };
+  const j = await r.json();
+  if (!j.ok) throw new Error((j.error || 'erreur serveur') + (j.log ? '\n' + j.log : ''));
+  return j;
+}
+$('asmGo').addEventListener('click', async () => {
+  const parts = asm.parts.map(p => { const f = partFile(p); return { name: f.name, data: b64(f.raw && !f.dirty ? f.raw : f.bytes), repeat: p.repeat === '' ? null : Math.max(0, Math.floor(+p.repeat)) }; });
+  let name = ($('asmName').value.trim() || 'assemblage.vgz').replace(/\.(vgm)$/i, '.vgz');
+  if (!/\.vgz$/i.test(name)) name += '.vgz';
+  name = uniqueName(name, asm.result);   // never replaces a loaded file, only the previous result of the same name
+  $('asmMsg').innerHTML = '<span class="spin"></span> assemblage…'; $('asmGo').disabled = true; $('asmLog').textContent = '';
+  try {
+    const j = await postJson('/api/concat', { parts, output: name });
+    $('asmLog').textContent = j.log || '';
+    const bytes = unb64(j.data);
+    const f = await readFile(new File([bytes], name), null);
+    const old = asm.result ? files.indexOf(asm.result) : -1;
+    if (old >= 0 && asm.result.name === name) files.splice(old, 1);
+    files.push(f); sortFiles(); select(files.indexOf(f));
+    asm.result = f;
+    $('asmMsg').textContent = 'assemblé : ' + name + ' (' + fmtTime(totalOf(f.bytes)) + (loopOf(f.bytes) ? ', boucle ' + fmtTime(loopOf(f.bytes)) : '') + ') — ajouté à la liste, « Enregistrer » pour l’écrire';
+    $('asmMsg').className = 'hint ok';
+    renderAsm();
+    $('playWhat').value = 'f:' + files.indexOf(f);
+  } catch (e) { $('asmMsg').textContent = e.message.split('\n')[0]; $('asmMsg').className = 'hint warn'; $('asmLog').textContent = e.message; }
+  renderAsm();
+});
+$('playGo').addEventListener('click', async () => {
+  const v = $('playWhat').value;
+  let f, start = null, end = null, label;
+  if (v.startsWith('j:')) {
+    f = asm.result; const j = asm.junctions[+v.slice(2)];
+    if (!f) { $('playMsg').textContent = 'assemble d’abord'; return; }
+    start = Math.max(0, j / 44100 - 5); end = j / 44100 + 5; label = 'jonction';
+  } else { f = files[+v.slice(2)]; label = f.name; }
+  $('playMsg').innerHTML = '<span class="spin"></span> rendu de ' + label + '…'; $('playGo').disabled = true;
+  try {
+    const r = await postJson('/api/render', { name: f.name, data: b64(f.raw && !f.dirty ? f.raw : f.bytes), start, end, loops: 1 });
+    const a = $('player');
+    if (a.dataset.url) URL.revokeObjectURL(a.dataset.url);
+    a.src = a.dataset.url = URL.createObjectURL(r.blob);
+    if (start != null) a.currentTime = 0;
+    await a.play().catch(() => {});
+    $('playMsg').textContent = label + (start != null ? ' (' + fmtTime(start * 44100) + ' → ' + fmtTime(end * 44100) + ', la jonction est à 5 s)' : '');
+  } catch (e) { $('playMsg').textContent = e.message.split('\n')[0]; }
+  $('playGo').disabled = false;
+});
+pingServer();
+try { showModule(localStorage.getItem('vgmstudio.module') || 'tags'); } catch (e) { showModule('tags'); }
+const _renderList = renderList;
+renderList = function () { _renderList(); if (!$('mod-asm').hidden) renderAsm(); };
 </script>
 </body>
 </html>

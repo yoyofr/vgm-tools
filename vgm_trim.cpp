@@ -2645,46 +2645,238 @@ static bool ends_with_nocase(const std::string& s, const char* suffix)
 // --append: concatenate captures. The data blocks (0x67) of every file come first (exact duplicates
 // dropped), then the command streams in order: the initial register image of an appended file re-creates
 // its state at the junction, the ESP keeps the tail of the previous part. Header and GD3 of the first
-// file, total = sum, loop of the last file that has one (offsets shifted, the loop runs to the end).
-static Bytes merge(const std::vector<VGMFile>& in)
+// file, total = sum, loop of the last part that has one and no --repeat (offsets shifted, the loop runs
+// to the end). --repeat N plays the loop body of its part N times (0 = the intro only) instead of leaving
+// a loop point there.
+// ZSG-2 junction, made seamless: the voices still sounding at the end of a part get a short release
+// (volume target 0, ~0.1 s ramp) and ring into the next part, which starts right there; the
+// next part's initial register image is deferred, voice by voice, to the first time it touches each of
+// those voices (its idle key-offs leave them alone until then), so a trimmed (--cmp) part keeps its
+// invariants. The DSP keeps running (the reverb tail survives): the state block of the appended part is
+// left out when its program is the one already running and only the coefficients that differ are sent,
+// through the host port like the sound CPU does.
+struct MergePart { VGMFile file; int repeat = -1; };
+
+// tms57002::state_save layout (version 1): program at 204, coefficients at 1228 (256 x u32 each)
+static bool tms_state_fields(const u8* st, size_t len, std::vector<u32>& pgm, std::vector<u32>& cmem)
 {
-	const VGMFile& a = in[0];
+	const size_t PGM = 204, CMEM = PGM + 1024;
+	if (len < CMEM + 1024 || le32(st) != 1) return false;
+	pgm.resize(256); cmem.resize(256);
+	for (int i = 0; i < 256; i++) { pgm[i] = le32(st + PGM + 4 * i); cmem[i] = le32(st + CMEM + 4 * i); }
+	return true;
+}
+
+static Bytes merge(std::vector<MergePart>& in)
+{
+	const VGMFile& a = in[0].file;
+	const bool zsg2 = a.is_zsg2;
 	Bytes blocks, body;
 	std::set<Bytes> seen;
 	i64 total = 0, loop_t = -1;
 	size_t loop_body_ofs = 0, loop_part = 0;
 	ui::section("Merge");
-	ui::Table parts_table({"Part", "Length", "Loop"}, {true, false, false});
-	for (size_t k = 0; k < in.size(); k++) if (in[k].loop_ofs) loop_part = k + 1;
+	ui::Table parts_table({"Part", "Starts at", "Length", "Loop", "Played"}, {true, false, false, false, false});
+	for (size_t k = 0; k < in.size(); k++) if (in[k].file.loop_ofs && in[k].repeat < 0) loop_part = k + 1;
 	if (loop_part && loop_part < in.size())
 		ui::warn(strf("part %zu has a loop but is not the last part: the loop will run to the end of the merged file", loop_part));
+
+	// DSP of the ZSG-2 board: the output stream is replayed on the player's core as it is written, so that
+	// the state at a junction is known (coefficient differences with the appended part)
+	TMS57002* dsp = nullptr;
+	i64 dsp_ticks = 0;
+	const u32 clock = a.zsg2_clock ? a.zsg2_clock : 25000000;
+	const double chip_rate = (double)(clock / 768);
+	const int dsp_cycles = (int)((clock / 2) / (clock / 768));
+	u8 dsp_ctrl = 3;
+	auto dsp_run_to = [&](i64 t) {
+		if (!dsp) return;
+		i64 n = (i64)(t * chip_rate / SAMPLE_RATE) - dsp_ticks;
+		if (n > 0) { tms57002_prerun(dsp, (u32)n, dsp_cycles); dsp_ticks += n; }
+	};
+	auto dsp_feed = [&](const u8* c) {   // an 0xE4 command or a 0x98 block, at time `total`
+		if (!zsg2) return;
+		if (c[0] == 0x67)
+		{
+			if (!dsp) dsp = tms57002_create();
+			dsp_run_to(total);
+			u32 len = le32(c + 3) & 0x7FFFFFFF;
+			if (len >= 8) tms57002_state_load(dsp, c + 15, len - 8);
+			return;
+		}
+		u8 sub = c[1] & 15, aa = c[2];
+		u16 data = (u16)((c[3] << 8) | c[4]);
+		if (sub < 4 || sub == 6) return;
+		if (!dsp) dsp = tms57002_create();
+		dsp_run_to(total);
+		switch (sub)
+		{
+		case 4: tms57002_data_w(dsp, data & 0xFF); break;
+		case 5: dsp_ctrl = data & 3; tms57002_cload_w(dsp, data & 2); tms57002_pload_w(dsp, data & 1); break;
+		case 7: tms57002_reset(dsp); break;
+		case 8: tms57002_prerun(dsp, ((u32)aa << 16) | data, dsp_cycles); break;
+		default: break;
+		}
+	};
+	ZSG2State st;   // voice model of the output stream (which voices still sound at a junction)
+	st.set_clock(clock);
+	auto model = [&](const u8* c) {   // an 0xE4 command at time `total`
+		st.now = total;
+		u8 sub = c[1] & 15;
+		u16 data = (u16)((c[3] << 8) | c[4]);
+		if (sub <= 3) st.write(((sub & 3) << 8) | c[2], data); else st.ext(sub, c[2], data);
+	};
+	auto raw = [&](u8 sub, u8 aa, u16 d) {
+		u8 c[5] = {0xE4, sub, aa, u8(d >> 8), u8(d & 0xFF)};
+		body.insert(body.end(), c, c + 5);
+		if (zsg2) { model(c); dsp_feed(c); }
+	};
+	// register 0xF low byte: volume ramp code for a release of about 0.1 s from full scale
+	u8 release_code = 0;
+	{
+		const double want = -65535.0 / (0.1 * chip_rate / 2);
+		double best = 1e9;
+		for (int val = 0; val < 256; val++) { double r = zsg2_get_ramp((u8)val); if (r < 0 && std::fabs(r - want) < best) { best = std::fabs(r - want); release_code = (u8)val; } }
+	}
+
 	for (size_t k = 0; k < in.size(); k++)
 	{
-		const VGMFile& v = in[k];
+		const VGMFile& v = in[k].file;
+		const int repeat = in[k].repeat;
+		const u8* d = v.data.data();
 		if (v.es5506_clock != a.es5506_clock || v.is_es5506 != a.is_es5506)
 			ui::warn(strf("part %zu: ES5506 clock %08X differs from the first part (%08X)", k + 1, v.es5506_clock, a.es5506_clock));
+		if (v.is_zsg2 != a.is_zsg2 || v.zsg2_clock != a.zsg2_clock)
+			ui::warn(strf("part %zu: ZSG-2 clock %08X differs from the first part (%08X)", k + 1, v.zsg2_clock, a.zsg2_clock));
 		if (k && v.data_ofs > 0x7C && a.data_ofs > 0x7C && v.data[0x7C] != a.data[0x7C])
 			ui::warn(strf("part %zu: volume modifier %02X differs from the first part (%02X), the first one is kept", k + 1, v.data[0x7C], a.data[0x7C]));
-		if (v.loop_ofs && k + 1 != loop_part) ui::warn(strf("part %zu has a loop too, only the one of part %zu is kept", k + 1, loop_part));
-		if (k + 1 == loop_part) loop_t = -1;
-		const u8* d = v.data.data();
-		bool found_loop = false;
+		if (v.loop_ofs && repeat < 0 && k + 1 != loop_part) ui::warn(strf("part %zu has a loop too, only the one of part %zu is kept", k + 1, loop_part));
+		if (repeat >= 0 && !v.loop_ofs) ui::warn(strf("part %zu has no loop, --repeat %d ignored", k + 1, repeat));
+
+		std::vector<Cmd> cmds;
+		size_t first_body = SIZE_MAX, first_wait = SIZE_MAX;
 		v.commands([&](const Cmd& c) {
 			if (c.op == 0x66) return false;
-			if (k + 1 == loop_part && c.p == v.loop_ofs) { loop_body_ofs = body.size(); loop_t = total + c.t; found_loop = true; }
-			if (c.op == 0x67 && d[c.p + 2] != 0x98)   // a DSP state block (0x98) stays where it is in the stream
+			if (v.loop_ofs && c.p == v.loop_ofs) first_body = cmds.size();
+			if (first_wait == SIZE_MAX && wait_of(d + c.p, c.op) > 0) first_wait = cmds.size();
+			cmds.push_back(c);
+			return true;
+		});
+		if (v.loop_ofs && first_body == SIZE_MAX) ui::warn(strf("part %zu: loop offset does not fall on a command, treated as a part without loop", k + 1));
+		const bool has_loop = first_body != SIZE_MAX;
+		const size_t intro_end = has_loop ? first_body : cmds.size();
+		const int plays = has_loop ? (repeat >= 0 ? repeat : 1) : 1;
+		const i64 part_start = total;
+
+		// ZSG-2 junction
+		std::set<size_t> skip;   // commands of the init left out (DSP state block, resets, pre-runs)
+		bool tail[48] = {};      // voices of the previous part still sounding: image deferred, key-offs masked
+		std::vector<std::pair<u16, u16>> deferred[48];
+		int ntails = 0;
+		if (zsg2 && k)
+		{
+			for (int vi = 0; vi < 48; vi++)
+			{
+				if (!st.playing(vi, total)) continue;
+				tail[vi] = true; ntails++;
+				raw(u8(vi >> 4), u8((vi << 4) | 0xE), 0);                                              // volume target 0
+				raw(u8(vi >> 4), u8((vi << 4) | 0xF), u16((st.voice[vi].v[0xF] & 0xFF00) | release_code));   // ramp speed, DSP gain kept
+			}
+			size_t blk = SIZE_MAX;
+			for (size_t i = 0; i < cmds.size() && i < first_wait; i++)
+				if (cmds[i].op == 0x67 && d[cmds[i].p + 2] == 0x98 && cmds[i].len >= 15) { blk = i; break; }
+			if (blk != SIZE_MAX && dsp)
+			{
+				std::vector<u32> pgm_b, cmem_b, pgm_a, cmem_a;
+				dsp_run_to(total);
+				u32 size = tms57002_state_save(dsp, nullptr, 0);
+				Bytes st(size);
+				tms57002_state_save(dsp, st.data(), size);
+				const Cmd& c = cmds[blk];
+				if (tms_state_fields(d + c.p + 15, c.len - 15, pgm_b, cmem_b) && tms_state_fields(st.data(), st.size(), pgm_a, cmem_a))
+				{
+					if (pgm_a == pgm_b)
+					{
+						int updates = 0;
+						for (int i = 0; i < 256; i++)
+						{
+							if (cmem_a[i] == cmem_b[i]) continue;
+							// coefficient update through the host port: CLOAD low, address, 4 value bytes, CLOAD high
+							const u8 ctrl = dsp_ctrl;
+							raw(5, 0, ctrl & ~2);
+							raw(4, 0, (u8)i);
+							for (int s = 24; s >= 0; s -= 8) raw(4, 0, (cmem_b[i] >> s) & 0xFF);
+							raw(5, 0, ctrl | 2);
+							updates++;
+						}
+						for (size_t i = 0; i < cmds.size() && i < first_wait; i++)
+							if (cmds[i].op == 0x67 ? d[cmds[i].p + 2] == 0x98 : (cmds[i].op == 0xE4 && ((d[cmds[i].p + 1] & 15) == 7 || (d[cmds[i].p + 1] & 15) == 8)))
+								skip.insert(i);
+						ui::info(strf("part %zu: same DSP program, the DSP runs on across the junction (%d coefficient update(s), %zu init command(s) left out); %d voice(s) of part %zu ring on with a 0.1 s release", k + 1, updates, skip.size(), ntails, k));
+					}
+					else ui::warn(strf("part %zu: its DSP program differs from the running one, its state block is loaded at the junction (the reverb tail of part %zu is cut)", k + 1, k));
+				}
+				else ui::warn(strf("part %zu: unreadable DSP state block, loaded as is", k + 1));
+			}
+			else if (blk == SIZE_MAX) ui::warn(strf("part %zu has no DSP state block at its start: its DSP commands run on the DSP state left by part %zu", k + 1, k));
+		}
+
+		bool in_init = zsg2 && k;   // appended ZSG-2 part: its initial register image (before the first wait)
+		auto flush = [&](int vi) {   // deferred image of a voice of the previous part, the first time this part touches it
+			if (!tail[vi]) return;
+			tail[vi] = false;
+			for (auto& w : deferred[vi]) raw(u8(w.first >> 8), u8(w.first & 0xFF), w.second);
+		};
+		auto emit = [&](size_t i) {
+			const Cmd& c = cmds[i];
+			if (skip.count(i)) return;
+			if (c.op == 0x67 && d[c.p + 2] != 0x98)   // ROM / sample blocks go to the front of the file
 			{
 				Bytes b(d + c.p, d + c.p + c.len);
 				if (seen.insert(b).second) blocks.insert(blocks.end(), b.begin(), b.end());
-				return true;
+				return;
+			}
+			i64 w = wait_of(d + c.p, c.op);
+			if (zsg2 && k)
+			{
+				if (w > 0 && c.op != 0xE4) in_init = false;
+				if (c.op == 0xE4 && (d[c.p + 1] & 15) <= 3)
+				{
+					u16 ofs = ((d[c.p + 1] & 3) << 8) | d[c.p + 2], data = (u16)((d[c.p + 3] << 8) | d[c.p + 4]);
+					if (ofs < 0x300)
+					{
+						int vi = ofs >> 4;
+						if (tail[vi] && in_init) { deferred[vi].push_back({ofs, data}); return; }
+						flush(vi);
+					}
+					else if (ofs <= 0x302)
+					{
+						for (int b = 0; b < 16; b++) if (data & (1 << b)) flush(((ofs - 0x300) << 4) | b);
+					}
+					else if (ofs >= 0x304 && ofs <= 0x306)
+					{
+						for (int b = 0; b < 16; b++) if (tail[((ofs - 0x304) << 4) | b]) data &= ~(1 << b);
+						if (!data) return;
+						raw(3, u8(ofs & 0xFF), data);
+						return;
+					}
+				}
 			}
 			body.insert(body.end(), d + c.p, d + c.p + c.len);
-			return true;
-		});
-		if (k + 1 == loop_part && !found_loop) ui::warn(strf("part %zu: loop offset does not fall on a command, loop dropped", k + 1));
-		total += v.total;
-		parts_table.add({strf("%zu", k + 1), fmt_pos(v.total), v.loop_ofs ? fmt_pos(v.loop_samples) : "-"});
+			if (zsg2 && c.op == 0xE4) model(d + c.p);
+			if (c.op == 0x67 || c.op == 0xE4) dsp_feed(d + c.p);
+			total += w;
+		};
+		for (size_t i = 0; i < intro_end; i++) emit(i);
+		for (int pass = 0; pass < plays; pass++)
+		{
+			if (pass == 0 && k + 1 == loop_part) { loop_body_ofs = body.size(); loop_t = total; }
+			for (size_t i = intro_end; i < cmds.size(); i++) emit(i);
+		}
+		std::string played = !has_loop ? "once" : repeat < 0 ? "intro + loop" : repeat == 0 ? "intro only" : strf("intro + %d x loop", repeat);
+		parts_table.add({strf("%zu", k + 1), fmt_pos(part_start), fmt_pos(total - part_start), v.loop_ofs ? fmt_pos(v.loop_samples) : "-", played});
 	}
+	if (dsp) tms57002_destroy(dsp);
 	body.push_back(0x66);
 	Bytes out(a.data.begin(), a.data.begin() + a.data_ofs);
 	size_t data_start = out.size();
@@ -2856,6 +3048,9 @@ static void usage()
 	        "  --sro-gap N            --sro: merge used ranges closer than this many words (default 0)\n"
 	        "  --gd3 keep|drop        keep the GD3 tag (default keep)\n"
 	        "  --append FILE          append FILE (repeatable) to the input and write the result: header, GD3 and volume of the\n"
+	        "  --repeat N             play the loop body of the preceding part (the input, or the last --append FILE) N times\n"
+	        "                         instead of looping there (0 = its intro only); the merged file loops on the last part that\n"
+	        "                         keeps its loop; ZSG-2: voices keyed off at the junction, the DSP runs on (reverb tail kept)\n"
 	        "                         input, loop of the last part that has one; no other processing\n"
 	        "  (no option)            rewrite the input as is (.vgm <-> .vgz, loop kept); files written as VGM 1.73 become 1.72\n"
 	        "  --volume D             set the header volume modifier (VGM 1.60+) from a gain in dB (e.g. +6dB, -3): the player\n"
@@ -2881,6 +3076,7 @@ int main(int argc, char** argv)
 	i64 sro_margin = 256, sro_gap = 0;
 	int silence = -1;   // -1: automatic (noise floor)
 	std::vector<std::string> positional, appends;
+	std::vector<int> repeats(1, -1);   // --repeat of the input, then of each --append (in order)
 	std::string color = "auto";
 	for (int i = 1; i < argc; i++)
 	{
@@ -2903,7 +3099,8 @@ int main(int argc, char** argv)
 		else if (name == "--end") value(end_s);
 		else if (name == "--loop") value(loop_s);
 		else if (name == "--gd3") value(gd3);
-		else if (name == "--append") { std::string v; value(v); appends.push_back(v); }
+		else if (name == "--append") { std::string v; value(v); appends.push_back(v); repeats.push_back(-1); }
+		else if (name == "--repeat") { std::string v; value(v); repeats.back() = atoi(v.c_str()); if (repeats.back() < 0) usage(); }
 		else if (name == "--volume")
 		{
 			std::string v; value(v);
@@ -2945,9 +3142,10 @@ int main(int argc, char** argv)
 	if (f_info || output.empty()) { info(vgm); return 0; }
 	if (!appends.empty())
 	{
-		std::vector<VGMFile> parts(1 + appends.size());
-		parts[0] = std::move(vgm);
-		for (size_t k = 0; k < appends.size(); k++) parts[k + 1].load(appends[k]);
+		std::vector<MergePart> parts(1 + appends.size());
+		parts[0].file = std::move(vgm);
+		for (size_t k = 0; k < parts.size(); k++) parts[k].repeat = repeats[k];
+		for (size_t k = 0; k < appends.size(); k++) parts[k + 1].file.load(appends[k]);
 		Bytes out = merge(parts);
 		write_output(output, out);
 		ui::ok(strf("%s written (%s)", output.c_str(), ui::bytes(out.size()).c_str()));

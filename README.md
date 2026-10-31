@@ -20,6 +20,7 @@ vgm_trim capture.vgm out.vgz --auto --split log --track all --cmp --sro --find-l
 vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --loop 30.0s --cmp --sro
 vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --volume +6dB
 vgm_trim part1.vgz merged.vgz --append part2.vgz
+vgm_trim part1.vgz merged.vgz --repeat 2 --append part2.vgz   # intro + 2 loop passes of part 1, then part 2 (its loop is kept)
 vgm_trim capture.vgm capture.vgz            # no option: rewrite as is (loop kept); 1.73 files become 1.72
 vgm_trim capture.wav tracks.wav --auto --track all --gap 3s   # a .wav input is split / cut the same way (16-bit PCM out)
 ```
@@ -40,7 +41,14 @@ so it stays lossless and reversible; `--info` prints the current value.
 `--append` (repeatable) concatenates captures: data blocks of every part first, then the command
 streams in order. The initial register image of an appended part re-creates its state at the
 junction and the ESP keeps the tail of the previous part. Header, GD3 and volume come from the
-first part, the loop from the last part that has one.
+first part, the loop from the last part that has one. `--repeat N` (after the input or after an
+`--append FILE`) plays that part's loop body N times instead of looping there (0 = its intro only), so a
+two-part song (Ray Crisis BGM 6 then 7) becomes one file: intro + N passes of part 1, then part 2 and its
+loop. ZSG-2 junctions are seamless: the voices still sounding get a 0.1 s release and ring into the
+next part (its register image is applied voice by voice when it first uses them, its idle key-offs leave
+them alone until then), and the DSP runs on, reverb tail included: the next part's state block is left
+out when its program is the one already running and only the coefficients that differ are sent through
+the host port.
 
 ZSG-2 logs (Taito FX-1B / G-NET, VGM 1.72 with a 0x110-byte header) are handled by a dedicated path: a cut re-creates the
 board gains, the DSP (simulated from the start of the capture with libvgm's TMS57002 core, a copy of
@@ -50,9 +58,23 @@ a ZSG-2 voice model; the loop detection also follows the pitch, volume, filter a
 on sustained voices (Ray Crisis plays most of a song that way, with the drums keyed from the
 first bar); the loop body is taken from the second repetition when captured (seamless loop).
 
-## gd3edit.html
+## vgmstudio.html (formerly gd3edit.html)
 
-Local, single-file GD3 tag editor (open it in Chrome for in-place saving). Japanese tags, batch
+Local, single-file tool with two modules: **Tags** (the GD3 editor below) and **Assemblage**, which chains
+parts into one file (`vgm_trim --repeat/--append` above): pick the parts among the loaded files, set the
+number of loop passes of each one (empty = the part keeps its loop, normally the last one), assemble, then
+listen to the result or to a 10 s window around each junction. The result is added to the list (its GD3 =
+the first part's, editable in Tags) and saved with the usual button. Assembling and listening need the
+local backend, which runs `vgm_trim` and `vgm2wav` (libvgm's own player, so what you hear is what any
+player plays):
+
+```sh
+python3 vgmstudio.py            # then open http://127.0.0.1:8765/  (--port, --vgm-trim, --vgm2wav)
+```
+
+Opened as a plain file, vgmstudio.html still works as the tag editor alone.
+
+The **Tags** module is a GD3 tag editor (open it in Chrome for in-place saving). Japanese tags, batch
 copy of a field to every loaded file, title from the file name (track number and extension
 stripped, shift-click for every file), `.vgm` / `.vgz`, the header volume modifier (in dB, see
 `--volume` above), the loop modifier and loop base (0x7F / 0x7E: the player plays
