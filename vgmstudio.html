@@ -104,8 +104,12 @@ canvas.wave { display: block; width: 100%; height: 56px; border: 1px solid var(-
 canvas.wave.small { height: 40px }
 .tltools { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px }
 button.mini { font-size: 12px; padding: 2px 8px }
+.jbar { display: grid; grid-template-columns: 15em minmax(0, 1fr); gap: 8px; align-items: center; padding: 2px 8px 2px 24px; border-left: 3px solid var(--ok); margin-left: 12px }
+@media (max-width: 700px) { .jbar { grid-template-columns: 1fr } }
 .jrow { display: grid; grid-template-columns: 15em minmax(0, 1fr); gap: 8px; align-items: center; margin-top: 6px }
-@media (max-width: 700px) { .jrow { grid-template-columns: 1fr } }
+@media (max-width: 700px) { .jbar { display: grid; grid-template-columns: 15em minmax(0, 1fr); gap: 8px; align-items: center; padding: 2px 8px 2px 24px; border-left: 3px solid var(--ok); margin-left: 12px }
+@media (max-width: 700px) { .jbar { grid-template-columns: 1fr } }
+.jrow { grid-template-columns: 1fr } }
 #asm select#jWin { font: inherit; padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--fg) }
 .asmbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
 .asmbar input[type=text] { flex: 1; min-width: 12em }
@@ -168,7 +172,7 @@ button.mini { font-size: 12px; padding: 2px 8px }
         <div class="asmbar"><button type="button" id="asmAdd">+ Partie</button><span class="hint" id="asmTotal"></span></div>
         <div class="asmbar"><label for="asmName" class="hint">Résultat</label><input type="text" id="asmName" placeholder="nom du fichier .vgz"><button type="button" class="primary" id="asmGo" disabled>Assembler</button><span class="hint" id="asmMsg"></span></div>
         <div>
-          <div class="asmbar"><h2>Jonctions</h2><label class="hint" for="jWin">fenêtre</label><select id="jWin"><option value="2">±2 s</option><option value="5" selected>±5 s</option><option value="10">±10 s</option></select><button type="button" id="resPlay" disabled>▶ Résultat entier</button></div>
+          <div class="asmbar"><h2>Jonctions</h2><label class="hint" for="jWin">fenêtre (aperçus et résultat)</label><select id="jWin"><option value="2">±2 s</option><option value="5" selected>±5 s</option><option value="10">±10 s</option></select><button type="button" id="resPlay" disabled>▶ Résultat entier</button></div>
           <div id="asmJunctions"></div>
         </div>
         <div class="player">
@@ -1083,11 +1087,12 @@ async function peaksOf(blob, n) {
 }
 // render a clip through the server (or take it from the cache); req = /api/render body without data
 const inflight = new Map();
-async function getRender(key, f, req, label, extra) {
+async function getRender(key, f, req, label, extra, url) {
   if (renderCache.has(key)) return renderCache.get(key);
   if (inflight.has(key)) return inflight.get(key);
   const job = (async () => {
-    const r = await postJson('/api/render', { name: f.name, data: fileData(f), ...req });
+    const r = await postJson(url || '/api/render', url ? req : { name: f.name, data: fileData(f), ...req });
+    if (r.junction != null) extra = { ...extra, marker: +r.junction };
     const pk = await peaksOf(r.blob, 1600).catch(() => ({ peaks: null, dur: 0 }));
     const e = { url: URL.createObjectURL(r.blob), f, pos: 0, label, peaks: pk.peaks, dur: pk.dur, offset: 0, marker: null, ...extra };
     renderCache.set(key, e); pruneCache();
@@ -1226,6 +1231,7 @@ function renderAsm() {
       card.appendChild(tl);
       requestAnimationFrame(() => cv._draw());
     }
+    if (k && f && partFile(asm.parts[k - 1])) box.appendChild(junctionBar(k - 1, k));
     box.appendChild(card);
   });
   asm.junctions = junctions;
@@ -1239,6 +1245,37 @@ function renderAsm() {
     $('asmName').value = uniqueName(base, asm.result);
   }
   renderResult();
+}
+// preview of a junction from the current settings, without assembling: end of part i, start of part j
+function junctionReq(i, j, w) {
+  const pa = asm.parts[i], pb = asm.parts[j], fa = partFile(pa), fb = partFile(pb), A = cutOf(fa, pa), B = cutOf(fb, pb);
+  const part = (f, p, C) => ({ name: f.name, data: fileData(f), repeat: repeatOf(p), start: C.a > 0 ? C.a : null, end: C.b < C.P.len - 1e-6 ? C.b : null });
+  const key = ['J', fileId(fa), repeatOf(pa) ?? 'L', A.a.toFixed(3), A.b.toFixed(3), fileId(fb), repeatOf(pb) ?? 'L', B.a.toFixed(3), B.b.toFixed(3), w].join('|');
+  return { key, req: () => ({ a: part(fa, pa, A), b: part(fb, pb, B), window: w }), fa, A, B };
+}
+function junctionBar(i, j) {
+  const w = +$('jWin').value, J = junctionReq(i, j, w);
+  const bar = document.createElement('div'); bar.className = 'jbar';
+  const b = document.createElement('button'); b.type = 'button'; b.className = 'mini';
+  b.textContent = '▶ enchaînement ' + (i + 1) + ' → ' + (j + 1) + ' (±' + w + ' s)';
+  b.title = 'Écouter la fin de la partie ' + (i + 1) + ' (sortie ' + fmtSec(J.A.b) + ') enchaînée au début de la partie ' + (j + 1) + ' (entrée ' + fmtSec(J.B.a) + '), sans tout assembler';
+  const cv = document.createElement('canvas'); cv.className = 'wave small';
+  cv._key = J.key;
+  cv._draw = () => { const e = renderCache.get(J.key); drawWave(cv, e, { dur: (e && e.dur) || 2 * w, marks: e && e.marker != null ? [{ t: e.marker }] : [], playhead: playingKey === J.key ? $('player').currentTime : null, empty: 'jonction ' + fmtSec(J.A.b) + ' → ' + fmtSec(J.B.a) + ' : ▶ pour l’écouter' }); };
+  const go = async from => {
+    if (!serverOk) return;
+    if (!renderCache.has(J.key)) $('playMsg').innerHTML = '<span class="spin"></span> rendu de l’enchaînement ' + (i + 1) + ' → ' + (j + 1) + '…';
+    try {
+      const e = await getRender(J.key, J.fa, J.req(), 'enchaînement ' + (i + 1) + ' → ' + (j + 1) + ' (sortie ' + fmtSec(J.A.b) + ', entrée ' + fmtSec(J.B.a) + ')', {}, '/api/junction');
+      await playKey(J.key, from);
+      cv._draw();
+    } catch (x) { $('playMsg').textContent = x.message.split('\n')[0]; }
+  };
+  b.addEventListener('click', () => go(null));
+  cv.addEventListener('click', ev => { const e = renderCache.get(J.key), r = cv.getBoundingClientRect(); go(e ? (ev.clientX - r.left) / r.width * e.dur : null); });
+  bar.append(b, cv);
+  requestAnimationFrame(() => cv._draw());
+  return bar;
 }
 async function listenPart(f, p, from, waveOnly) {
   if (!serverOk) return;
@@ -1284,7 +1321,7 @@ async function listenJunction(r, k, j, w, from) {
     renderResult();
   } catch (e) { $('playMsg').textContent = e.message.split('\n')[0]; }
 }
-$('jWin').addEventListener('change', renderResult);
+$('jWin').addEventListener('change', renderAsm);
 $('resPlay').addEventListener('click', async () => {
   const r = asm.result; if (!r) return;
   const key = 'f|' + fileId(r);
@@ -1314,7 +1351,7 @@ $('asmAdd').addEventListener('click', () => {
 async function postJson(url, body) {
   const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const ct = r.headers.get('Content-Type') || '';
-  if (ct.startsWith('audio/')) return { blob: await r.blob() };
+  if (ct.startsWith('audio/')) return { blob: await r.blob(), junction: r.headers.get('X-Junction') };
   const j = await r.json();
   if (!j.ok) throw new Error((j.error || 'erreur serveur') + (j.log ? '\n' + j.log : ''));
   return j;

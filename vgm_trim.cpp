@@ -1487,6 +1487,9 @@ static double audio_corr(const Wav& w, i64 a, i64 b, i64 n, i64 max_lag = 2000);
 // coefficients are not modelled: the coefficient updates the sound CPU sends through CLOAD land where the
 // running program reads them, so the DSP state at a cut is re-created by replaying every host write from
 // the start of the capture, with the time between them replaced by DSP pre-runs (command 0xE4 sub 8).
+static bool g_fast_dsp = false;   // --fast-dsp: approximate DSP state at a cut (previews), see ZSG2State::image
+static bool tms_state_fields(const u8* st, size_t len, std::vector<u32>& pgm, std::vector<u32>& cmem);
+
 struct TmsHost
 {
 	u8 ctrl = 3;
@@ -1690,7 +1693,43 @@ struct ZSG2State
 		};
 		auto regw = [&](u16 ofs, u16 d) { raw(u8((ofs >> 8) & 3), u8(ofs & 0xFF), d); };
 		for (auto& kv : gains) raw(6, u8(kv.first), kv.second);
-		if (mode == IMAGE_INIT && !dsp_hist.empty())
+		if (mode == IMAGE_INIT && !dsp_hist.empty() && g_fast_dsp)
+		{
+			// --fast-dsp (previews): no simulation. The last state block before the cut, with the program
+			// and coefficients the host port wrote since (CLOAD updates, PLOAD uploads), the external delay
+			// memory cleared: exact except that the reverb / delay lines refill during their first second
+			int blk = -1;
+			for (size_t k = 0; k < dsp_hist.size() && dsp_hist[k].t <= at; k++) if (dsp_hist[k].sub == 0xFF) blk = (int)k;
+			std::vector<u32> pgm, cmem;
+			if (blk >= 0 && tms_state_fields(dsp_states[dsp_hist[blk].aa].data(), dsp_states[dsp_hist[blk].aa].size(), pgm, cmem))
+			{
+				u8 ctrl = 3; bool cval = false; u8 sa = 0, pc = 0, ca = 0, host[4] = {}; int n = 0;
+				for (size_t k = blk + 1; k < dsp_hist.size() && dsp_hist[k].t <= at; k++)
+				{
+					const DspCmd& c = dsp_hist[k];
+					if (c.sub == 5) { u8 prev = ctrl; ctrl = c.data & 3; if ((prev & 1) && !(ctrl & 1)) { pc = ca = 0; n = 0; } continue; }
+					if (c.sub == 7) { cval = false; n = 0; continue; }
+					if (c.sub != 4) continue;
+					const u8 b = c.data & 0xFF;
+					const bool pload = !(ctrl & 1), cload = !(ctrl & 2);
+					if (!pload && cload) { if (!cval) { sa = b; n = 0; cval = true; } else { host[n++] = b; if (n == 4) { cmem[sa] = (u32)host[0] << 24 | host[1] << 16 | host[2] << 8 | host[3]; cval = false; n = 0; } } }
+					else if (pload) { host[n++] = b; if (n == 4) { u32 v = (u32)host[0] << 24 | host[1] << 16 | host[2] << 8 | host[3]; if (cload) cmem[ca++] = v; else pgm[pc++] = v; n = 0; } }
+				}
+				const Bytes& src = dsp_states[dsp_hist[blk].aa];
+				const size_t PGM = 204, CMEM = PGM + 1024, EXT = CMEM + 1024 + 1024 + 128;
+				Bytes st(src.begin(), src.begin() + std::min(src.size(), EXT + 4));
+				if (st.size() == EXT + 4)
+				{
+					for (int i = 0; i < 256; i++) { put_le32(&st[PGM + 4 * i], pgm[i]); put_le32(&st[CMEM + 4 * i], cmem[i]); }
+					put_le32(&st[EXT], 0);   // no external memory span: delay lines cleared
+					out.insert(out.end(), {0x67, 0x66, 0x98});
+					push_le32(out, 8 + (u32)st.size()); push_le32(out, (u32)st.size()); push_le32(out, 0);
+					out.insert(out.end(), st.begin(), st.end());
+					if (mirror) mirror->dsp_state_block(at, st.data(), st.size());
+				}
+			}
+		}
+		else if (mode == IMAGE_INIT && !dsp_hist.empty())
 		{
 			// simulate the DSP from the start of the capture (host writes, state blocks, the time in between
 			// as silent sample periods) with the player's own core, and write the resulting state as a data
@@ -2681,41 +2720,48 @@ static Bytes merge(std::vector<MergePart>& in)
 	if (loop_part && loop_part < in.size())
 		ui::warn(strf("part %zu has a loop but is not the last part: the loop will run to the end of the merged file", loop_part));
 
-	// DSP of the ZSG-2 board: the output stream is replayed on the player's core as it is written, so that
-	// the state at a junction is known (coefficient differences with the appended part)
-	TMS57002* dsp = nullptr;
-	i64 dsp_ticks = 0;
+	// DSP of the ZSG-2 board at a junction: program and coefficients only (what the appended part's state
+	// block is compared with). They come from the last state block, then the host port writes: CLOAD
+	// coefficient updates (address byte + 4 value bytes, applied by the running program within a sample
+	// period) and PLOAD uploads (program, or coefficients from 0 with CLOAD low too), as in the core
+	struct DspImage { bool known = false, dirty = false; std::vector<u32> pgm, cmem; bool cval = false; u8 sa = 0, pc = 0, ca = 0; int n = 0; u8 host[4] = {}; } dimg;
 	const u32 clock = a.zsg2_clock ? a.zsg2_clock : 25000000;
 	const double chip_rate = (double)(clock / 768);
-	const int dsp_cycles = (int)((clock / 2) / (clock / 768));
 	u8 dsp_ctrl = 3;
-	auto dsp_run_to = [&](i64 t) {
-		if (!dsp) return;
-		i64 n = (i64)(t * chip_rate / SAMPLE_RATE) - dsp_ticks;
-		if (n > 0) { tms57002_prerun(dsp, (u32)n, dsp_cycles); dsp_ticks += n; }
-	};
-	auto dsp_feed = [&](const u8* c) {   // an 0xE4 command or a 0x98 block, at time `total`
+	auto dsp_feed = [&](const u8* c) {   // an 0xE4 command or a 0x98 block
 		if (!zsg2) return;
 		if (c[0] == 0x67)
 		{
-			if (!dsp) dsp = tms57002_create();
-			dsp_run_to(total);
 			u32 len = le32(c + 3) & 0x7FFFFFFF;
-			if (len >= 8) tms57002_state_load(dsp, c + 15, len - 8);
+			if (len >= 8 && tms_state_fields(c + 15, len - 8, dimg.pgm, dimg.cmem)) { dimg.known = true; dimg.dirty = false; dimg.cval = false; dimg.n = 0; }
 			return;
 		}
-		u8 sub = c[1] & 15, aa = c[2];
-		u16 data = (u16)((c[3] << 8) | c[4]);
-		if (sub < 4 || sub == 6) return;
-		if (!dsp) dsp = tms57002_create();
-		dsp_run_to(total);
-		switch (sub)
+		u8 sub = c[1] & 15;
+		u8 data = c[4];
+		if (sub == 5)
 		{
-		case 4: tms57002_data_w(dsp, data & 0xFF); break;
-		case 5: dsp_ctrl = data & 3; tms57002_cload_w(dsp, data & 2); tms57002_pload_w(dsp, data & 1); break;
-		case 7: tms57002_reset(dsp); break;
-		case 8: tms57002_prerun(dsp, ((u32)aa << 16) | data, dsp_cycles); break;
-		default: break;
+			u8 prev = dsp_ctrl; dsp_ctrl = c[4] & 3;
+			if ((prev & 1) && !(dsp_ctrl & 1)) { dimg.pc = 0; dimg.ca = 0; dimg.n = 0; }   // PLOAD falling: upload from 0
+			return;
+		}
+		if (sub == 7) { dimg.cval = false; dimg.n = 0; return; }
+		if (sub != 4 || !dimg.known) return;
+		const bool pload = !(dsp_ctrl & 1), cload = !(dsp_ctrl & 2);
+		if (!pload && cload)
+		{
+			if (!dimg.cval) { dimg.sa = data; dimg.n = 0; dimg.cval = true; return; }
+			dimg.host[dimg.n++] = data;
+			if (dimg.n == 4) { dimg.cmem[dimg.sa] = (u32)dimg.host[0] << 24 | dimg.host[1] << 16 | dimg.host[2] << 8 | dimg.host[3]; dimg.cval = false; dimg.n = 0; }
+		}
+		else if (pload)
+		{
+			dimg.host[dimg.n++] = data;
+			if (dimg.n == 4)
+			{
+				u32 v = (u32)dimg.host[0] << 24 | dimg.host[1] << 16 | dimg.host[2] << 8 | dimg.host[3];
+				if (cload) dimg.cmem[dimg.ca++] = v; else { dimg.pgm[dimg.pc++] = v; dimg.dirty = true; }
+				dimg.n = 0;
+			}
 		}
 	};
 	ZSG2State st;   // voice model of the output stream (which voices still sound at a junction)
@@ -2785,15 +2831,13 @@ static Bytes merge(std::vector<MergePart>& in)
 			size_t blk = SIZE_MAX;
 			for (size_t i = 0; i < cmds.size() && i < first_wait; i++)
 				if (cmds[i].op == 0x67 && d[cmds[i].p + 2] == 0x98 && cmds[i].len >= 15) { blk = i; break; }
-			if (blk != SIZE_MAX && dsp)
+			if (blk != SIZE_MAX && dimg.known)
 			{
-				std::vector<u32> pgm_b, cmem_b, pgm_a, cmem_a;
-				dsp_run_to(total);
-				u32 size = tms57002_state_save(dsp, nullptr, 0);
-				Bytes st(size);
-				tms57002_state_save(dsp, st.data(), size);
+				std::vector<u32> pgm_b, cmem_b;
+				const std::vector<u32>& pgm_a = dimg.pgm;
+				const std::vector<u32>& cmem_a = dimg.cmem;
 				const Cmd& c = cmds[blk];
-				if (tms_state_fields(d + c.p + 15, c.len - 15, pgm_b, cmem_b) && tms_state_fields(st.data(), st.size(), pgm_a, cmem_a))
+				if (tms_state_fields(d + c.p + 15, c.len - 15, pgm_b, cmem_b))
 				{
 					if (pgm_a == pgm_b)
 					{
@@ -2876,7 +2920,6 @@ static Bytes merge(std::vector<MergePart>& in)
 		std::string played = !has_loop ? "once" : repeat < 0 ? "intro + loop" : repeat == 0 ? "intro only" : strf("intro + %d x loop", repeat);
 		parts_table.add({strf("%zu", k + 1), fmt_pos(part_start), fmt_pos(total - part_start), v.loop_ofs ? fmt_pos(v.loop_samples) : "-", played});
 	}
-	if (dsp) tms57002_destroy(dsp);
 	body.push_back(0x66);
 	Bytes out(a.data.begin(), a.data.begin() + a.data_ofs);
 	size_t data_start = out.size();
@@ -3094,6 +3137,7 @@ int main(int argc, char** argv)
 		else if (name == "--cmp") f_cmp = true;
 		else if (name == "--sro") f_sro = true;
 		else if (name == "--auto") f_auto = true;
+		else if (name == "--fast-dsp") g_fast_dsp = true;
 		else if (name == "--loop-pass") { std::string v; value(v); g_loop_pass = atoi(v.c_str()); }
 		else if (name == "--start") value(start_s);
 		else if (name == "--end") value(end_s);

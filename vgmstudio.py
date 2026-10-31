@@ -41,7 +41,7 @@ def vgm_info(path):
 
 SR = 44100
 
-def prepare_part(tmp, i, part, log):
+def prepare_part(tmp, i, part, log, fast=False):
     """write the part, unroll its loop (repeat N), cut it (start / end, seconds in the played part).
     Returns the path to feed the merge and whether it still loops."""
     src = write_part(tmp, i, part)
@@ -61,7 +61,7 @@ def prepare_part(tmp, i, part, log):
     s = max(0, min(s, total)); e = max(s + 1, min(e, total))
     if s == 0 and e == total: return src, loops
     c = os.path.join(tmp, f"c{i}.vgm")
-    cmd = [TOOLS["vgm_trim"], src, c, "--start", str(s), "--end", str(e), "--color", "never"]
+    cmd = [TOOLS["vgm_trim"], src, c, "--start", str(s), "--end", str(e), "--color", "never"] + (["--fast-dsp"] if fast else [])
     loop_at = total - info["loop"] if loops else None
     if loops and e == total and s < loop_at: cmd += ["--loop", str(loop_at)]   # the part keeps its loop
     else: loops = False
@@ -114,6 +114,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             if self.path == "/api/concat": self.api_concat()
+            elif self.path == "/api/junction": self.api_junction()
             elif self.path == "/api/render": self.api_render()
             else: self.send_error(404)
         except Exception as e:   # report, never crash the server
@@ -149,6 +150,50 @@ class Handler(BaseHTTPRequestHandler):
             if rc != 0 or not os.path.isfile(final): self.send_json({"ok": False, "error": "vgm_trim (sro) failed", "log": "\n".join(log)}); return
             with open(final, "rb") as f: data = f.read()
             self.send_json({"ok": True, "log": "\n".join(log), "data": base64.b64encode(data).decode(), "name": out_name, "junctions": junctions})
+        except RuntimeError as e:
+            self.send_json({"ok": False, "error": str(e), "log": "\n".join(log)})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # junction preview without assembling everything: the last `window` seconds of part A (before its out
+    # point) and the first `window` seconds of part B (after its in point), merged like the full assembly
+    # {a: part, b: part, window: s}, parts as in /api/concat -> audio/wav (the junction is at `window` s,
+    # or earlier when part A is shorter: header X-Junction gives it in seconds)
+    def api_junction(self):
+        req = self.read_json()
+        w = float(req.get("window") or 5)
+        tmp = tempfile.mkdtemp(prefix="vgmstudio_")
+        log = []
+        try:
+            A, B = dict(req["a"]), dict(req["b"])
+            # A: unrolled first (its played length is known then), then only its tail is cut
+            pa, _ = prepare_part(tmp, 0, {**A, "start": None, "end": None}, log)
+            ta = vgm_info(pa)["total"] / SR
+            a1 = ta if A.get("end") in (None, "") else min(float(A["end"]), ta)
+            a0 = max(float(A.get("start") or 0), a1 - w)
+            pa2 = os.path.join(tmp, "a_tail.vgm")
+            rc, out = run([TOOLS["vgm_trim"], pa, pa2, "--start", str(int(round(a0 * SR))), "--end", str(int(round(a1 * SR))), "--color", "never", "--fast-dsp"], tmp)
+            log.append(out)
+            if rc != 0 or not os.path.isfile(pa2): raise RuntimeError("part A: cut failed")
+            ja = vgm_info(pa2)["total"] / SR
+            b0 = float(B.get("start") or 0)
+            b1 = b0 + w if B.get("end") in (None, "") else min(float(B["end"]), b0 + w)
+            pb, _ = prepare_part(tmp, 1, {**B, "end": b1}, log, fast=True)   # previews: approximate DSP image (--fast-dsp)
+            merged = os.path.join(tmp, "j.vgm")
+            rc, out = run([TOOLS["vgm_trim"], pa2, merged, "--append", pb, "--color", "never"], tmp)
+            log.append(out)
+            if rc != 0 or not os.path.isfile(merged): self.send_json({"ok": False, "error": "vgm_trim (merge) failed", "log": "\n".join(log)}); return
+            wav = os.path.join(tmp, "j.wav")
+            rc, out = run([TOOLS["vgm2wav"], "--loops", "1", "--fade", "0", merged, wav], tmp)
+            if rc != 0 or not os.path.isfile(wav): self.send_json({"ok": False, "error": "vgm2wav failed", "log": "\n".join(log) + out}); return
+            with open(wav, "rb") as f: data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Junction", "%.6f" % ja)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
         except RuntimeError as e:
             self.send_json({"ok": False, "error": str(e), "log": "\n".join(log)})
         finally:

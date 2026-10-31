@@ -34,6 +34,11 @@ capture: same start and stop, same numbering) goes through the same silence spli
 The console output uses sections, status lines and tables; colours when stdout is a terminal
 (`--color auto|always|never`, `NO_COLOR` honoured).
 
+`--fast-dsp` (ZSG-2, used by the previews of VGM Studio) builds the DSP state at a cut from the last
+state block and the program / coefficients written since, instead of simulating the DSP from the start
+of the capture: instantaneous, exact except that the external delay memory starts empty (reverb and
+delay lines refill during their first second). Final files are always cut with the exact simulation.
+
 `--volume` sets the VGM header volume modifier (offset 0x7C, VGM 1.60+): the player applies
 2^(n/32) to its output, n = round(dB / 6.02 × 32), range -12 dB..+36 dB. The chip data is untouched,
 so it stays lossless and reversible; `--info` prints the current value.
@@ -65,7 +70,10 @@ parts into one file (`vgm_trim --repeat/--append` above): pick the parts among t
 number of loop passes of each one (empty = the part keeps its loop, normally the last one), cut each part
 like in an audio editor (in / out points typed or dragged on its waveform, click to listen from there;
 the backend unrolls the loops, cuts with `vgm_trim --start/--end`, merges, then recomputes the used ROM
-ranges), assemble, then listen to the result or to a ±2/5/10 s window around each junction (renders are cached per file and window: switching back plays at once and resumes where it was left). The result is added to the list (its GD3 =
+ranges), listen to each junction before assembling
+(between two parts, "▶ enchaînement": the last seconds of the first part chained to the first seconds of
+the next, from the current settings, rendered in about 2 s), assemble, then listen to the result or to a
+±2/5/10 s window around each junction (renders are cached per file and window: switching back plays at once and resumes where it was left). The result is added to the list (its GD3 =
 the first part's, editable in Tags) and saved with the usual button. Assembling and listening need the
 local backend, which runs `vgm_trim` and `vgm2wav` (libvgm's own player, so what you hear is what any
 player plays):
