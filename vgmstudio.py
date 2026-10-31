@@ -7,8 +7,9 @@ then open http://127.0.0.1:8765/ . Without the server, vgmstudio.html still work
 (open the file directly); the Assemblage module needs the server.
 Requests and answers are JSON; file contents travel as base64. Only loopback connections are accepted.
 """
-import argparse, base64, gzip, json, os, re, shutil, subprocess, sys, tempfile
+import argparse, base64, gzip, json, os, re, shutil, subprocess, sys, tempfile, threading, uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+import v3pack
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = {}
@@ -40,6 +41,21 @@ def vgm_info(path):
     return {"total": le(0x18), "loop": le(0x20) if le(0x1C) else 0}
 
 SR = 44100
+
+def is_v1_ext(path):
+    """True for an ES55xx / ZSG-2 file of the v1 encoding (what vgm_trim and the MAME logger write today):
+    ES5506 or ZSG-2 clock with a header shorter than 0x120. Those need vgm2wav-v1."""
+    with open(path, "rb") as f: d = f.read(0x200)
+    if d[:2] == b"\x1f\x8b":
+        with gzip.open(path, "rb") as g: d = g.read(0x200)
+    le = lambda o: int.from_bytes(d[o:o + 4], "little") if len(d) >= o + 4 else 0
+    ver = le(0x08); hdr = 0x34 + le(0x34) if ver >= 0x150 and le(0x34) else 0x40
+    return hdr < 0x120 and ((hdr > 0xD3 and le(0xD0)) or (hdr > 0x103 and le(0x100)))
+
+def vgm2wav_for(path):
+    return TOOLS["vgm2wav_v1"] if TOOLS.get("vgm2wav_v1") and is_v1_ext(path) else TOOLS["vgm2wav"]
+
+JOBS = {}   # v3 pack conversions: id -> {done, total, current, finished, report, zip, error, name}
 
 def prepare_part(tmp, i, part, log, fast=False):
     """write the part, unroll its loop (repeat N), cut it (start / end, seconds in the played part).
@@ -108,6 +124,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(204); self.end_headers()
         elif self.path == "/api/ping":
             self.send_json({"ok": True, "tools": TOOLS})
+        elif self.path.startswith("/api/v3pack/status"):
+            job = JOBS.get(self.path.partition("id=")[2])
+            if not job: self.send_json({"ok": False, "error": "unknown job"}, 404); return
+            self.send_json({"ok": True, **{k: v for k, v in job.items() if k != "zip"}, "ready": job["zip"] is not None})
+        elif self.path.startswith("/api/v3pack/result"):
+            job = JOBS.get(self.path.partition("id=")[2])
+            if not job or job["zip"] is None: self.send_error(404); return
+            self.send_bytes(job["zip"], "application/zip")
         else:
             self.send_error(404)
 
@@ -116,6 +140,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/concat": self.api_concat()
             elif self.path == "/api/junction": self.api_junction()
             elif self.path == "/api/render": self.api_render()
+            elif self.path.startswith("/api/v3pack/start"): self.api_v3pack_start()
             else: self.send_error(404)
         except Exception as e:   # report, never crash the server
             self.send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
@@ -184,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
             log.append(out)
             if rc != 0 or not os.path.isfile(merged): self.send_json({"ok": False, "error": "vgm_trim (merge) failed", "log": "\n".join(log)}); return
             wav = os.path.join(tmp, "j.wav")
-            rc, out = run([TOOLS["vgm2wav"], "--loops", "1", "--fade", "0", merged, wav], tmp)
+            rc, out = run([vgm2wav_for(merged), "--loops", "1", "--fade", "0", merged, wav], tmp)
             if rc != 0 or not os.path.isfile(wav): self.send_json({"ok": False, "error": "vgm2wav failed", "log": "\n".join(log) + out}); return
             with open(wav, "rb") as f: data = f.read()
             self.send_response(200)
@@ -222,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
             fade = req.get("fade")
             if fade is None: fade = 0 if (start is not None or end is not None or vgm_info(src)["loop"] == 0) else 8
             wav = os.path.join(tmp, "out.wav")
-            rc, out = run([TOOLS["vgm2wav"], "--loops", str(loops), "--fade", str(float(fade)), src, wav], tmp)
+            rc, out = run([vgm2wav_for(src), "--loops", str(loops), "--fade", str(float(fade)), src, wav], tmp)
             if rc != 0 or not os.path.isfile(wav): self.send_json({"ok": False, "error": "vgm2wav failed", "log": "\n".join(log) + out}); return
             with open(wav, "rb") as f: data = f.read()
             self.send_bytes(data, "audio/wav")
@@ -231,14 +256,43 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    # body = the pack zip (application/zip), ?name=<file name>&verify=0|1 -> {id}; then poll
+    # GET /api/v3pack/status?id= and fetch GET /api/v3pack/result?id= (the converted zip)
+    def api_v3pack_start(self):
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(self.path).query)
+        n = int(self.headers.get("Content-Length") or 0)
+        data = self.rfile.read(n)
+        jid = uuid.uuid4().hex
+        job = {"done": 0, "total": 0, "current": "", "finished": False, "report": [], "zip": None, "error": None,
+               "name": (q.get("name") or ["pack.zip"])[0]}
+        JOBS[jid] = job
+        verify = (q.get("verify") or ["1"])[0] != "0"
+        tools = {"vgm_v3conv": TOOLS["vgm_v3conv"], "vgm2wav_v1": TOOLS["vgm2wav_v1"], "vgm2wav": TOOLS["vgm2wav"]}
+        def work():
+            def prog(d, t, name): job.update(done=d, total=t, current=name)
+            try:
+                z, report = v3pack.convert_pack(data, tools=tools, verify=verify, progress=prog)
+                job.update(report=report, zip=z)
+                if z is None: job["error"] = "conversion refusée : au moins une piste en erreur"
+            except Exception as e:
+                job["error"] = f"{type(e).__name__}: {e}"
+            job["finished"] = True
+        threading.Thread(target=work, daemon=True).start()
+        self.send_json({"ok": True, "id": jid})
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--vgm-trim", help="path of vgm_trim (default: next to this script, then PATH)")
-    ap.add_argument("--vgm2wav", help="path of vgm2wav (default: ../libvgm/build/bin/vgm2wav, then PATH)")
+    ap.add_argument("--vgm2wav", help="path of vgm2wav, v3 player (default: ../libvgm/build/bin/vgm2wav, then PATH)")
+    ap.add_argument("--vgm2wav-v1", help="path of the v1 player (default: bin/vgm2wav-v1 next to this script)")
+    ap.add_argument("--vgm-v3conv", help="path of vgm_v3conv (default: next to this script)")
     a = ap.parse_args()
     TOOLS["vgm_trim"] = find_tool("vgm_trim", a.vgm_trim, [os.path.join(HERE, "vgm_trim")])
     TOOLS["vgm2wav"] = find_tool("vgm2wav", a.vgm2wav, [os.path.join(HERE, "..", "libvgm", "build", "bin", "vgm2wav"), os.path.join(HERE, "vgm2wav")])
+    TOOLS["vgm2wav_v1"] = find_tool("vgm2wav-v1", a.vgm2wav_v1, [os.path.join(HERE, "bin", "vgm2wav-v1")])
+    TOOLS["vgm_v3conv"] = find_tool("vgm_v3conv", a.vgm_v3conv, [os.path.join(HERE, "vgm_v3conv")])
     for k, v in TOOLS.items():
         if not v: sys.exit(f"{k} not found: pass --{k.replace('_', '-')} PATH")
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)

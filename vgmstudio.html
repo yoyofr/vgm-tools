@@ -115,6 +115,16 @@ button.mini { font-size: 12px; padding: 2px 8px }
 .asmbar input[type=text] { flex: 1; min-width: 12em }
 #asmLog { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; max-height: 260px; overflow: auto; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--muted) }
 #asmLog:empty { display: none }
+#v3 { padding: 16px; display: grid; gap: 14px; max-width: 900px }
+#v3 h2 { font-size: 14px; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-weight: 600 }
+#v3drop { margin: 0; padding: 22px; cursor: pointer }
+#v3 progress { width: 100%; height: 8px; accent-color: var(--accent) }
+#v3tbl { width: 100%; border-collapse: collapse; font-size: 13px }
+#v3tbl td { padding: 4px 8px; border-top: 1px solid var(--line); vertical-align: top }
+#v3tbl td.st { font-family: var(--mono); font-size: 12px; white-space: nowrap }
+#v3tbl td.lg { font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: pre-wrap; word-break: break-word }
+#v3tbl:empty { display: none }
+#v3 label.chk { display: flex; gap: 6px; align-items: center }
 .player { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 6px }
 .player audio { width: 100%; height: 36px }
 .player .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
@@ -126,7 +136,7 @@ button.mini { font-size: 12px; padding: 2px 8px }
 <body>
 <header>
   <div>
-    <div class="titlebar"><h1>VGM Studio</h1><nav class="tabs" id="tabs"><button type="button" data-mod="tags" class="on">Tags</button><button type="button" data-mod="asm">Assemblage</button></nav><span id="srv" class="hint" title="Serveur local vgmstudio.py : assemblage et écoute"></span></div>
+    <div class="titlebar"><h1>VGM Studio</h1><nav class="tabs" id="tabs"><button type="button" data-mod="tags" class="on">Tags</button><button type="button" data-mod="asm">Assemblage</button><button type="button" data-mod="v3">Conversion v3</button></nav><span id="srv" class="hint" title="Serveur local vgmstudio.py : assemblage et écoute"></span></div>
     <div id="status">Ouvre des fichiers .vgm ou .vgz. Les tags japonais sont en UTF-16, saisie directe.</div>
   </div>
   <div class="toolbar">
@@ -161,6 +171,19 @@ button.mini { font-size: 12px; padding: 2px 8px }
       <div class="row single"><label for="loopMul">Boucles</label><div class="volbox"><span>×</span><input type="number" id="loopMul" step="0.25" min="0.0625" max="15.9375" placeholder="1"><span>−</span><input type="number" id="loopBase" step="1" min="-128" max="127" placeholder="0"><span id="loopHint"></span></div><button class="all" id="loopAll">→ tous</button></div>
     </div>
     <div id="info"></div>
+    </div>
+    <div class="mod" id="mod-v3" hidden>
+      <div id="v3">
+        <div>
+          <h2>Convertir un pack en v3</h2>
+          <div class="hint">Le zip d’un pack ES55xx (Taito F3…) ou ZSG-2 (Taito Zoom) écrit avec l’ancien encodage (v1) est converti piste par piste vers la proposition v3 (numéros libérés pour les Namco WSG du PR #151 de libvgm). Chaque piste est vérifiée : rendu v1 (vgm2wav-v1) et rendu v3 (vgm2wav) doivent être identiques octet pour octet, sinon le zip n’est pas produit. Les autres fichiers du pack (m3u, txt, png, opus…) sont recopiés tels quels, même ordre, mêmes noms.</div>
+        </div>
+        <div class="drop" id="v3drop" tabindex="0">Glisser le zip du pack ici, ou cliquer pour le choisir</div>
+        <input id="v3pick" type="file" accept=".zip" hidden>
+        <div class="asmbar"><label class="chk hint"><input type="checkbox" id="v3verify" checked> vérifier par rendu (recommandé)</label><button type="button" class="primary" id="v3go" disabled>Convertir</button><button type="button" id="v3save" disabled>Enregistrer le zip v3…</button><span class="hint" id="v3msg"></span></div>
+        <progress id="v3prog" value="0" max="1" hidden></progress>
+        <table id="v3tbl"></table>
+      </div>
     </div>
     <div class="mod" id="mod-asm" hidden>
       <div id="asm">
@@ -1035,7 +1058,7 @@ document.addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.ke
 let serverOk = false;
 function showModule(m) {
   for (const b of $('tabs').querySelectorAll('button')) b.classList.toggle('on', b.dataset.mod === m);
-  $('mod-tags').hidden = m !== 'tags'; $('mod-asm').hidden = m !== 'asm';
+  $('mod-tags').hidden = m !== 'tags'; $('mod-asm').hidden = m !== 'asm'; $('mod-v3').hidden = m !== 'v3';
   try { localStorage.setItem('vgmstudio.module', m); } catch (e) {}
   if (m === 'asm') renderAsm();
 }
@@ -1046,6 +1069,7 @@ async function pingServer() {
   $('srv').textContent = serverOk ? 'serveur local : connecté' : 'serveur local absent : lance « python3 vgmstudio.py » et ouvre http://127.0.0.1:8765/ pour assembler et écouter';
   $('srv').className = serverOk ? 'hint ok' : 'hint warn';
   renderAsm();
+  if (typeof v3Buttons === 'function') v3Buttons();
 }
 function totalOf(b) { return le32(b, 0x18); }
 function loopOf(b) { return le32(b, 0x1C) ? le32(b, 0x20) : 0; }
@@ -1385,6 +1409,68 @@ $('asmGo').addEventListener('click', async () => {
     $('asmMsg').className = 'hint ok';
   } catch (e) { $('asmMsg').textContent = e.message.split('\n')[0]; $('asmMsg').className = 'hint warn'; $('asmLog').textContent = e.message; }
   renderAsm();
+});
+// ---- Conversion v3: pack zip -> vgmstudio.py /api/v3pack (vgm_v3conv + render check) ----
+const v3 = { file: null, job: null, zipName: '' };
+function v3SetFile(f) {
+  if (!f || !/\.zip$/i.test(f.name)) { $('v3msg').textContent = 'un fichier .zip est attendu'; $('v3msg').className = 'hint warn'; return; }
+  v3.file = f; v3.job = null;
+  $('v3drop').textContent = f.name + ' (' + (f.size / 1048576).toFixed(1) + ' Mo)';
+  $('v3msg').textContent = ''; $('v3tbl').innerHTML = ''; $('v3prog').hidden = true; $('v3save').disabled = true;
+  v3Buttons();
+}
+function v3Buttons() { $('v3go').disabled = !v3.file || !serverOk || (v3.job && !v3.job.finished); }
+$('v3drop').addEventListener('click', () => $('v3pick').click());
+$('v3drop').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('v3pick').click(); } });
+$('v3pick').addEventListener('change', () => { if ($('v3pick').files[0]) v3SetFile($('v3pick').files[0]); $('v3pick').value = ''; });
+$('v3drop').addEventListener('dragover', e => { e.preventDefault(); e.stopPropagation(); $('v3drop').classList.add('over'); });
+$('v3drop').addEventListener('dragleave', () => $('v3drop').classList.remove('over'));
+$('v3drop').addEventListener('drop', e => { e.preventDefault(); e.stopPropagation(); $('v3drop').classList.remove('over'); if (e.dataTransfer.files[0]) v3SetFile(e.dataTransfer.files[0]); });
+function v3Table(report) {
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+  $('v3tbl').innerHTML = report.map(r => {
+    const st = r.status === 'error' ? '<span class="warn">ERREUR</span>' : r.status === 'copied' ? 'copié' : r.verified ? '<span class="ok">v3 ✓ identique</span>' : 'v3 (non vérifié)';
+    const lg = r.status === 'converted' && r.verified ? (r.seconds ? fmtTime(r.seconds * 44100) + ' rendus, ' : '') + 'rendus v1 et v3 identiques' : (r.log || '').split('\n').slice(r.status === 'error' ? 0 : 1).join('\n');
+    return '<tr><td>' + esc(r.name) + '</td><td class="st">' + st + '</td><td class="lg">' + esc(lg) + '</td></tr>';
+  }).join('');
+}
+$('v3go').addEventListener('click', async () => {
+  if (!v3.file) return;
+  $('v3go').disabled = true; $('v3save').disabled = true; $('v3tbl').innerHTML = '';
+  $('v3msg').innerHTML = '<span class="spin"></span> envoi…'; $('v3msg').className = 'hint';
+  try {
+    const r = await fetch('/api/v3pack/start?name=' + encodeURIComponent(v3.file.name) + '&verify=' + ($('v3verify').checked ? 1 : 0),
+      { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: v3.file });
+    const j = await r.json(); if (!j.ok) throw new Error(j.error || 'erreur serveur');
+    v3.job = { id: j.id, finished: false };
+    $('v3prog').hidden = false; $('v3prog').value = 0;
+    for (;;) {
+      await new Promise(res => setTimeout(res, 700));
+      const s = await (await fetch('/api/v3pack/status?id=' + j.id, { cache: 'no-store' })).json();
+      if (!s.ok) throw new Error(s.error || 'job perdu');
+      $('v3prog').max = s.total || 1; $('v3prog').value = s.done;
+      if (!s.finished) { $('v3msg').innerHTML = '<span class="spin"></span> ' + (s.total ? s.done + ' / ' + s.total + ' pistes' + ($('v3verify').checked ? ' (conversion + 2 rendus chacune)' : '') : 'lecture du zip…'); continue; }
+      v3.job.finished = true;
+      v3Table(s.report || []);
+      if (s.error) { $('v3msg').textContent = s.error; $('v3msg').className = 'hint warn'; break; }
+      const n = (s.report || []).filter(x => x.status === 'converted').length, c = (s.report || []).filter(x => x.status === 'copied').length;
+      $('v3msg').textContent = n + ' piste(s) converties' + (c ? ', ' + c + ' recopiée(s) sans changement' : '') + ($('v3verify').checked ? ', toutes vérifiées' : '') + '.';
+      $('v3msg').className = 'hint ok';
+      v3.zipName = v3.file.name.replace(/\.zip$/i, '') + ' (v3).zip';
+      $('v3save').disabled = false;
+      break;
+    }
+  } catch (e) { $('v3msg').textContent = e.message; $('v3msg').className = 'hint warn'; }
+  if (v3.job) v3.job.finished = true;
+  v3Buttons();
+});
+$('v3save').addEventListener('click', async () => {
+  if (!v3.job) return;
+  try {
+    const r = await fetch('/api/v3pack/result?id=' + v3.job.id, { cache: 'no-store' });
+    if (!r.ok) throw new Error('résultat indisponible (serveur redémarré ?)');
+    await saveBlob(await r.blob(), v3.zipName);
+  } catch (e) { if (e.name !== 'AbortError') { $('v3msg').textContent = e.message; $('v3msg').className = 'hint warn'; } }
 });
 window.addEventListener('resize', () => { for (const c of document.querySelectorAll('canvas.wave')) if (c._draw) c._draw(); drawNow(); });
 pingServer();

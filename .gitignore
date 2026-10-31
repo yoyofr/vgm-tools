@@ -9,3 +9,5 @@
 *.zip
 __pycache__/
 .DS_Store
+/bin/
+/vgm_v3conv

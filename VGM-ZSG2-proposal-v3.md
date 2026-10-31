@@ -43,7 +43,7 @@ game: the block is logged at the first key-on and again (changed range only) whe
 | Command | Meaning |
 |---|---|
 | `0x4D cc dd` | host data write (program upload under PLOAD, coefficient upload and updates under CLOAD). |
-| `0x4E cc ll` | control lines: bit 0 = PLOAD, bit 1 = CLOAD (levels, active low as on the pins), bit 2 = reset pulse. Lines are set CLOAD first, PLOAD second, as the board does. |
+| `0x4E cc ll` | control lines: bit 0 = PLOAD, bit 1 = CLOAD (levels, active low as on the pins), bit 2 = DSP reset pulse (bits 0-1 ignored in that case). Lines are set CLOAD first, PLOAD second, as the board does. |
 | `0xCD cc nnnn` | run nnnn sample periods with silent inputs, output discarded. Re-creates the program-internal state at a cut point or at a restarted capture (coefficient updates landing where the running program reads them, LFO phases). Repeated for longer spans. |
 
 cc bit 7 = second chip, other bits 0.
@@ -54,7 +54,7 @@ Shared with the ES55xx proposal:
 
 | Command | Meaning |
 |---|---|
-| `0xE3 tt cc gggg` | output gain: channel cc of chip tt into the final mix, big-endian 8.8 (0x0100 = unity, default). Even channels left, odd channels right. Channels 0x80+ii are the serial inputs of a DSP (input attenuation). |
+| `0xE3 tt cc gggg` | output gain: channel cc of chip tt into the final mix, big-endian 8.8 (0x0100 = unity, default). Even channels left, odd channels right. Channels 0x80+ii are the serial inputs of a DSP (input attenuation). Implemented for the Taito Zoom wiring: TMS57002 output n to the side of its parity, ZSG-2 output n direct to the side of its parity. |
 | `0xE2 dd ii ss cc` | serial routing: input ii of DSP dd takes output channel cc of chip ss. |
 
 Taito Zoom wiring:

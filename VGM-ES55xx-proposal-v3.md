@@ -20,7 +20,8 @@ Existing commands, kept, with the semantics written down:
 | `0xBE aa dd` | 8-bit write. ES5506: register aa >> 2, byte lane aa & 3, big endian, lane 3 commits the 32-bit latch. ES5505: register aa >> 1, lane aa & 1. aa bit 7 = second chip. |
 | `0xD6 aa ddee` | 16-bit write, big endian: dd to lane aa, ee to lane aa + 1. aa bit 7 = second chip. |
 
-Dropped: the VGMPlay convention `0xBE 0x40+voice dd` (external bank). Values aa >= 0x40 are ordinary lanes.
+Dropped for writers: the VGMPlay convention `0xBE 0x40+voice dd` (external bank), replaced by `0x49`. The
+register lanes stop at 0x3F, so players keep decoding it for files made by older loggers.
 
 Header fields of 1.71 unchanged: clock at 0xD0 (bit 31 = ES5506, clear = ES5505; bit 30 = dual), channel
 count at 0xD5.
@@ -62,7 +63,7 @@ Verified output-neutral in the first implementation.
 ## 5. ES5510 ESP as a chip
 
 New header entry: ES5510 clock (bit 30 = dual) at 0x114, after the Namco WSG fields (0x100-0x10C) and the
-ZSG-2 clock (0x110), plus one flags byte at 0x11C: bits 0-3 = log2(DRAM words) - 16 (0 = 1M words, MAME's
+ZSG-2 clock (0x110), plus one byte at 0x11C: log2 of the DRAM size in words, 0 = default (1M words, MAME's
 value). Chip ID 0x35. Players
 only read the field when the header is long enough, as for every earlier addition.
 
@@ -80,15 +81,15 @@ the sampler outputs. Rather than ES5506-specific sub-commands, two commands any 
 
 | Command | Meaning |
 |---|---|
-| `0xE3 tt cc gggg` | output gain: channel cc of chip tt into the final mix, gggg big-endian 8.8 (0x0100 = unity, the default for every channel). Even channels go left, odd channels right. |
-| `0xE2 dd ii ss cc` | serial routing: input ii of DSP chip dd takes output channel cc of chip ss. |
+| `0xE3 tt cc gggg` | output gain: channel cc of chip tt, gggg big-endian 8.8 (0x0100 = unity, the default for every channel). Even channels go left, odd channels right. The gain applies to the channel wherever it goes (direct mix and DSP input). cc 0xFE / 0xFF: gain of the chip's direct mix bus, left / right (board stage after the channel gains). |
+| `0xE2 dd ii ss cc` | serial routing: input ii of DSP chip dd takes output channel cc of chip ss (cc 0xFF = nothing). A channel wired to a DSP input leaves the direct mix. |
 
 tt / dd / ss = VGM chip ID (the numbering of the DAC stream control and the extra header), bit 7 = second
 instance.
 
-Taito F3 example: pair 0 direct (`0xE3 0x25 00 gg`, `0xE3 0x25 01 gg`), pairs 1-3 into the ESP
-(`0xE2 0x35 ii 0x25 cc` for ii = 0-5, gain 0 on channels 2-11), ESP outputs 6/7 to the mix
-(`0xE3 0x35 06 gg`, `0xE3 0x35 07 gg`). The logger writes the product of the board stages (route gain x
+Taito F3 example: pair 0 direct, pairs 1-3 into the ESP (`0xE2 0x35 ii 0x25 ii+2` for ii = 0-5),
+channel gains `0xE3 0x25 cc gg` (cc = 0-7), direct bus `0xE3 0x25 FE gg` / `FF gg`, ESP outputs 6/7 to the
+mix (`0xE3 0x35 06 gg`, `0xE3 0x35 07 gg`). The logger writes the product of the board stages (route gain x
 MB87078 attenuator), so gains follow the game's volume changes at run time.
 
 This replaces, from the first proposal: the ESP routing preset, the direct-mix flag, the per-input and
@@ -108,8 +109,10 @@ per-output routing sub-commands and the ES5506-only gain command.
 | `0xD8 03 o side` | `0xE3 0x35 o gain` |
 | `0xD8 04 c flag` | `0xE3 0x25 c gain` |
 | `0xD8 05 preset` | expanded into `0xE2` / `0xE3` |
-| `0xD8 06 0 n` | header flags byte 0x11C |
-| `0xE3 pp cc gggg` | `0xE3 tt cc gggg` |
+| `0xD8 06 0 n` | header byte 0x11C = n |
+| `0xE3 pp cc gggg`, cc 0-11 | `0xE3 0x25 cc gggg` |
+| `0xE3 pp 0x10/0x11 gggg` (ESP out) | `0xE3 0x35 06/07 gggg` |
+| `0xE3 pp 0x12/0x13 gggg` (direct bus) | `0xE3 0x25 FE/FF gggg` |
 | block `0x90` with region bits / 8-bit flag | blocks `0x90` / `0x99` / `0x9A` / `0x9B`, 16-bit data |
 
 All of it is table-driven on our side (logger emission, libvgm command and block tables, vgm_trim

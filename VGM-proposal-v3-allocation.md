@@ -39,7 +39,7 @@ the generic board commands `0xE2` / `0xE3`.
 | 0x110 | ZSG-2 clock, bit 30 = dual |
 | 0x114 | ES5510 clock, bit 30 = dual |
 | 0x118 | TMS57002 clock, bit 30 = dual |
-| 0x11C | ES5510 flags: bits 0-3 = log2(DRAM words) - 16 (0 = 1M words) |
+| 0x11C | ES5510 DRAM size: log2 of the size in words, 0 = default (1M words, MAME's value) |
 | 0x11D-0x11F | reserved, 0 |
 
 Header length 0x120 for a file using the ES55xx / Zoom fields (the data offset at 0x34 says how long the
@@ -68,7 +68,7 @@ Free in libvgm master today: 0x45-0x4E (2 operands), 0xCA-0xCF and 0xD7-0xDF (3 
 | `0xCC cc aa dd` | ES5510 host write | `0xCA` |
 | `0xCD cc nnnn` | TMS57002 pre-run (nnnn silent sample periods) | `0xCB` |
 | `0xE2 dd ii ss cc` | generic serial routing | unchanged |
-| `0xE3 tt cc gggg` | generic output gain (8.8) | unchanged |
+| `0xE3 tt cc gggg` | generic output gain (8.8); cc 0xFE / 0xFF = the chip's direct mix bus, left / right | unchanged + bus channels |
 | `0xE4 oooo dddd` | ZSG-2 register write | unchanged |
 
 The 2-operand range 0x41-0x4E is full after this. If that is a problem, `0x4B`, `0x4C` and `0x4E`
@@ -93,7 +93,7 @@ Block `0x98` is left free.
 themselves), but a C30 in stereo or the quadraphonic Pole Position chip can use `0xE3 0x32 cc gggg` /
 `0xE3 0x33 cc gggg` for board-level balance, with no new opcode.
 
-## 6. Conversion of existing files (`vgm_trim --convert v3`)
+## 6. Conversion of existing files (`vgm_v3conv`, `v3pack.py`, VGM Studio)
 
 The released ES55xx and ZSG-2 packs use the **v1** encoding (what our MAME logger and libvgm `es55xx`
 branch implement today): ES5506 `0xBE 0x40+v`, `0xD7`, `0xD8`, `0xE3 pp`; ZSG-2 `0xE4 ss aa dddd`, clock
@@ -126,10 +126,12 @@ v3.
 
 ### Packs
 
-`vgm_trim --convert v3 --pack "Game.zip" -o "Game (v3).zip"`: every `.vgm` / `.vgz` in the zip is
-converted (gzip kept when the input was gzipped); `.m3u`, `.txt`, `.png` and file names copied unchanged;
-the zip is rebuilt stored, same order, like the gd3edit / VGM Studio pack generator. A folder of loose
-files works the same way (`--pack dir/`).
+- One file: `vgm_v3conv in.vgz out.vgz` (exit 0 = converted, 2 = nothing to convert, copied; 1 = error,
+  with the reason: an unrepresentable v1 command is refused, never approximated).
+- A pack: `python3 v3pack.py "Game.zip" ["Game (v3).zip"]`, or the **Conversion v3** tab of VGM Studio
+  (drop the zip, convert, save). Every `.vgm` / `.vgz` in the zip is converted (gzip kept);
+  `.m3u`, `.txt`, `.png`, `.opus` and file names, order and dates are copied unchanged; the zip is
+  rebuilt stored like the VGM Studio pack generator.
 
 ### Verification (mandatory, per file)
 
@@ -140,10 +142,13 @@ of the tool (100 % faithful, no lossy step).
 
 ### Implementation order
 
-1. libvgm (branch `es55xx` -> `vgm-v3`): command and block tables, header fields at 0x110-0x11C, new chip
-   IDs; v1 decoding kept under a compile switch only for `vgm2wav-v1`.
-2. vgm_trim: v3 parser and emitter (all trim / loop / cmp / sro logic is state-based, unchanged),
-   `--convert v3`, `--pack`.
+1. libvgm, branch `vgm-v3` (= `es55xx` + PR #151 merged): command and block tables, header fields at
+   0x110-0x11C, ZSG-2 = DEVID 0x34. The v3 commands drive the same core entry points as v1, which is
+   what makes the byte comparison meaningful. `vgm2wav-v1` = a build of the `es55xx` branch, kept in
+   `vgm-tools/bin/`. Done 2026-10-31.
+2. `vgm_v3conv` + `v3pack.py` + VGM Studio tab. Done 2026-10-31. Then vgm_trim: v3 parser and emitter (all
+   trim / loop / cmp / sro logic is state-based, unchanged); until then vgm_trim and the Assemblage work
+   on v1 files only, and VGM Studio renders v1 files with `vgm2wav-v1`.
 3. MAME logger (`vgmlog0288-es5506`): emit v3 (the same tables). Optionally merge cam900's WSG logging
    from `mao_vgm` so WSG games can be captured from the same build.
 4. Convert and verify every released pack (Darius Gaiden, Gunlock, Elevator Action Returns, Ray Storm,
