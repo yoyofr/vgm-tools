@@ -43,7 +43,7 @@ def vgm_info(path):
 SR = 44100
 
 def is_v1_ext(path):
-    """True for an ES55xx / ZSG-2 file of the v1 encoding (what vgm_trim and the MAME logger write today):
+    """True for an ES55xx / ZSG-2 file of the v1 encoding (what the MAME logger writes today; vgm_trim keeps the encoding of its input):
     ES5506 or ZSG-2 clock with a header shorter than 0x120. Those need vgm2wav-v1."""
     with open(path, "rb") as f: d = f.read(0x200)
     if d[:2] == b"\x1f\x8b":

@@ -146,9 +146,11 @@ of the tool (100 % faithful, no lossy step).
    0x110-0x11C, ZSG-2 = DEVID 0x34. The v3 commands drive the same core entry points as v1, which is
    what makes the byte comparison meaningful. `vgm2wav-v1` = a build of the `es55xx` branch, kept in
    `vgm-tools/bin/`. Done 2026-10-31.
-2. `vgm_v3conv` + `v3pack.py` + VGM Studio tab. Done 2026-10-31. Then vgm_trim: v3 parser and emitter (all
-   trim / loop / cmp / sro logic is state-based, unchanged); until then vgm_trim and the Assemblage work
-   on v1 files only, and VGM Studio renders v1 files with `vgm2wav-v1`.
+2. `vgm_v3conv` + `v3pack.py` + VGM Studio tab. Done 2026-10-31. vgm_trim reads both encodings: a v3
+   input is converted to v1 in memory (`vgm_v3.h`, the exact inverse mapping; `vgm_v3conv --to-v1` does
+   the same on a file), processed by the unchanged v1 logic, and written back as v3. Done 2026-10-31
+   (v3 -> v1 -> v3 gives back every converted pack file byte for byte; trims of the v1 and v3 versions
+   of a file render identically). VGM Studio renders v1 files with `vgm2wav-v1`, v3 files with `vgm2wav`.
 3. MAME logger (`vgmlog0288-es5506`): emit v3 (the same tables). Optionally merge cam900's WSG logging
    from `mao_vgm` so WSG games can be captured from the same build.
 4. Convert and verify every released pack (Darius Gaiden, Gunlock, Elevator Action Returns, Ray Storm,

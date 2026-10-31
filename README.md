@@ -10,6 +10,8 @@ Post-processing for raw MAME VGM captures: cut, split a session into tracks on s
 points from the note-on sequence (the loop starts where the song becomes periodic: everything
 before, intro or build-up, is kept), drop register writes that do not change the chip state, keep only
 the sample ROM ranges that are played, upgrade the header to VGM 1.72, read and write `.vgz`.
+ES55xx / ZSG-2 files of both encodings are accepted (v1, and v3 of `VGM-proposal-v3-allocation.md`): a v3
+input is converted to v1 in memory and the output written back as v3 (`vgm_v3.h`, lossless both ways).
 
 ```sh
 c++ -O2 -std=c++17 -o vgm_trim vgm_trim.cpp libvgm/emu/cores/tms57002.cpp -lz   # the DSP core is a copy of libvgm's

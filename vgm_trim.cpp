@@ -3,6 +3,7 @@
 // Output ending in .vgz is gzip-compressed (zlib).
 //
 // build: c++ -O2 -std=c++17 -o vgm_trim vgm_trim.cpp libvgm/emu/cores/tms57002.cpp -lz
+// v1 and v3 encodings of the ES55xx / ZSG-2 additions are both read; a v3 input gives a v3 output
 //
 // usage:
 //   vgm_trim in.vgm out.vgz --start 18.2s --end 1:05.5 [--loop 30.0s] [--cmp] [--sro]
@@ -27,6 +28,7 @@
 #include <strings.h>
 #include <cstdarg>
 #include <initializer_list>
+#include "vgm_v3.h"                 // v1 <-> v3 encoding of the ES55xx / ZSG-2 additions
 #include "libvgm/emu/cores/tms57002.h"   // DSP core of libvgm (copy kept in sync): simulates the TMS57002 at a cut point
 #include <unistd.h>
 
@@ -223,6 +225,10 @@ static void wait_cmd(Bytes& out, i64 n)
 // ---------------------------------------------------------------------------------------------
 struct Cmd { size_t p; u8 op; size_t len; i64 t; };
 
+// the ES55xx / ZSG-2 logic works on the v1 encoding: a v3 input is converted to v1 when loaded, and
+// the output is converted back to v3 when written (lossless both ways, see vgm_v3.h)
+static bool g_v3_output = false;
+
 struct VGMFile
 {
 	Bytes data;
@@ -258,6 +264,12 @@ struct VGMFile
 			n = (long)data.size();
 		}
 		if (n < 0x40 || memcmp(data.data(), "Vgm ", 4) != 0) die("not a VGM file");
+		if (vgmv3::is_v3_ext(data))
+		{
+			try { data = vgmv3::to_v1(data); }
+			catch (const std::exception& e) { die(path + ": " + e.what()); }
+			g_v3_output = true;
+		}
 		version = le32(&data[0x08]);
 		eof = le32(&data[0x04]) + 0x04;
 		gd3 = le32(&data[0x14]);
@@ -2947,8 +2959,16 @@ static Bytes merge(std::vector<MergePart>& in)
 	return out;
 }
 
-static void write_output(const std::string& path, const Bytes& out)
+static void write_output(const std::string& path, const Bytes& out_v1)
 {
+	Bytes v3;
+	if (g_v3_output)
+	{
+		int kind;
+		try { v3 = vgmv3::to_v3(out_v1, kind); }
+		catch (const std::exception& e) { die(path + ": v3 output: " + e.what()); }
+	}
+	const Bytes& out = g_v3_output ? v3 : out_v1;
 	if (ends_with_nocase(path, ".vgz"))
 	{
 		gzFile g = gzopen(path.c_str(), "wb9");
