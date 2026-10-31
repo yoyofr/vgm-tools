@@ -175,12 +175,12 @@ button.mini { font-size: 12px; padding: 2px 8px }
     <div class="mod" id="mod-v3" hidden>
       <div id="v3">
         <div>
-          <h2>Convertir un pack en v3</h2>
-          <div class="hint">Le zip d’un pack ES55xx (Taito F3…) ou ZSG-2 (Taito Zoom) écrit avec l’ancien encodage (v1) est converti piste par piste vers la proposition v3 (numéros libérés pour les Namco WSG du PR #151 de libvgm). Chaque piste est vérifiée : rendu v1 (vgm2wav-v1) et rendu v3 (vgm2wav) doivent être identiques octet pour octet, sinon le zip n’est pas produit. Les autres fichiers du pack (m3u, txt, png, opus…) sont recopiés tels quels, même ordre, mêmes noms.</div>
+          <h2>Convertir en v3 (pack ou fichiers)</h2>
+          <div class="hint">Le zip d’un pack ES55xx (Taito F3…) ou ZSG-2 (Taito Zoom) écrit avec l’ancien encodage (v1) est converti piste par piste vers la proposition v3 (numéros libérés pour les Namco WSG du PR #151 de libvgm). Chaque piste est vérifiée : rendu v1 (vgm2wav-v1) et rendu v3 (vgm2wav) doivent être identiques octet pour octet, sinon le zip n’est pas produit. Les autres fichiers du pack (m3u, txt, png, opus…) sont recopiés tels quels, même ordre, mêmes noms. On peut aussi déposer un ou plusieurs .vgz / .vgm isolés : un fichier seul est enregistré sous son nom suivi de « (v3) », plusieurs fichiers sont écrits sous leurs noms d’origine dans un dossier à choisir.</div>
         </div>
-        <div class="drop" id="v3drop" tabindex="0">Glisser le zip du pack ici, ou cliquer pour le choisir</div>
-        <input id="v3pick" type="file" accept=".zip" hidden>
-        <div class="asmbar"><label class="chk hint"><input type="checkbox" id="v3verify" checked> vérifier par rendu (recommandé)</label><button type="button" class="primary" id="v3go" disabled>Convertir</button><button type="button" id="v3save" disabled>Enregistrer le zip v3…</button><span class="hint" id="v3msg"></span></div>
+        <div class="drop" id="v3drop" tabindex="0">Glisser le zip du pack ou des .vgz / .vgm ici, ou cliquer pour les choisir</div>
+        <input id="v3pick" type="file" accept=".zip,.vgz,.vgm" multiple hidden>
+        <div class="asmbar"><label class="chk hint"><input type="checkbox" id="v3verify" checked> vérifier par rendu (recommandé)</label><button type="button" class="primary" id="v3go" disabled>Convertir</button><button type="button" id="v3save" disabled>Enregistrer…</button><span class="hint" id="v3msg"></span></div>
         <progress id="v3prog" value="0" max="1" hidden></progress>
         <table id="v3tbl"></table>
       </div>
@@ -960,7 +960,9 @@ async function gzipBytes(bytes) {
 }
 async function saveBlob(blob, name) {
   if (window.showSaveFilePicker) {
-    const h = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: 'Zip', accept: { 'application/zip': ['.zip'] } }] });
+    const ext = (name.match(/\.[^.]+$/) || ['.zip'])[0].toLowerCase();
+    const types = ext === '.zip' ? [{ description: 'Zip', accept: { 'application/zip': ['.zip'] } }] : [{ description: 'VGM', accept: { 'application/octet-stream': [ext] } }];
+    const h = await window.showSaveFilePicker({ suggestedName: name, types });
     const w = await h.createWritable(); await w.write(blob); await w.close(); return 'enregistré';
   }
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
@@ -1411,21 +1413,49 @@ $('asmGo').addEventListener('click', async () => {
   renderAsm();
 });
 // ---- Conversion v3: pack zip -> vgmstudio.py /api/v3pack (vgm_v3conv + render check) ----
-const v3 = { file: null, job: null, zipName: '' };
-function v3SetFile(f) {
-  if (!f || !/\.zip$/i.test(f.name)) { $('v3msg').textContent = 'un fichier .zip est attendu'; $('v3msg').className = 'hint warn'; return; }
+const v3 = { file: null, loose: null, job: null, zipName: '' };   // loose: names of .vgz / .vgm dropped without a zip
+// files of a stored zip (the server writes them stored): [{name, data}]
+function unzipStored(buf) {
+  const d = new DataView(buf), out = [], dec = new TextDecoder();
+  let p = 0;
+  while (p + 30 <= buf.byteLength && d.getUint32(p, true) === 0x04034b50) {
+    const method = d.getUint16(p + 8, true), size = d.getUint32(p + 18, true), nl = d.getUint16(p + 26, true), xl = d.getUint16(p + 28, true);
+    if (method !== 0) throw new Error('zip compressé inattendu');
+    const name = dec.decode(new Uint8Array(buf, p + 30, nl)), at = p + 30 + nl + xl;
+    out.push({ name, data: new Uint8Array(buf, at, size) });
+    p = at + size;
+  }
+  return out;
+}
+async function v3SetFiles(list) {
+  const files = [...list];
+  if (!files.length) return;
+  const zips = files.filter(f => /\.zip$/i.test(f.name)), vgms = files.filter(f => /\.vg[mz]$/i.test(f.name));
+  if (zips.length > 1 || (zips.length && vgms.length) || zips.length + vgms.length !== files.length) {
+    $('v3msg').textContent = 'un seul .zip, ou des fichiers .vgz / .vgm'; $('v3msg').className = 'hint warn'; return;
+  }
+  let f = zips[0];
+  v3.loose = null;
+  if (!f) {
+    const names = new Set();
+    for (const x of vgms) { if (names.has(x.name)) { $('v3msg').textContent = 'deux fichiers portent le nom ' + x.name; $('v3msg').className = 'hint warn'; return; } names.add(x.name); }
+    const entries = [];
+    for (const x of vgms) entries.push({ name: x.name, data: new Uint8Array(await x.arrayBuffer()) });
+    f = new File([makeZip(entries)], vgms.length === 1 ? vgms[0].name + '.zip' : 'fichiers.zip', { type: 'application/zip' });
+    v3.loose = vgms.map(x => x.name);
+  }
   v3.file = f; v3.job = null;
-  $('v3drop').textContent = f.name + ' (' + (f.size / 1048576).toFixed(1) + ' Mo)';
-  $('v3msg').textContent = ''; $('v3tbl').innerHTML = ''; $('v3prog').hidden = true; $('v3save').disabled = true;
+  $('v3drop').textContent = (v3.loose ? (v3.loose.length === 1 ? v3.loose[0] : v3.loose.length + ' fichiers : ' + v3.loose.join(', ')) : f.name) + ' (' + (f.size / 1048576).toFixed(1) + ' Mo)';
+  $('v3msg').textContent = ''; $('v3tbl').innerHTML = ''; $('v3prog').hidden = true; $('v3save').disabled = true; $('v3save').textContent = 'Enregistrer…';
   v3Buttons();
 }
 function v3Buttons() { $('v3go').disabled = !v3.file || !serverOk || (v3.job && !v3.job.finished); }
 $('v3drop').addEventListener('click', () => $('v3pick').click());
 $('v3drop').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('v3pick').click(); } });
-$('v3pick').addEventListener('change', () => { if ($('v3pick').files[0]) v3SetFile($('v3pick').files[0]); $('v3pick').value = ''; });
+$('v3pick').addEventListener('change', async () => { await v3SetFiles($('v3pick').files); $('v3pick').value = ''; });
 $('v3drop').addEventListener('dragover', e => { e.preventDefault(); e.stopPropagation(); $('v3drop').classList.add('over'); });
 $('v3drop').addEventListener('dragleave', () => $('v3drop').classList.remove('over'));
-$('v3drop').addEventListener('drop', e => { e.preventDefault(); e.stopPropagation(); $('v3drop').classList.remove('over'); if (e.dataTransfer.files[0]) v3SetFile(e.dataTransfer.files[0]); });
+$('v3drop').addEventListener('drop', e => { e.preventDefault(); e.stopPropagation(); $('v3drop').classList.remove('over'); v3SetFiles(e.dataTransfer.files); });
 function v3Table(report) {
   const esc = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
   $('v3tbl').innerHTML = report.map(r => {
@@ -1457,6 +1487,7 @@ $('v3go').addEventListener('click', async () => {
       $('v3msg').textContent = n + ' piste(s) converties' + (c ? ', ' + c + ' recopiée(s) sans changement' : '') + ($('v3verify').checked ? ', toutes vérifiées' : '') + '.';
       $('v3msg').className = 'hint ok';
       v3.zipName = v3.file.name.replace(/\.zip$/i, '') + ' (v3).zip';
+      $('v3save').textContent = !v3.loose ? 'Enregistrer le zip v3…' : v3.loose.length === 1 ? 'Enregistrer le fichier v3…' : 'Enregistrer dans un dossier…';
       $('v3save').disabled = false;
       break;
     }
@@ -1469,7 +1500,22 @@ $('v3save').addEventListener('click', async () => {
   try {
     const r = await fetch('/api/v3pack/result?id=' + v3.job.id, { cache: 'no-store' });
     if (!r.ok) throw new Error('résultat indisponible (serveur redémarré ?)');
-    await saveBlob(await r.blob(), v3.zipName);
+    if (!v3.loose) { await saveBlob(await r.blob(), v3.zipName); return; }
+    const files = unzipStored(await r.arrayBuffer());
+    if (files.length === 1) {
+      const n = files[0].name, k = n.lastIndexOf('.');
+      await saveBlob(new Blob([files[0].data]), k > 0 ? n.slice(0, k) + ' (v3)' + n.slice(k) : n + ' (v3)');
+      return;
+    }
+    if (!window.showDirectoryPicker) { await saveBlob(new Blob([await (await fetch('/api/v3pack/result?id=' + v3.job.id)).arrayBuffer()]), v3.zipName); return; }
+    const dir = await window.showDirectoryPicker({ mode: 'readwrite' });
+    for (const x of files) {
+      let exists = true;
+      try { await dir.getFileHandle(x.name); } catch (e) { exists = false; }
+      if (exists) throw new Error(x.name + ' existe déjà dans ce dossier : choisir un autre dossier (les fichiers v1 ne sont jamais écrasés)');
+    }
+    for (const x of files) { const w = await (await dir.getFileHandle(x.name, { create: true })).createWritable(); await w.write(x.data); await w.close(); }
+    $('v3msg').textContent = files.length + ' fichiers v3 écrits dans ' + dir.name; $('v3msg').className = 'hint ok';
   } catch (e) { if (e.name !== 'AbortError') { $('v3msg').textContent = e.message; $('v3msg').className = 'hint warn'; } }
 });
 window.addEventListener('resize', () => { for (const c of document.querySelectorAll('canvas.wave')) if (c._draw) c._draw(); drawNow(); });
