@@ -154,7 +154,8 @@ of the tool (100 % faithful, no lossy step).
 3. MAME logger: branch `vgmlog0289-es5506` (= `vgmlog0288-es5506` + MAME 0.289 merged) writes v3. The
    devices still log the logical commands; `vgmwrite.cpp` translates them through a copy of `vgm_v3.h`
    (`src/lib/util/vgmv3.h`), so a capture is exactly what `vgm_v3conv` would make of the v1 capture.
-   Header 0x120 for every ES5505/6 or ZSG-2 file. Optionally merge cam900's WSG logging from `mao_vgm`
-   so WSG games can be captured from the same build.
+   Header 0x120 for every ES5505/6 or ZSG-2 file. cam900's WSG logging (`mao_vgm` 52ec2dc7c62) is ported
+   to the 0.289 `namco.cpp` on the same branch (header 0x120 too), so WSG games are captured from the
+   same build. Done 2026-10-31.
 4. Convert and verify every released pack (Darius Gaiden, Gunlock, Elevator Action Returns, Ray Storm,
    G-Darius, Ray Crisis...), then republish.
