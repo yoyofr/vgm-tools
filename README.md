@@ -62,8 +62,10 @@ first bar); the loop body is taken from the second repetition when captured (sea
 
 Local, single-file tool with two modules: **Tags** (the GD3 editor below) and **Assemblage**, which chains
 parts into one file (`vgm_trim --repeat/--append` above): pick the parts among the loaded files, set the
-number of loop passes of each one (empty = the part keeps its loop, normally the last one), assemble, then
-listen to the result or to a 10 s window around each junction (renders are cached per file and window: switching back plays at once and resumes where it was left). The result is added to the list (its GD3 =
+number of loop passes of each one (empty = the part keeps its loop, normally the last one), cut each part
+like in an audio editor (in / out points typed or dragged on its waveform, click to listen from there;
+the backend unrolls the loops, cuts with `vgm_trim --start/--end`, merges, then recomputes the used ROM
+ranges), assemble, then listen to the result or to a ±2/5/10 s window around each junction (renders are cached per file and window: switching back plays at once and resumes where it was left). The result is added to the list (its GD3 =
 the first part's, editable in Tags) and saved with the usual button. Assembling and listening need the
 local backend, which runs `vgm_trim` and `vgm2wav` (libvgm's own player, so what you hear is what any
 player plays):

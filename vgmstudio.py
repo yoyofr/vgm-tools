@@ -7,7 +7,7 @@ then open http://127.0.0.1:8765/ . Without the server, vgmstudio.html still work
 (open the file directly); the Assemblage module needs the server.
 Requests and answers are JSON; file contents travel as base64. Only loopback connections are accepted.
 """
-import argparse, base64, json, os, shutil, subprocess, sys, tempfile
+import argparse, base64, gzip, json, os, re, shutil, subprocess, sys, tempfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +31,44 @@ def write_part(tmp, i, part):
     path = os.path.join(tmp, f"part{i}{ext}")
     with open(path, "wb") as f: f.write(base64.b64decode(part["data"]))
     return path
+
+def vgm_info(path):
+    """total and loop (samples) of a .vgm/.vgz file"""
+    with open(path, "rb") as f: d = f.read()
+    if d[:2] == b"\x1f\x8b": d = gzip.decompress(d)
+    le = lambda o: int.from_bytes(d[o:o + 4], "little")
+    return {"total": le(0x18), "loop": le(0x20) if le(0x1C) else 0}
+
+SR = 44100
+
+def prepare_part(tmp, i, part, log):
+    """write the part, unroll its loop (repeat N), cut it (start / end, seconds in the played part).
+    Returns the path to feed the merge and whether it still loops."""
+    src = write_part(tmp, i, part)
+    info = vgm_info(src)
+    repeat, start, end = part.get("repeat"), part.get("start"), part.get("end")
+    loops = info["loop"] > 0
+    if repeat is not None and loops:
+        u = os.path.join(tmp, f"u{i}.vgm")
+        rc, out = run([TOOLS["vgm_trim"], src, u, "--repeat", str(int(repeat)), "--color", "never"], tmp)
+        log.append(out)
+        if rc != 0 or not os.path.isfile(u): raise RuntimeError(f"part {i + 1}: unroll failed")
+        src, loops = u, False
+        info = vgm_info(src)
+    total = info["total"]
+    s = int(round(float(start) * SR)) if start not in (None, "") else 0
+    e = int(round(float(end) * SR)) if end not in (None, "") else total
+    s = max(0, min(s, total)); e = max(s + 1, min(e, total))
+    if s == 0 and e == total: return src, loops
+    c = os.path.join(tmp, f"c{i}.vgm")
+    cmd = [TOOLS["vgm_trim"], src, c, "--start", str(s), "--end", str(e), "--color", "never"]
+    loop_at = total - info["loop"] if loops else None
+    if loops and e == total and s < loop_at: cmd += ["--loop", str(loop_at)]   # the part keeps its loop
+    else: loops = False
+    rc, out = run(cmd, tmp)
+    log.append(out)
+    if rc != 0 or not os.path.isfile(c): raise RuntimeError(f"part {i + 1}: cut failed")
+    return c, loops
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "vgmstudio/1.0"
@@ -81,52 +119,70 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:   # report, never crash the server
             self.send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
 
-    # parts: [{name, data (base64), repeat (int or null)}], output: file name (.vgz / .vgm)
+    # parts: [{name, data (base64), repeat (int|null), start (s|null), end (s|null)}], output: file name
+    # each part is unrolled / cut first, then the parts are merged (seamless junctions), then the used
+    # sample ROM ranges of the whole result are recomputed (--sro)
     def api_concat(self):
         req = self.read_json()
         parts = req.get("parts") or []
         if len(parts) < 1: self.send_json({"ok": False, "error": "no part"}, 400); return
         tmp = tempfile.mkdtemp(prefix="vgmstudio_")
+        log = []
         try:
-            out = os.path.join(tmp, "out.vgz" if str(req.get("output", "out.vgz")).lower().endswith(".vgz") else "out.vgm")
-            cmd = [TOOLS["vgm_trim"], write_part(tmp, 0, parts[0]), out]
-            if parts[0].get("repeat") is not None: cmd += ["--repeat", str(int(parts[0]["repeat"]))]
-            for i, p in enumerate(parts[1:], 1):
-                cmd += ["--append", write_part(tmp, i, p)]
-                if p.get("repeat") is not None: cmd += ["--repeat", str(int(p["repeat"]))]
+            prepared = [prepare_part(tmp, i, p, log) for i, p in enumerate(parts)]
+            merged = os.path.join(tmp, "merged.vgm")
+            cmd = [TOOLS["vgm_trim"], prepared[0][0], merged]
+            for path, _ in prepared[1:]: cmd += ["--append", path]
             cmd += ["--color", "never"]
-            rc, log = run(cmd, tmp)
-            if rc != 0 or not os.path.isfile(out):
-                self.send_json({"ok": False, "error": "vgm_trim failed", "log": log}); return
-            with open(out, "rb") as f: data = f.read()
-            self.send_json({"ok": True, "log": log, "data": base64.b64encode(data).decode(), "name": os.path.basename(out)})
+            rc, out = run(cmd, tmp)
+            log.append(out)
+            if rc != 0 or not os.path.isfile(merged): self.send_json({"ok": False, "error": "vgm_trim (merge) failed", "log": "\n".join(log)}); return
+            # junction times from the merge table ("│    2 │ 3:01.197 (7990778) │")
+            junctions = [int(m.group(1)) for m in re.finditer(r"│\s+\d+\s+│\s+[\d:.]+\s+\((\d+)\)", out)][1:]
+            out_name = "out.vgz" if str(req.get("output", "out.vgz")).lower().endswith(".vgz") else "out.vgm"
+            final = os.path.join(tmp, out_name)
+            info = vgm_info(merged)
+            cmd = [TOOLS["vgm_trim"], merged, final, "--sro", "--color", "never"]
+            if info["loop"]: cmd += ["--loop", str(info["total"] - info["loop"])]
+            rc, out = run(cmd, tmp)
+            log.append(out)
+            if rc != 0 or not os.path.isfile(final): self.send_json({"ok": False, "error": "vgm_trim (sro) failed", "log": "\n".join(log)}); return
+            with open(final, "rb") as f: data = f.read()
+            self.send_json({"ok": True, "log": "\n".join(log), "data": base64.b64encode(data).decode(), "name": out_name, "junctions": junctions})
+        except RuntimeError as e:
+            self.send_json({"ok": False, "error": str(e), "log": "\n".join(log)})
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    # {name, data (base64), start (s) | null, end (s) | null, loops (default 1), fade (s, default 0 when a window is given, else 8)}
+    # {name, data (base64), repeat (int|null), cut_start / cut_end (s|null: the part as assembled),
+    #  start / end (s|null: listening window inside that), loops (default 1), fade (s)}
     def api_render(self):
         req = self.read_json()
         tmp = tempfile.mkdtemp(prefix="vgmstudio_")
+        log = []
         try:
-            src = write_part(tmp, 0, req)
+            src, _ = prepare_part(tmp, 0, {"name": req.get("name"), "data": req["data"], "repeat": req.get("repeat"),
+                                           "start": req.get("cut_start"), "end": req.get("cut_end")}, log)
             start, end = req.get("start"), req.get("end")
-            log = ""
             if start is not None or end is not None:
-                cut = os.path.join(tmp, "cut.vgm")
+                cut = os.path.join(tmp, "win.vgm")
                 cmd = [TOOLS["vgm_trim"], src, cut, "--color", "never"]
                 if start is not None: cmd += ["--start", "%.4fs" % max(0.0, float(start))]
                 if end is not None: cmd += ["--end", "%.4fs" % float(end)]
-                rc, log = run(cmd, tmp)
-                if rc != 0 or not os.path.isfile(cut): self.send_json({"ok": False, "error": "vgm_trim failed", "log": log}); return
+                rc, out = run(cmd, tmp)
+                log.append(out)
+                if rc != 0 or not os.path.isfile(cut): self.send_json({"ok": False, "error": "vgm_trim failed", "log": "\n".join(log)}); return
                 src = cut
             loops = int(req.get("loops") or 1)
             fade = req.get("fade")
-            if fade is None: fade = 0 if (start is not None or end is not None) else 8
+            if fade is None: fade = 0 if (start is not None or end is not None or vgm_info(src)["loop"] == 0) else 8
             wav = os.path.join(tmp, "out.wav")
-            rc, log2 = run([TOOLS["vgm2wav"], "--loops", str(loops), "--fade", str(float(fade)), src, wav], tmp)
-            if rc != 0 or not os.path.isfile(wav): self.send_json({"ok": False, "error": "vgm2wav failed", "log": log + log2}); return
+            rc, out = run([TOOLS["vgm2wav"], "--loops", str(loops), "--fade", str(float(fade)), src, wav], tmp)
+            if rc != 0 or not os.path.isfile(wav): self.send_json({"ok": False, "error": "vgm2wav failed", "log": "\n".join(log) + out}); return
             with open(wav, "rb") as f: data = f.read()
             self.send_bytes(data, "audio/wav")
+        except RuntimeError as e:
+            self.send_json({"ok": False, "error": str(e), "log": "\n".join(log)})
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

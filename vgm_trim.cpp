@@ -3140,7 +3140,7 @@ int main(int argc, char** argv)
 	vgm.load(input);
 	if (f_activity) { activity(vgm, parse_pos(gap), false); return 0; }
 	if (f_info || output.empty()) { info(vgm); return 0; }
-	if (!appends.empty())
+	if (!appends.empty() || repeats[0] >= 0)   // --repeat alone: the loop of the input unrolled N times (no loop left)
 	{
 		std::vector<MergePart> parts(1 + appends.size());
 		parts[0].file = std::move(vgm);

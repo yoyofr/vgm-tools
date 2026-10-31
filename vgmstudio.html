@@ -89,16 +89,24 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
 .mod[hidden] { display: none }
 #asm { padding: 16px; display: grid; gap: 14px }
 #asm h2 { font-size: 14px; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-weight: 600 }
-.parts { display: grid; gap: 6px }
-.part { display: grid; grid-template-columns: 2.2em minmax(0, 1fr) 9em 8em 8em 7em 2em; gap: 8px; align-items: center; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); font-variant-numeric: tabular-nums }
-.part .n { color: var(--muted); font-family: var(--mono) }
-.part select { font: inherit; min-width: 0; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg) }
-.part input { width: 100%; font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg) }
-.part .t { font-family: var(--mono); font-size: 12px; color: var(--muted) }
-.part .rm { border: 0; background: none; color: inherit; opacity: .55; cursor: pointer; font-size: 14px }
-.part .rm:hover { opacity: 1; color: var(--warn) }
-.parthead { display: grid; grid-template-columns: 2.2em minmax(0, 1fr) 9em 8em 8em 7em 2em; gap: 8px; padding: 0 8px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em }
-@media (max-width: 900px) { .part, .parthead { grid-template-columns: 2em minmax(0, 1fr) 7em 2em } .part .t:not(.keep), .parthead .t:not(.keep) { display: none } }
+.parts { display: grid; gap: 8px }
+.part { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); font-variant-numeric: tabular-nums }
+.ptop { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
+.ptop .n { color: var(--muted); font-family: var(--mono); min-width: 1.4em }
+.ptop select { font: inherit; min-width: 0; max-width: 22em; flex: 1 1 14em; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--fg) }
+.ptop .pl { display: flex; gap: 4px; align-items: center; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em }
+.ptop input { width: 7.5em; font: 13px var(--mono); padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--fg) }
+.ptop .pl:first-of-type input { width: 4.5em }
+.ptop .t { font-family: var(--mono); font-size: 12px; color: var(--muted); flex: 1 1 18em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.ptop .rm { border: 0; background: none; color: inherit; opacity: .55; font-size: 14px }
+.ptop .rm:hover { opacity: 1; color: var(--warn) }
+canvas.wave { display: block; width: 100%; height: 56px; border: 1px solid var(--line); border-radius: 4px; cursor: pointer; touch-action: none }
+canvas.wave.small { height: 40px }
+.tltools { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px }
+button.mini { font-size: 12px; padding: 2px 8px }
+.jrow { display: grid; grid-template-columns: 15em minmax(0, 1fr); gap: 8px; align-items: center; margin-top: 6px }
+@media (max-width: 700px) { .jrow { grid-template-columns: 1fr } }
+#asm select#jWin { font: inherit; padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--fg) }
 .asmbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
 .asmbar input[type=text] { flex: 1; min-width: 12em }
 #asmLog { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; max-height: 260px; overflow: auto; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--muted) }
@@ -154,18 +162,22 @@ kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); 
       <div id="asm">
         <div>
           <h2>Parties</h2>
-          <div class="hint">Chaque partie est un fichier de la liste. « Boucles » = nombre de passages du corps de boucle avant la partie suivante (0 = l'intro seule) ; vide = la partie garde sa boucle (la dernière partie, normalement). Les parties s'enchaînent sans silence : les voix encore actives à la jonction s'éteignent en 0,1 s pendant que la suite démarre, le DSP (réverbération) continue.</div>
+          <div class="hint">Chaque partie est un fichier de la liste. « Boucles » = passages du corps de boucle (0 = intro seule ; vide = la partie garde sa boucle, normalement la dernière). « Entrée » / « Sortie » coupent la partie jouée (m:ss.sss) : tape la valeur ou tire les poignées sur l’onde ; un clic sur l’onde écoute depuis cet endroit. Les parties s’enchaînent sans silence : les voix encore actives à la jonction s’éteignent en 0,1 s pendant que la suite démarre, le DSP (réverbération) continue.</div>
         </div>
-        <div class="parthead"><span>#</span><span>Fichier</span><span class="t keep">Boucles</span><span class="t">Début</span><span class="t">Durée</span><span class="t">Boucle</span><span></span></div>
         <div class="parts" id="asmParts"></div>
         <div class="asmbar"><button type="button" id="asmAdd">+ Partie</button><span class="hint" id="asmTotal"></span></div>
         <div class="asmbar"><label for="asmName" class="hint">Résultat</label><input type="text" id="asmName" placeholder="nom du fichier .vgz"><button type="button" class="primary" id="asmGo" disabled>Assembler</button><span class="hint" id="asmMsg"></span></div>
-        <pre id="asmLog"></pre>
-        <div class="player">
-          <div class="bar"><strong>Écoute</strong><select id="playWhat"></select><button type="button" id="playGo" disabled>▶ Rendre et écouter</button><span class="hint" id="playMsg"></span></div>
-          <audio id="player" controls preload="none"></audio>
-          <div class="hint">Rendu par vgm2wav (le moteur de lecture de libvgm) via le serveur local ; une fenêtre de jonction = 5 s avant et après.</div>
+        <div>
+          <div class="asmbar"><h2>Jonctions</h2><label class="hint" for="jWin">fenêtre</label><select id="jWin"><option value="2">±2 s</option><option value="5" selected>±5 s</option><option value="10">±10 s</option></select><button type="button" id="resPlay" disabled>▶ Résultat entier</button></div>
+          <div id="asmJunctions"></div>
         </div>
+        <div class="player">
+          <div class="bar"><strong>Lecture</strong><span class="hint" id="playMsg"></span></div>
+          <canvas id="nowWave" class="wave"></canvas>
+          <audio id="player" controls preload="none"></audio>
+          <div class="hint">Rendu par vgm2wav (le moteur de lecture de libvgm) via le serveur local ; les rendus restent en cache (retour immédiat, reprise à la position quittée). Trait vert = jonction, trait orange = début de boucle.</div>
+        </div>
+        <details><summary class="hint">Journal de vgm_trim</summary><pre id="asmLog"></pre></details>
       </div>
     </div>
   </section>
@@ -1032,75 +1044,270 @@ async function pingServer() {
   renderAsm();
 }
 function totalOf(b) { return le32(b, 0x18); }
-function loopOf(b) { return le32(b, 0x20); }
+function loopOf(b) { return le32(b, 0x1C) ? le32(b, 0x20) : 0; }
 function b64(bytes) { let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(s); }
 function unb64(str) { const bin = atob(str), out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
 const vgmFiles = () => files.map((f, i) => ({ f, i })).filter(x => !x.f.audio);
+const fileData = f => b64(f.raw && !f.dirty ? f.raw : f.bytes);
+// seconds <-> "m:ss.sss"
+function fmtSec(s) { if (s == null || isNaN(s)) return ''; const m = Math.floor(s / 60); return m + ':' + (s - m * 60).toFixed(3).padStart(6, '0'); }
+function parseSec(str) {
+  str = String(str).trim().replace(',', '.');
+  if (!str) return null;
+  const m = str.match(/^(?:(\d+):)?(\d+(?:\.\d*)?)$/);
+  return m ? (m[1] ? +m[1] * 60 : 0) + +m[2] : NaN;
+}
 
-// the sequence: parts refer to files by name + size (the list is re-sorted); repeat '' = keep the loop
+// ---- render cache: one entry per rendered clip, kept while its file stays loaded (LRU) ----
+const RENDER_MAX = 24;
+const renderCache = new Map();   // key -> {url, f, pos, label, peaks: Float32Array (min,max pairs) | null, dur, offset, marker}
+const fileIds = new WeakMap(); let nextFileId = 1;
+const fileId = f => { if (!fileIds.has(f)) fileIds.set(f, nextFileId++); return fileIds.get(f); };
+let playingKey = null;
+function pruneCache() {
+  for (const [k, e] of renderCache) if (!files.includes(e.f) && k !== playingKey) { URL.revokeObjectURL(e.url); renderCache.delete(k); }
+  for (const [k, e] of renderCache) { if (renderCache.size <= RENDER_MAX) break; if (k === playingKey) continue; URL.revokeObjectURL(e.url); renderCache.delete(k); }
+}
+async function peaksOf(blob, n) {
+  const ctx = new OfflineAudioContext(1, 1, 44100);
+  const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+  const ch = [...Array(buf.numberOfChannels).keys()].map(i => buf.getChannelData(i));
+  const len = buf.length, pk = new Float32Array(n * 2);
+  for (let i = 0; i < n; i++) {
+    let lo = 0, hi = 0;
+    const a = Math.floor(i * len / n), b = Math.max(a + 1, Math.floor((i + 1) * len / n)), step = Math.max(1, Math.floor((b - a) / 256));
+    for (let j = a; j < b; j += step) for (const c of ch) { const v = c[j]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    pk[2 * i] = lo; pk[2 * i + 1] = hi;
+  }
+  return { peaks: pk, dur: buf.duration };
+}
+// render a clip through the server (or take it from the cache); req = /api/render body without data
+const inflight = new Map();
+async function getRender(key, f, req, label, extra) {
+  if (renderCache.has(key)) return renderCache.get(key);
+  if (inflight.has(key)) return inflight.get(key);
+  const job = (async () => {
+    const r = await postJson('/api/render', { name: f.name, data: fileData(f), ...req });
+    const pk = await peaksOf(r.blob, 1600).catch(() => ({ peaks: null, dur: 0 }));
+    const e = { url: URL.createObjectURL(r.blob), f, pos: 0, label, peaks: pk.peaks, dur: pk.dur, offset: 0, marker: null, ...extra };
+    renderCache.set(key, e); pruneCache();
+    return e;
+  })();
+  inflight.set(key, job);
+  try { return await job; } finally { inflight.delete(key); }
+}
+async function playKey(key, from) {
+  const e = renderCache.get(key), a = $('player');
+  if (!e) return;
+  renderCache.delete(key); renderCache.set(key, e);
+  if (playingKey && renderCache.has(playingKey)) renderCache.get(playingKey).pos = a.currentTime || 0;
+  if (playingKey !== key) {
+    a.src = e.url; playingKey = key;
+    await new Promise(r => { if (a.readyState >= 1) r(); else a.addEventListener('loadedmetadata', r, { once: true }); });
+  }
+  try { a.currentTime = from != null ? Math.max(0, from) : (e.pos || 0); } catch (x) {}
+  await a.play().catch(() => {});
+  $('playMsg').textContent = e.label + ' · ' + renderCache.size + ' rendu(s) en cache';
+  drawNow();
+}
+
+// ---- the sequence: parts refer to files by name + size (the list is re-sorted) ----
+// repeat '' = keep the loop; start / end = seconds in the played part (after the loop passes), null = whole
 const asm = { parts: [], result: null, junctions: [] };
-let asmNameAuto = true;   // the result name follows the parts until the user edits it
+let asmNameAuto = true;
 $('asmName').addEventListener('input', () => { asmNameAuto = $('asmName').value.trim() === ''; if (asmNameAuto) renderAsm(); });
 function uniqueName(name, keep) { let n = name, k = 2; while (files.some(f => f.name === n && f !== keep)) n = name.replace(/(\.vgz)$/i, '') + ' (' + k++ + ').vgz'; return n; }
 function partFile(p) { return files.find(f => f.name === p.name && f.size === p.size) || null; }
-function partLength(f, repeat) {
-  const total = totalOf(f.bytes), loop = loopOf(f.bytes);
-  if (repeat === '' || repeat == null || !loop) return { len: total, loops: loop ? 'garde sa boucle' : 'sans boucle' };
-  const n = Math.max(0, Math.floor(+repeat));
-  return { len: total - loop + n * loop, loops: n === 0 ? 'intro seule' : 'intro + ' + n + ' × ' + fmtTime(loop) };
+const repeatOf = p => p.repeat === '' || p.repeat == null ? null : Math.max(0, Math.floor(+p.repeat));
+function played(f, p) {   // length (s) of the part before the cut, and a description
+  const total = totalOf(f.bytes) / 44100, loop = loopOf(f.bytes) / 44100, n = repeatOf(p);
+  if (n == null || !loop) return { len: total, loop: n == null && loop ? loop : 0, text: loop ? 'garde sa boucle' : 'sans boucle' };
+  return { len: total - loop + n * loop, loop: 0, text: n === 0 ? 'intro seule' : 'intro + ' + n + ' × ' + fmtSec(loop) };
 }
+function cutOf(f, p) {   // effective in / out points (s)
+  const P = played(f, p);
+  const a = Math.max(0, Math.min(p.start ?? 0, P.len)), b = Math.max(a, Math.min(p.end ?? P.len, P.len));
+  return { a, b, P, keepsLoop: P.loop > 0 && b >= P.len - 1e-6 && a < P.len - P.loop };
+}
+const partKey = (f, p) => 'p|' + fileId(f) + '|' + (repeatOf(p) ?? 'L');
+
+function drawWave(cv, e, opts) {
+  // opts: {dur (timeline length s), a, b (shaded outside), marks: [{t, color}], playhead}
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+  const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+  const cs = getComputedStyle(document.documentElement), col = n => cs.getPropertyValue(n).trim();
+  const X = t => (t / opts.dur) * W;
+  g.fillStyle = col('--field'); g.fillRect(0, 0, W, H);
+  if (e && e.peaks) {
+    g.fillStyle = col('--muted');
+    const n = e.peaks.length / 2, span = e.dur || opts.dur;
+    for (let x = 0; x < W; x++) {
+      const t0 = x / W * opts.dur, i = Math.floor(t0 / span * n);
+      if (i >= n) break;
+      const lo = e.peaks[2 * i], hi = e.peaks[2 * i + 1];
+      g.fillRect(x, H / 2 - hi * H / 2, 1, Math.max(1, (hi - lo) * H / 2));
+    }
+  } else { g.fillStyle = col('--muted'); g.font = '11px ' + col('--font'); g.fillText(opts.empty || '', 8, H / 2 + 4); }
+  if (opts.a != null) {
+    g.fillStyle = 'rgba(0,0,0,.45)';
+    g.fillRect(0, 0, X(opts.a), H); g.fillRect(X(opts.b), 0, W - X(opts.b), H);
+    g.fillStyle = col('--accent');
+    for (const t of [opts.a, opts.b]) { const x = Math.round(X(t)); g.fillRect(x - 1, 0, 2, H); g.fillRect(x - 5, 0, 10, 6); }
+  }
+  for (const m of opts.marks || []) { g.fillStyle = m.color || col('--ok'); g.fillRect(Math.round(X(m.t)) - 1, 0, 2, H); }
+  if (opts.playhead != null) { g.fillStyle = col('--fg'); g.fillRect(Math.round(X(opts.playhead)), 0, 1, H); }
+}
+
 function renderAsm() {
   const box = $('asmParts');
   box.innerHTML = '';
   const list = vgmFiles();
   let t = 0, loopKept = null;
-  asm.junctions = [];
+  const junctions = [];
   asm.parts.forEach((p, k) => {
     const f = partFile(p);
-    const row = document.createElement('div'); row.className = 'part';
+    const card = document.createElement('div'); card.className = 'part';
+    const top = document.createElement('div'); top.className = 'ptop';
     const sel = document.createElement('select');
     sel.innerHTML = '<option value="">— choisir —</option>' + list.map(x => `<option value="${x.i}" ${f === x.f ? 'selected' : ''}>${x.f.name}</option>`).join('');
-    sel.addEventListener('change', () => { const x = files[+sel.value]; if (x) { p.name = x.name; p.size = x.size; } else { p.name = null; } renderAsm(); });
-    const rep = document.createElement('input'); rep.type = 'number'; rep.min = '0'; rep.step = '1'; rep.placeholder = k === asm.parts.length - 1 ? 'boucle' : '1'; rep.value = p.repeat;
-    rep.title = 'Passages du corps de boucle (0 = intro seule) ; vide = garde la boucle du fichier';
-    rep.addEventListener('input', () => { p.repeat = rep.value; renderAsm(); });
-    let start = '', len = '', lp = '';
+    sel.addEventListener('change', () => { const x = files[+sel.value]; if (x) { p.name = x.name; p.size = x.size; p.start = p.end = null; } else p.name = null; renderAsm(); });
+    const num = (ph, val, title, on) => { const i = document.createElement('input'); i.type = 'text'; i.placeholder = ph; i.value = val; i.title = title; i.addEventListener('change', () => on(i)); i.addEventListener('keydown', e => { if (e.key === 'Enter') on(i); }); return i; };
+    const rep = num(k === asm.parts.length - 1 ? 'boucle' : '1', p.repeat, 'Passages du corps de boucle (0 = intro seule) ; vide = garde la boucle du fichier', i => { p.repeat = i.value.trim() === '' ? '' : String(Math.max(0, Math.floor(+i.value) || 0)); renderAsm(); });
+    const inp = num('0:00.000', fmtSec(p.start), 'Point d’entrée (m:ss.sss) dans la partie jouée ; vide = début', i => { const v = parseSec(i.value); if (!isNaN(v)) p.start = v; renderAsm(); });
+    const outp = num('fin', fmtSec(p.end), 'Point de sortie (m:ss.sss) ; vide = fin', i => { const v = parseSec(i.value); if (!isNaN(v)) p.end = v; renderAsm(); });
+    const info = document.createElement('span'); info.className = 't';
+    const btn = (txt, title, fn) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'mini'; b.textContent = txt; b.title = title; b.addEventListener('click', fn); return b; };
+    const rm = btn('×', 'Retirer la partie', () => { asm.parts.splice(k, 1); renderAsm(); }); rm.classList.add('rm');
+    const lab = (txt, el) => { const l = document.createElement('label'); l.className = 'pl'; l.append(txt, el); return l; };
+    top.append(Object.assign(document.createElement('span'), { className: 'n', textContent: k + 1 }), sel, lab('Boucles', rep), lab('Entrée', inp), lab('Sortie', outp), info, rm);
+    card.appendChild(top);
     if (f) {
-      if (k) asm.junctions.push(t);
-      const L = partLength(f, p.repeat);
-      start = fmtTime(t); len = fmtTime(L.len); lp = L.loops; t += L.len;
-      if (loopOf(f.bytes) && (p.repeat === '' || p.repeat == null)) loopKept = k;
+      const C = cutOf(f, p);
+      if (k) junctions.push(t);
+      const len = C.b - C.a;
+      info.textContent = fmtSec(t) + ' → ' + fmtSec(t + len) + ' · ' + fmtSec(len) + ' · ' + (C.keepsLoop ? 'garde sa boucle (' + fmtSec(C.P.loop) + ')' : C.P.text + (C.a > 0 || C.b < C.P.len - 1e-6 ? ', coupée' : ''));
+      info.title = info.textContent;
+      t += len;
+      if (C.keepsLoop) loopKept = k;
+      // timeline: waveform of the played part, in / out handles, click = listen from there
+      const tl = document.createElement('div'); tl.className = 'tl';
+      const cv = document.createElement('canvas'); cv.className = 'wave';
+      const key = partKey(f, p);
+      cv._draw = () => drawWave(cv, renderCache.get(key), { dur: C.P.len, a: C.a, b: C.b, empty: 'onde non rendue : « Onde » ou clic pour écouter (rend la partie)', playhead: playingKey === key ? $('player').currentTime : null, marks: C.P.loop ? [{ t: C.P.len - C.P.loop, color: getComputedStyle(document.documentElement).getPropertyValue('--warn') }] : [] });
+      cv._key = key;
+      let drag = null;
+      const tAt = ev => { const r = cv.getBoundingClientRect(); return Math.max(0, Math.min(C.P.len, (ev.clientX - r.left) / r.width * C.P.len)); };
+      cv.addEventListener('pointerdown', ev => {
+        const r = cv.getBoundingClientRect(), x = ev.clientX - r.left, xa = C.a / C.P.len * r.width, xb = C.b / C.P.len * r.width;
+        if (Math.abs(x - xa) < 8) drag = 'a'; else if (Math.abs(x - xb) < 8) drag = 'b'; else drag = null;
+        if (drag) { cv.setPointerCapture(ev.pointerId); ev.preventDefault(); }
+      });
+      cv.addEventListener('pointermove', ev => {
+        const r = cv.getBoundingClientRect(), x = ev.clientX - r.left;
+        cv.style.cursor = drag || Math.abs(x - C.a / C.P.len * r.width) < 8 || Math.abs(x - C.b / C.P.len * r.width) < 8 ? 'ew-resize' : 'pointer';
+        if (!drag) return;
+        const v = Math.round(tAt(ev) * 1000) / 1000;
+        if (drag === 'a') { C.a = Math.min(v, C.b - 0.05); inp.value = fmtSec(C.a); } else { C.b = Math.max(v, C.a + 0.05); outp.value = fmtSec(C.b); }
+        cv._draw();
+      });
+      cv.addEventListener('pointerup', ev => {
+        if (drag) { if (drag === 'a') p.start = C.a > 0.0005 ? C.a : null; else p.end = C.b < C.P.len - 0.0005 ? C.b : null; drag = null; renderAsm(); return; }
+        listenPart(f, p, tAt(ev));
+      });
+      tl.appendChild(cv);
+      const tools = document.createElement('div'); tools.className = 'tltools';
+      tools.append(btn('Onde', 'Rendre la partie (boucles déroulées) pour afficher son onde', () => listenPart(f, p, null, true)),
+        btn('▶ entrée', 'Écouter depuis le point d’entrée', () => listenPart(f, p, C.a)),
+        btn('▶ sortie −5 s', 'Écouter les 5 s avant le point de sortie', () => listenPart(f, p, Math.max(0, C.b - 5))),
+        btn('↺', 'Remettre entrée et sortie aux bornes', () => { p.start = p.end = null; renderAsm(); }));
+      if (C.P.loop) tools.append(Object.assign(document.createElement('span'), { className: 'hint', textContent: '| = début de boucle' }));
+      tl.appendChild(tools);
+      card.appendChild(tl);
+      requestAnimationFrame(() => cv._draw());
     }
-    const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'rm'; rm.textContent = '×'; rm.title = 'Retirer';
-    rm.addEventListener('click', () => { asm.parts.splice(k, 1); renderAsm(); });
-    row.append(Object.assign(document.createElement('span'), { className: 'n', textContent: k + 1 }), sel, rep,
-      Object.assign(document.createElement('span'), { className: 't', textContent: start }),
-      Object.assign(document.createElement('span'), { className: 't', textContent: len }),
-      Object.assign(document.createElement('span'), { className: 't', textContent: lp, title: lp }), rm);
-    box.appendChild(row);
+    box.appendChild(card);
   });
+  asm.junctions = junctions;
   const ready = asm.parts.length >= 1 && asm.parts.every(p => partFile(p));
-  const warn = loopKept != null && loopKept !== asm.parts.length - 1 ? ' · la boucle de la partie ' + (loopKept + 1) + ' n’est pas sur la dernière partie : le fichier bouclera jusqu’à la fin' : '';
-  $('asmTotal').textContent = ready ? 'durée totale ' + fmtTime(t) + (loopKept != null ? ' · boucle = celle de la partie ' + (loopKept + 1) : ' · sans boucle') + warn : '';
+  const warn = loopKept != null && loopKept !== asm.parts.length - 1 ? ' · la boucle de la partie ' + (loopKept + 1) + ' n’est pas sur la dernière : le fichier bouclera jusqu’à la fin' : '';
+  $('asmTotal').textContent = ready ? 'durée totale ' + fmtSec(t) + (loopKept != null ? ' · boucle = celle de la partie ' + (loopKept + 1) : ' · sans boucle') + warn : '';
   $('asmGo').disabled = !(ready && serverOk);
   if (ready && asmNameAuto) {
     const names = asm.parts.map(p => partFile(p).name.replace(/\.(vgm|vgz)$/i, ''));
     const base = (names.length > 1 ? names[0] + '+' + names.slice(1).map(n => /\d/.test(n) ? n.replace(/^.*?(\d+)[^\d]*$/, '$1') : n).join('+') : names[0] + ' (assemblage)') + '.vgz';
     $('asmName').value = uniqueName(base, asm.result);
   }
-  // listening choices: any loaded file, the result and its junctions
-  const pw = $('playWhat'), prev = pw.value;
-  pw.innerHTML = list.map(x => `<option value="f:${x.i}">${x.f.name}</option>`).join('') +
-    asm.junctions.map((j, k) => `<option value="j:${k}">jonction ${k + 1} → ${k + 2} (${fmtTime(j)}) ±5 s</option>`).join('');
-  if ([...pw.options].some(o => o.value === prev)) pw.value = prev;
-  $('playGo').disabled = !(serverOk && pw.options.length);
-  if (typeof updatePlayButton === 'function') { pruneCache(); updatePlayButton(); }
+  renderResult();
 }
+async function listenPart(f, p, from, waveOnly) {
+  if (!serverOk) return;
+  const key = partKey(f, p), rep = repeatOf(p);
+  const fresh = !renderCache.has(key);
+  if (fresh) $('playMsg').innerHTML = '<span class="spin"></span> rendu de ' + f.name + (rep != null ? ' (' + rep + ' boucle(s))' : '') + '…';
+  try {
+    await getRender(key, f, { repeat: rep, loops: 1, fade: rep != null || !loopOf(f.bytes) ? 0 : 8 }, f.name + (rep != null ? ' · ' + rep + ' boucle(s)' : ''));
+    if (waveOnly) { $('playMsg').textContent = 'onde de ' + f.name + ' rendue'; renderAsm(); return; }
+    await playKey(key, from);
+    renderAsm();
+  } catch (e) { $('playMsg').textContent = e.message.split('\n')[0]; }
+}
+
+// ---- result: junctions with their listening windows ----
+function renderResult() {
+  const box = $('asmJunctions');
+  box.innerHTML = '';
+  const r = asm.result && files.includes(asm.result) ? asm.result : null;
+  $('resPlay').disabled = !r || !serverOk;
+  if (!r) { box.appendChild(Object.assign(document.createElement('div'), { className: 'hint', textContent: 'Assemble pour vérifier les jonctions.' })); return; }
+  const w = +$('jWin').value;
+  (asm.resultJunctions || []).forEach((j, k) => {
+    const key = 'j|' + fileId(r) + '|' + k + '|' + w;
+    const row = document.createElement('div'); row.className = 'jrow';
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = '▶ jonction ' + (k + 1) + ' → ' + (k + 2) + ' (' + fmtSec(j) + ')';
+    b.addEventListener('click', () => listenJunction(r, k, j, w));
+    const cv = document.createElement('canvas'); cv.className = 'wave small';
+    const start = Math.max(0, j - w);
+    cv._key = key;
+    cv._draw = () => drawWave(cv, renderCache.get(key), { dur: 2 * w, marks: [{ t: j - start }], playhead: playingKey === key ? $('player').currentTime : null, empty: 'non rendue' });
+    cv.addEventListener('click', ev => { const rc = cv.getBoundingClientRect(); listenJunction(r, k, j, w, (ev.clientX - rc.left) / rc.width * 2 * w); });
+    row.append(b, cv); box.appendChild(row);
+    requestAnimationFrame(() => cv._draw());
+  });
+}
+async function listenJunction(r, k, j, w, from) {
+  const key = 'j|' + fileId(r) + '|' + k + '|' + w, start = Math.max(0, j - w);
+  if (!renderCache.has(key)) $('playMsg').innerHTML = '<span class="spin"></span> rendu de la jonction ' + (k + 1) + '…';
+  try {
+    await getRender(key, r, { start, end: j + w, loops: 1 }, 'jonction ' + (k + 1) + ' → ' + (k + 2) + ' (' + fmtSec(start) + ' → ' + fmtSec(j + w) + ', la jonction est à ' + (j - start).toFixed(1) + ' s)', { marker: j - start });
+    await playKey(key, from);
+    renderResult();
+  } catch (e) { $('playMsg').textContent = e.message.split('\n')[0]; }
+}
+$('jWin').addEventListener('change', renderResult);
+$('resPlay').addEventListener('click', async () => {
+  const r = asm.result; if (!r) return;
+  const key = 'f|' + fileId(r);
+  if (!renderCache.has(key)) $('playMsg').innerHTML = '<span class="spin"></span> rendu du résultat…';
+  try { await getRender(key, r, { loops: 1 }, r.name); await playKey(key); } catch (e) { $('playMsg').textContent = e.message.split('\n')[0]; }
+});
+
+// ---- now playing: waveform of the current clip, playhead, click to seek ----
+function drawNow() {
+  const cv = $('nowWave'), e = playingKey && renderCache.get(playingKey), a = $('player');
+  drawWave(cv, e, { dur: (e && e.dur) || a.duration || 1, playhead: a.currentTime, marks: e && e.marker != null ? [{ t: e.marker }] : [], empty: 'rien en lecture' });
+  for (const c of document.querySelectorAll('canvas.wave')) if (c._key && c._key === playingKey && c._draw) c._draw();
+}
+$('nowWave').addEventListener('click', ev => { const a = $('player'); if (!a.duration) return; const r = $('nowWave').getBoundingClientRect(); a.currentTime = (ev.clientX - r.left) / r.width * a.duration; drawNow(); });
+(function tick() { if (!$('player').paused) drawNow(); requestAnimationFrame(tick); })();
+$('player').addEventListener('seeked', drawNow);
+$('player').addEventListener('pause', drawNow);
+
 $('asmAdd').addEventListener('click', () => {
   const list = vgmFiles();
   const used = new Set(asm.parts.map(p => p.name + '|' + p.size));
   const next = list.find(x => !used.has(x.f.name + '|' + x.f.size)) || list[0];
-  asm.parts.push(next ? { name: next.f.name, size: next.f.size, repeat: '' } : { name: null, size: 0, repeat: '' });
+  asm.parts.push(next ? { name: next.f.name, size: next.f.size, repeat: '', start: null, end: null } : { name: null, size: 0, repeat: '', start: null, end: null });
   if (asm.parts.length >= 2) { const prev = asm.parts[asm.parts.length - 2]; if (prev.repeat === '') prev.repeat = '1'; }
   renderAsm();
 });
@@ -1113,89 +1320,27 @@ async function postJson(url, body) {
   return j;
 }
 $('asmGo').addEventListener('click', async () => {
-  const parts = asm.parts.map(p => { const f = partFile(p); return { name: f.name, data: b64(f.raw && !f.dirty ? f.raw : f.bytes), repeat: p.repeat === '' ? null : Math.max(0, Math.floor(+p.repeat)) }; });
+  const parts = asm.parts.map(p => { const f = partFile(p), C = cutOf(f, p); return { name: f.name, data: fileData(f), repeat: repeatOf(p),
+    start: C.a > 0 ? C.a : null, end: C.b < C.P.len - 1e-6 ? C.b : null }; });
   let name = ($('asmName').value.trim() || 'assemblage.vgz').replace(/\.(vgm)$/i, '.vgz');
   if (!/\.vgz$/i.test(name)) name += '.vgz';
-  name = uniqueName(name, asm.result);   // never replaces a loaded file, only the previous result of the same name
+  name = uniqueName(name, asm.result);
   $('asmMsg').innerHTML = '<span class="spin"></span> assemblage…'; $('asmGo').disabled = true; $('asmLog').textContent = '';
   try {
     const j = await postJson('/api/concat', { parts, output: name });
     $('asmLog').textContent = j.log || '';
-    const bytes = unb64(j.data);
-    const f = await readFile(new File([bytes], name), null);
+    const f = await readFile(new File([unb64(j.data)], name), null);
     const old = asm.result ? files.indexOf(asm.result) : -1;
     if (old >= 0 && asm.result.name === name) files.splice(old, 1);
     files.push(f); sortFiles(); select(files.indexOf(f));
     asm.result = f;
+    asm.resultJunctions = (j.junctions || []).map(x => x / 44100);
     $('asmMsg').textContent = 'assemblé : ' + name + ' (' + fmtTime(totalOf(f.bytes)) + (loopOf(f.bytes) ? ', boucle ' + fmtTime(loopOf(f.bytes)) : '') + ') — ajouté à la liste, « Enregistrer » pour l’écrire';
     $('asmMsg').className = 'hint ok';
-    renderAsm();
-    $('playWhat').value = 'f:' + files.indexOf(f);
   } catch (e) { $('asmMsg').textContent = e.message.split('\n')[0]; $('asmMsg').className = 'hint warn'; $('asmLog').textContent = e.message; }
   renderAsm();
 });
-// rendered audio cache: one entry per (file, window), kept while the file stays loaded; switching the
-// choice plays the cached render at once and resumes where it was left (LRU, at most RENDER_MAX entries)
-const RENDER_MAX = 16;
-const renderCache = new Map();   // key -> {url, f, pos, label, window}
-const fileIds = new WeakMap(); let nextFileId = 1;
-const fileId = f => { if (!fileIds.has(f)) fileIds.set(f, nextFileId++); return fileIds.get(f); };
-let playingKey = null;
-function playTarget() {
-  const v = $('playWhat').value;
-  if (!v) return null;
-  if (v.startsWith('j:')) {
-    const f = asm.result, j = asm.junctions[+v.slice(2)];
-    if (!f || j == null) return { error: 'assemble d’abord' };
-    const start = Math.max(0, j / 44100 - 5), end = j / 44100 + 5;
-    return { f, start, end, label: 'jonction ' + v.slice(2).replace(/\d+/, n => +n + 1), key: fileId(f) + '|' + start.toFixed(4) + '|' + end.toFixed(4) };
-  }
-  const f = files[+v.slice(2)];
-  return f ? { f, start: null, end: null, label: f.name, key: fileId(f) + '||' } : null;
-}
-function pruneCache() {
-  for (const [k, e] of renderCache) if (!files.includes(e.f)) { URL.revokeObjectURL(e.url); renderCache.delete(k); }
-  while (renderCache.size > RENDER_MAX) { const [k, e] = renderCache.entries().next().value; if (k === playingKey) break; URL.revokeObjectURL(e.url); renderCache.delete(k); }
-}
-function savePos() { const e = playingKey && renderCache.get(playingKey); if (e) e.pos = $('player').currentTime || 0; }
-function updatePlayButton() {
-  const t = playTarget();
-  $('playGo').textContent = t && t.key && renderCache.has(t.key) ? '▶ Écouter (en cache)' : '▶ Rendre et écouter';
-}
-async function playCached(key, autoplay) {
-  const e = renderCache.get(key), a = $('player');
-  renderCache.delete(key); renderCache.set(key, e);   // most recently used last
-  savePos();
-  if (playingKey !== key) {
-    a.src = e.url; playingKey = key;
-    await new Promise(r => { if (a.readyState >= 1) r(); else a.addEventListener('loadedmetadata', r, { once: true }); });
-    try { a.currentTime = e.pos || 0; } catch (x) {}
-  }
-  if (autoplay) await a.play().catch(() => {});
-  $('playMsg').textContent = e.label + (e.window ? ' (' + e.window + ', la jonction est à 5 s)' : '') + ' · ' + renderCache.size + ' rendu(s) en cache';
-}
-$('playWhat').addEventListener('change', async () => {
-  const t = playTarget();
-  updatePlayButton();
-  if (t && t.key && renderCache.has(t.key)) { const wasPlaying = !$('player').paused; await playCached(t.key, wasPlaying); }
-});
-$('playGo').addEventListener('click', async () => {
-  const t = playTarget();
-  if (!t) return;
-  if (t.error) { $('playMsg').textContent = t.error; return; }
-  if (renderCache.has(t.key)) { await playCached(t.key, true); return; }
-  $('playMsg').innerHTML = '<span class="spin"></span> rendu de ' + t.label + '…'; $('playGo').disabled = true;
-  try {
-    const f = t.f;
-    const r = await postJson('/api/render', { name: f.name, data: b64(f.raw && !f.dirty ? f.raw : f.bytes), start: t.start, end: t.end, loops: 1 });
-    renderCache.set(t.key, { url: URL.createObjectURL(r.blob), f, pos: 0, label: t.label,
-      window: t.start != null ? fmtTime(t.start * 44100) + ' → ' + fmtTime(t.end * 44100) : '' });
-    pruneCache();
-    await playCached(t.key, true);
-  } catch (e) { $('playMsg').textContent = e.message.split('\n')[0]; }
-  $('playGo').disabled = false;
-  updatePlayButton();
-});
+window.addEventListener('resize', () => { for (const c of document.querySelectorAll('canvas.wave')) if (c._draw) c._draw(); drawNow(); });
 pingServer();
 try { showModule(localStorage.getItem('vgmstudio.module') || 'tags'); } catch (e) { showModule('tags'); }
 const _renderList = renderList;
