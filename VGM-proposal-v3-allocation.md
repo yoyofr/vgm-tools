@@ -151,7 +151,10 @@ of the tool (100 % faithful, no lossy step).
    the same on a file), processed by the unchanged v1 logic, and written back as v3. Done 2026-10-31
    (v3 -> v1 -> v3 gives back every converted pack file byte for byte; trims of the v1 and v3 versions
    of a file render identically). VGM Studio renders v1 files with `vgm2wav-v1`, v3 files with `vgm2wav`.
-3. MAME logger (`vgmlog0288-es5506`): emit v3 (the same tables). Optionally merge cam900's WSG logging
-   from `mao_vgm` so WSG games can be captured from the same build.
+3. MAME logger: branch `vgmlog0289-es5506` (= `vgmlog0288-es5506` + MAME 0.289 merged) writes v3. The
+   devices still log the logical commands; `vgmwrite.cpp` translates them through a copy of `vgm_v3.h`
+   (`src/lib/util/vgmv3.h`), so a capture is exactly what `vgm_v3conv` would make of the v1 capture.
+   Header 0x120 for every ES5505/6 or ZSG-2 file. Optionally merge cam900's WSG logging from `mao_vgm`
+   so WSG games can be captured from the same build.
 4. Convert and verify every released pack (Darius Gaiden, Gunlock, Elevator Action Returns, Ray Storm,
    G-Darius, Ray Crisis...), then republish.
