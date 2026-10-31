@@ -166,7 +166,7 @@ button.mini { font-size: 12px; padding: 2px 8px }
       <div id="asm">
         <div>
           <h2>Parties</h2>
-          <div class="hint">Chaque partie est un fichier de la liste. « Boucles » = passages du corps de boucle (0 = intro seule ; vide = la partie garde sa boucle, normalement la dernière). « Entrée » / « Sortie » coupent la partie jouée (m:ss.sss) : tape la valeur ou tire les poignées sur l’onde ; un clic sur l’onde écoute depuis cet endroit. Les parties s’enchaînent sans silence : les voix encore actives à la jonction s’éteignent en 0,1 s pendant que la suite démarre, le DSP (réverbération) continue.</div>
+          <div class="hint">Chaque partie est un fichier de la liste. « Boucles » = passages du corps de boucle, écrits dans le fichier (0 = intro seule) ; pour la dernière partie, la boucle reste une vraie boucle VGM et N = nombre de boucles demandé au lecteur (en-tête, champ « Boucles » des tags), vide = défaut du lecteur. « Entrée » / « Sortie » coupent la partie jouée (m:ss.sss) : tape la valeur ou tire les poignées sur l’onde ; un clic sur l’onde écoute depuis cet endroit. Les parties s’enchaînent sans silence : les voix encore actives à la jonction s’éteignent en 0,1 s pendant que la suite démarre, le DSP (réverbération) continue.</div>
         </div>
         <div class="parts" id="asmParts"></div>
         <div class="asmbar"><button type="button" id="asmAdd">+ Partie</button><span class="hint" id="asmTotal"></span></div>
@@ -1123,9 +1123,16 @@ let asmNameAuto = true;
 $('asmName').addEventListener('input', () => { asmNameAuto = $('asmName').value.trim() === ''; if (asmNameAuto) renderAsm(); });
 function uniqueName(name, keep) { let n = name, k = 2; while (files.some(f => f.name === n && f !== keep)) n = name.replace(/(\.vgz)$/i, '') + ' (' + k++ + ').vgz'; return n; }
 function partFile(p) { return files.find(f => f.name === p.name && f.size === p.size) || null; }
-const repeatOf = p => p.repeat === '' || p.repeat == null ? null : Math.max(0, Math.floor(+p.repeat));
+// the last part keeps its loop in the VGM: its « Boucles » N >= 1 is the loop count asked of the player
+// (header loop base, players loop twice by default), N = 0 = intro only, no loop; the other parts are
+// unrolled (a VGM has one loop point)
+const isLast = p => asm.parts[asm.parts.length - 1] === p;
+const lastLoops = p => { if (!isLast(p) || p.repeat === '' || p.repeat == null) return null; const f = partFile(p), n = Math.max(0, Math.floor(+p.repeat)); return f && loopOf(f.bytes) && n >= 1 ? n : null; };
+const repeatOf = p => p.repeat === '' || p.repeat == null || lastLoops(p) != null ? null : Math.max(0, Math.floor(+p.repeat));
 function played(f, p) {   // length (s) of the part before the cut, and a description
   const total = totalOf(f.bytes) / 44100, loop = loopOf(f.bytes) / 44100, n = repeatOf(p);
+  const ln = lastLoops(p);
+  if (ln != null) return { len: total, loop, text: 'boucle conservée, ' + ln + ' boucle(s) au lecteur' };
   if (n == null || !loop) return { len: total, loop: n == null && loop ? loop : 0, text: loop ? 'garde sa boucle' : 'sans boucle' };
   return { len: total - loop + n * loop, loop: 0, text: n === 0 ? 'intro seule' : 'intro + ' + n + ' × ' + fmtSec(loop) };
 }
@@ -1178,7 +1185,7 @@ function renderAsm() {
     sel.innerHTML = '<option value="">— choisir —</option>' + list.map(x => `<option value="${x.i}" ${f === x.f ? 'selected' : ''}>${x.f.name}</option>`).join('');
     sel.addEventListener('change', () => { const x = files[+sel.value]; if (x) { p.name = x.name; p.size = x.size; p.start = p.end = null; } else p.name = null; renderAsm(); });
     const num = (ph, val, title, on) => { const i = document.createElement('input'); i.type = 'text'; i.placeholder = ph; i.value = val; i.title = title; i.addEventListener('change', () => on(i)); i.addEventListener('keydown', e => { if (e.key === 'Enter') on(i); }); return i; };
-    const rep = num(k === asm.parts.length - 1 ? 'boucle' : '1', p.repeat, 'Passages du corps de boucle (0 = intro seule) ; vide = garde la boucle du fichier', i => { p.repeat = i.value.trim() === '' ? '' : String(Math.max(0, Math.floor(+i.value) || 0)); renderAsm(); });
+    const rep = num(k === asm.parts.length - 1 ? 'boucle' : '1', p.repeat, k === asm.parts.length - 1 ? 'Dernière partie : la boucle reste une boucle dans le VGM ; N = nombre de boucles demandé au lecteur (en-tête), 0 = intro seule sans boucle, vide = défaut du lecteur' : 'Passages du corps de boucle, écrits dans le fichier (0 = intro seule) ; vide = garde la boucle du fichier', i => { p.repeat = i.value.trim() === '' ? '' : String(Math.max(0, Math.floor(+i.value) || 0)); renderAsm(); });
     const inp = num('0:00.000', fmtSec(p.start), 'Point d’entrée (m:ss.sss) dans la partie jouée ; vide = début', i => { const v = parseSec(i.value); if (!isNaN(v)) p.start = v; renderAsm(); });
     const outp = num('fin', fmtSec(p.end), 'Point de sortie (m:ss.sss) ; vide = fin', i => { const v = parseSec(i.value); if (!isNaN(v)) p.end = v; renderAsm(); });
     const info = document.createElement('span'); info.className = 't';
@@ -1191,7 +1198,7 @@ function renderAsm() {
       const C = cutOf(f, p);
       if (k) junctions.push(t);
       const len = C.b - C.a;
-      info.textContent = fmtSec(t) + ' → ' + fmtSec(t + len) + ' · ' + fmtSec(len) + ' · ' + (C.keepsLoop ? 'garde sa boucle (' + fmtSec(C.P.loop) + ')' : C.P.text + (C.a > 0 || C.b < C.P.len - 1e-6 ? ', coupée' : ''));
+      info.textContent = fmtSec(t) + ' → ' + fmtSec(t + len) + ' · ' + fmtSec(len) + ' · ' + (C.keepsLoop ? (lastLoops(p) != null ? 'boucle ' + fmtSec(C.P.loop) + ' × ' + lastLoops(p) + ' au lecteur' : 'garde sa boucle (' + fmtSec(C.P.loop) + ')') : C.P.text + (C.a > 0 || C.b < C.P.len - 1e-6 ? ', coupée' : ''));
       info.title = info.textContent;
       t += len;
       if (C.keepsLoop) loopKept = k;
@@ -1370,9 +1377,11 @@ $('asmGo').addEventListener('click', async () => {
     const old = asm.result ? files.indexOf(asm.result) : -1;
     if (old >= 0 && asm.result.name === name) files.splice(old, 1);
     files.push(f); sortFiles(); select(files.indexOf(f));
+    const ln = lastLoops(asm.parts[asm.parts.length - 1]);
+    if (ln != null && loopOf(f.bytes)) { f.loopMod = 0; f.loopBase = Math.max(-128, Math.min(127, 2 - ln)); f.dirty = true; }
     asm.result = f;
     asm.resultJunctions = (j.junctions || []).map(x => x / 44100);
-    $('asmMsg').textContent = 'assemblé : ' + name + ' (' + fmtTime(totalOf(f.bytes)) + (loopOf(f.bytes) ? ', boucle ' + fmtTime(loopOf(f.bytes)) : '') + ') — ajouté à la liste, « Enregistrer » pour l’écrire';
+    $('asmMsg').textContent = 'assemblé : ' + name + ' (' + fmtTime(totalOf(f.bytes)) + (loopOf(f.bytes) ? ', boucle ' + fmtTime(loopOf(f.bytes)) + (ln != null ? ' × ' + ln + ' au lecteur' : '') : '') + ') — ajouté à la liste, « Enregistrer » pour l’écrire';
     $('asmMsg').className = 'hint ok';
   } catch (e) { $('asmMsg').textContent = e.message.split('\n')[0]; $('asmMsg').className = 'hint warn'; $('asmLog').textContent = e.message; }
   renderAsm();
