@@ -72,7 +72,9 @@ player plays):
 python3 vgmstudio.py            # then open http://127.0.0.1:8765/  (--port, --vgm-trim, --vgm2wav)
 ```
 
-Opened as a plain file, vgmstudio.html still works as the tag editor alone.
+Opened as a plain file, vgmstudio.html still works as the tag editor alone. `macos/make_app.sh` builds
+"VGM Studio.app" in `~/Applications` (a launcher: starts the backend if it is not running, then opens the
+page in Chrome; log in `~/Library/Logs/vgmstudio.log`).
 
 The **Tags** module is a GD3 tag editor (open it in Chrome for in-place saving). Japanese tags, batch
 copy of a field to every loaded file, title from the file name (track number and extension

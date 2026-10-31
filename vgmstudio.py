@@ -66,6 +66,8 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 self.send_error(404, "vgmstudio.html not found next to vgmstudio.py"); return
             self.send_bytes(data, "text/html; charset=utf-8")
+        elif self.path == "/favicon.ico":
+            self.send_response(204); self.end_headers()
         elif self.path == "/api/ping":
             self.send_json({"ok": True, "tools": TOOLS})
         else:
