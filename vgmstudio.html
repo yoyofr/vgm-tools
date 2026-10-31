@@ -1094,6 +1094,7 @@ function renderAsm() {
     asm.junctions.map((j, k) => `<option value="j:${k}">jonction ${k + 1} → ${k + 2} (${fmtTime(j)}) ±5 s</option>`).join('');
   if ([...pw.options].some(o => o.value === prev)) pw.value = prev;
   $('playGo').disabled = !(serverOk && pw.options.length);
+  if (typeof updatePlayButton === 'function') { pruneCache(); updatePlayButton(); }
 }
 $('asmAdd').addEventListener('click', () => {
   const list = vgmFiles();
@@ -1133,25 +1134,67 @@ $('asmGo').addEventListener('click', async () => {
   } catch (e) { $('asmMsg').textContent = e.message.split('\n')[0]; $('asmMsg').className = 'hint warn'; $('asmLog').textContent = e.message; }
   renderAsm();
 });
-$('playGo').addEventListener('click', async () => {
+// rendered audio cache: one entry per (file, window), kept while the file stays loaded; switching the
+// choice plays the cached render at once and resumes where it was left (LRU, at most RENDER_MAX entries)
+const RENDER_MAX = 16;
+const renderCache = new Map();   // key -> {url, f, pos, label, window}
+const fileIds = new WeakMap(); let nextFileId = 1;
+const fileId = f => { if (!fileIds.has(f)) fileIds.set(f, nextFileId++); return fileIds.get(f); };
+let playingKey = null;
+function playTarget() {
   const v = $('playWhat').value;
-  let f, start = null, end = null, label;
+  if (!v) return null;
   if (v.startsWith('j:')) {
-    f = asm.result; const j = asm.junctions[+v.slice(2)];
-    if (!f) { $('playMsg').textContent = 'assemble d’abord'; return; }
-    start = Math.max(0, j / 44100 - 5); end = j / 44100 + 5; label = 'jonction';
-  } else { f = files[+v.slice(2)]; label = f.name; }
-  $('playMsg').innerHTML = '<span class="spin"></span> rendu de ' + label + '…'; $('playGo').disabled = true;
+    const f = asm.result, j = asm.junctions[+v.slice(2)];
+    if (!f || j == null) return { error: 'assemble d’abord' };
+    const start = Math.max(0, j / 44100 - 5), end = j / 44100 + 5;
+    return { f, start, end, label: 'jonction ' + v.slice(2).replace(/\d+/, n => +n + 1), key: fileId(f) + '|' + start.toFixed(4) + '|' + end.toFixed(4) };
+  }
+  const f = files[+v.slice(2)];
+  return f ? { f, start: null, end: null, label: f.name, key: fileId(f) + '||' } : null;
+}
+function pruneCache() {
+  for (const [k, e] of renderCache) if (!files.includes(e.f)) { URL.revokeObjectURL(e.url); renderCache.delete(k); }
+  while (renderCache.size > RENDER_MAX) { const [k, e] = renderCache.entries().next().value; if (k === playingKey) break; URL.revokeObjectURL(e.url); renderCache.delete(k); }
+}
+function savePos() { const e = playingKey && renderCache.get(playingKey); if (e) e.pos = $('player').currentTime || 0; }
+function updatePlayButton() {
+  const t = playTarget();
+  $('playGo').textContent = t && t.key && renderCache.has(t.key) ? '▶ Écouter (en cache)' : '▶ Rendre et écouter';
+}
+async function playCached(key, autoplay) {
+  const e = renderCache.get(key), a = $('player');
+  renderCache.delete(key); renderCache.set(key, e);   // most recently used last
+  savePos();
+  if (playingKey !== key) {
+    a.src = e.url; playingKey = key;
+    await new Promise(r => { if (a.readyState >= 1) r(); else a.addEventListener('loadedmetadata', r, { once: true }); });
+    try { a.currentTime = e.pos || 0; } catch (x) {}
+  }
+  if (autoplay) await a.play().catch(() => {});
+  $('playMsg').textContent = e.label + (e.window ? ' (' + e.window + ', la jonction est à 5 s)' : '') + ' · ' + renderCache.size + ' rendu(s) en cache';
+}
+$('playWhat').addEventListener('change', async () => {
+  const t = playTarget();
+  updatePlayButton();
+  if (t && t.key && renderCache.has(t.key)) { const wasPlaying = !$('player').paused; await playCached(t.key, wasPlaying); }
+});
+$('playGo').addEventListener('click', async () => {
+  const t = playTarget();
+  if (!t) return;
+  if (t.error) { $('playMsg').textContent = t.error; return; }
+  if (renderCache.has(t.key)) { await playCached(t.key, true); return; }
+  $('playMsg').innerHTML = '<span class="spin"></span> rendu de ' + t.label + '…'; $('playGo').disabled = true;
   try {
-    const r = await postJson('/api/render', { name: f.name, data: b64(f.raw && !f.dirty ? f.raw : f.bytes), start, end, loops: 1 });
-    const a = $('player');
-    if (a.dataset.url) URL.revokeObjectURL(a.dataset.url);
-    a.src = a.dataset.url = URL.createObjectURL(r.blob);
-    if (start != null) a.currentTime = 0;
-    await a.play().catch(() => {});
-    $('playMsg').textContent = label + (start != null ? ' (' + fmtTime(start * 44100) + ' → ' + fmtTime(end * 44100) + ', la jonction est à 5 s)' : '');
+    const f = t.f;
+    const r = await postJson('/api/render', { name: f.name, data: b64(f.raw && !f.dirty ? f.raw : f.bytes), start: t.start, end: t.end, loops: 1 });
+    renderCache.set(t.key, { url: URL.createObjectURL(r.blob), f, pos: 0, label: t.label,
+      window: t.start != null ? fmtTime(t.start * 44100) + ' → ' + fmtTime(t.end * 44100) : '' });
+    pruneCache();
+    await playCached(t.key, true);
   } catch (e) { $('playMsg').textContent = e.message.split('\n')[0]; }
   $('playGo').disabled = false;
+  updatePlayButton();
 });
 pingServer();
 try { showModule(localStorage.getItem('vgmstudio.module') || 'tags'); } catch (e) { showModule('tags'); }
