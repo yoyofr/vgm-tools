@@ -1182,7 +1182,20 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			if (skip) emit_splice();
 			loop_body_ofs = body.size();
 			emitters[0].out_page = emitters[1].out_page = -1;
-			if (!st_end.empty()) { st2 = st_end; track2 = do_cmp; loop_report(); }
+			if (!st_end.empty())
+			{
+				st2 = st_end;
+				// the second pass is tracked for --cmp (redundant writes) and for --sro (ROM it plays:
+				// it starts from the end-of-body state, so it can read ranges the first pass never does)
+				track2 = do_cmp || do_sro;
+				for (int ci = 0; ci < 2; ci++)
+				{
+					for (int r = 0; r < 4; r++) st2[ci].rom_used[r].clear();
+					for (int v = 0; v < 32; v++)
+						if ((st2[ci].running >> v) & 1) st2[ci].note_rom_use(v);
+				}
+				loop_report();
+			}
 			// first thing in the loop body: the full voice state as it plays here in the first pass,
 			// so that the second pass starts from the same sound whatever the body left behind
 			for (int ci = 0; ci < 2; ci++)
@@ -1270,7 +1283,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			raw_changed = st.gain(d[p + 2], (d[p + 3] << 8) | d[p + 4]);
 			if (in_body) raw_changed |= st2[ci].gain(d[p + 2], (d[p + 3] << 8) | d[p + 4]);
 		}
-		if (in_body && nwrites > 0 && rw.reg != PAGE_REG)
+		if (do_cmp && in_body && nwrites > 0 && rw.reg != PAGE_REG)
 		{
 			// keep the write when it changes the register in the second pass; a byte-lane write
 			// becomes a full write when the other lane differs in the second pass (if that lane is
@@ -1320,7 +1333,12 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 	Bytes blocks(other_blocks);
 	stats.rom_bytes = 0;
 	for (int ci = 0; ci < 2; ci++)
+	{
+		if (do_sro && track2)
+			for (int r = 0; r < 4; r++)
+				states[ci].rom_used[r].insert(states[ci].rom_used[r].end(), st2[ci].rom_used[r].begin(), st2[ci].rom_used[r].end());
 		stats.rom_bytes += roms[ci].blocks(blocks, ci ? 0x80 : 0x00, do_sro ? states[ci].rom_used : nullptr, sro_margin, sro_gap);
+	}
 
 	Bytes out(vgm.data.begin(), vgm.data.begin() + vgm.data_ofs);
 	// files using the ES55xx extension are VGM 1.72 with a 0x100-byte header; upgrade older captures
@@ -2170,7 +2188,13 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 			flush_wait();
 			if (skip) emit_splice();
 			loop_body_ofs = body.size();
-			if (st_end) { st2.reset(new ZSG2State(*st_end)); track2 = do_cmp; }
+			if (st_end)
+			{
+				st2.reset(new ZSG2State(*st_end));
+				track2 = do_cmp || do_sro;   // --sro: ROM played by the second pass (see trim())
+				st2->rom_used.clear();
+				for (int vi = 0; vi < 48; vi++) if (st2->voice[vi].active) st2->note_rom_use(vi);
+			}
 			if (g_loop_as_is) return;
 			int rekeyed, lost;
 			st.image(body, loop, ZSG2State::IMAGE_LOOP, rekeyed, lost, st2.get());
@@ -2271,6 +2295,7 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 	body.push_back(0x66);
 
 	Bytes blocks(other_blocks);
+	if (do_sro && track2 && st2) st.rom_used.insert(st.rom_used.end(), st2->rom_used.begin(), st2->rom_used.end());
 	stats.rom_bytes = rom.blocks(blocks, 0x00, do_sro ? &st.rom_used : nullptr, sro_margin, sro_gap);
 
 	Bytes out(vgm.data.begin(), vgm.data.begin() + vgm.data_ofs);

@@ -35,9 +35,12 @@ offset, no state image added at the loop point, so the second pass plays exactly
 50 ms when that removes 0.25 s or more; with an effect DSP (ES5510 of the Taito F3) the render is then not
 bit-identical, since the DSP ran during the silence (modulation phase, delay memory).
 
-Known limit: on a file whose loop body was made by an earlier vgm_trim run, `--sro` can drop a sample range
-that only the second pass of the loop reads (seen on Darius Gaiden 05); VGM Studio checks every result by
-rendering and falls back to `--cmp` alone in that case.
+`--sro` keeps the sample ranges played by both passes of the loop: the second pass starts from the state
+left at the end of the body and can read ranges the first pass never does (Darius Gaiden 05). VGM Studio
+still checks every result by rendering and falls back to `--cmp` alone if `--sro` ever changes the sound.
+Known limit (2026-11-01, re-trim of the released packs with the loop kept): `--cmp` alone is not exact on
+some Elevator Action Returns / RayForce / RayStorm / Super Puzzle Bobble files, `--sro` alone on some
+G-Darius / RayStorm / Super Puzzle Bobble files; VGM Studio detects it and leaves those files unchanged.
 
 A `.wav` input (for example the `<capture>.wav` that MAME's `-vgmwav` option records alongside each
 capture: same start and stop, same numbering) goes through the same silence split, margins, `--start`
