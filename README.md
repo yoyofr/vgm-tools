@@ -65,6 +65,15 @@ a ZSG-2 voice model; the loop detection also follows the pitch, volume, filter a
 on sustained voices (Ray Crisis plays most of a song that way, with the drums keyed from the
 first bar); the loop body is taken from the second repetition when captured (seamless loop).
 
+Namco WSG family logs (WSG, C15, C30, Pole Position WSG of libvgm PR #151: commands 0x45-0x48, 0xCA/0xCB,
+RAM blocks 0xC4-0xC7, clocks at 0x100-0x10C) have their own path too. Their writes only set state, so a
+cut writes the register and wave memory state at the start, the loop point gets every register / byte
+that differs between the loop point and the end of the loop body (both passes continue from the same
+state), and `--cmp` drops writes that change nothing. `--find-loop`, `--activity` and `--split log` use the
+voice parameters: a note is a voice becoming audible or changing pitch / waveform (the drivers rarely key
+off between notes), volume changes must recur too. Checked by replaying the cut files (2 loop passes)
+against the capture: the chip state is identical at every write. `--sro` and `--append` do not apply.
+
 ## vgmstudio.html (formerly gd3edit.html)
 
 Local, single-file tool with two modules: **Tags** (the GD3 editor below) and **Assemblage**, which chains

@@ -1,5 +1,5 @@
-// vgm_trim - trim / loop / split / de-duplicate / ROM-optimise VGM logs; ES5505/ES5506 (+ ES5510 ESP)
-// extension aware.
+// vgm_trim - trim / loop / split / de-duplicate / ROM-optimise VGM logs; ES5505/ES5506 (+ ES5510 ESP),
+// ZSG-2 (+ TMS57002) and Namco WSG / C15 / C30 / Pole Position WSG aware.
 // Output ending in .vgz is gzip-compressed (zlib).
 //
 // build: c++ -O2 -std=c++17 -o vgm_trim vgm_trim.cpp libvgm/emu/cores/tms57002.cpp -lz
@@ -233,8 +233,8 @@ struct VGMFile
 {
 	Bytes data;
 	u32 version = 0, eof = 0, gd3 = 0, total = 0, loop_ofs = 0, loop_samples = 0, data_ofs = 0;
-	u32 es5506_clock = 0, zsg2_clock = 0;
-	bool is_es5506 = false, is_zsg2 = false;
+	u32 es5506_clock = 0, zsg2_clock = 0, wsg_clock[4] = {};
+	bool is_es5506 = false, is_zsg2 = false, is_wsg = false;
 
 	void load(const std::string& path)
 	{
@@ -281,8 +281,13 @@ struct VGMFile
 		data_ofs = (version >= 0x150) ? le32(&data[0x34]) + 0x34 : 0x40;
 		es5506_clock = (data_ofs > 0xD3) ? le32(&data[0xD0]) : 0;
 		is_es5506 = (es5506_clock & 0x80000000) != 0;
-		zsg2_clock = (data_ofs > 0x103) ? le32(&data[0x100]) : 0;   // VGM 1.72 extension: ZSG-2 (Taito Zoom) clock at 0x100 (header 0x110)
+		// v1 ZSG-2 (Taito Zoom) clock at 0x100, header exactly 0x110 (a v3 ZSG-2 file is converted to v1 above).
+		// A longer header carries the Namco WSG family clocks at 0x100-0x10C (libvgm PR #151)
+		zsg2_clock = (data_ofs == 0x110) ? le32(&data[0x100]) : 0;
 		is_zsg2 = zsg2_clock != 0;
+		if (data_ofs >= 0x110 && !is_zsg2)
+			for (int k = 0; k < 4; k++) { wsg_clock[k] = le32(&data[0x100 + 4 * k]); if (wsg_clock[k]) is_wsg = true; }
+		if (is_wsg && es5506_clock) die("Namco WSG and ES55xx in the same file: not supported");
 	}
 
 	// iterate the commands: f(cmd) returns false to stop
@@ -1354,6 +1359,153 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 }
 
 // ---------------------------------------------------------------------------------------------
+// Namco WSG family (libvgm PR #151): register writes 0x45 WSG, 0x46 C15, 0x47 C30, 0x48 Pole Position
+// WSG (offset bit 7 = 2nd chip); memory writes 0xCA (WSG PROM) and 0xCB (C30 wave RAM), address bit 15 =
+// 2nd chip; RAM blocks 0xC4-0xC7 (size bit 31 = 2nd chip). In the cores every write only sets state
+// (the C15 register 2 also sets the voice's phase), and unwritten state is 0 after the reset, so the
+// state at a cut is the last value written to each register and memory byte.
+// ---------------------------------------------------------------------------------------------
+static const char* const WSG_NAME[4] = {"Namco WSG", "Namco C15", "Namco C30", "Namco Pole Position WSG"};
+static const int WSG_VOICES[4] = {3, 8, 8, 8};
+
+struct WsgVoice
+{
+	int vol = 0, wave = 0;
+	u32 freq = 0;
+	bool noise = false;
+	bool audible() const { return vol > 0 && (freq != 0 || noise); }
+	bool operator==(const WsgVoice& o) const { return vol == o.vol && wave == o.wave && freq == o.freq && noise == o.noise; }
+};
+
+struct WsgState
+{
+	int16_t reg[4][2][128];   // -1: never written (0 in the core)
+	int16_t mem[4][2][256];
+	bool used[4][2] = {};
+	WsgState() { memset(reg, 0xFF, sizeof reg); memset(mem, 0xFF, sizeof mem); }
+
+	static bool is_cmd(u8 op) { return (op >= 0x45 && op <= 0x48) || op == 0xCA || op == 0xCB; }
+	static bool is_block(const u8* d) { return d[0] == 0x67 && d[2] >= 0xC4 && d[2] <= 0xC7; }
+	int rv(int t, int c, int a) const { return reg[t][c][a] < 0 ? 0 : reg[t][c][a]; }
+
+	// apply a 0x45-0x48 / 0xCA / 0xCB command or a 0xC4-0xC7 block; true when the state changed
+	bool apply(const u8* d)
+	{
+		u8 op = d[0];
+		bool ch = false;
+		if (op >= 0x45 && op <= 0x48)
+		{
+			int t = op - 0x45, c = d[1] >> 7, a = d[1] & 0x7F;
+			used[t][c] = true;
+			ch = reg[t][c][a] != d[2];
+			reg[t][c][a] = d[2];
+		}
+		else if (op == 0xCA || op == 0xCB)
+		{
+			// the cores take the low address byte; the WSG keeps the low nibble only (its block write does not)
+			int t = op == 0xCA ? 0 : 2, c = d[1] >> 7;
+			int16_t v = op == 0xCA ? (d[3] & 0x0F) : d[3];
+			used[t][c] = true;
+			ch = mem[t][c][d[2]] != v;
+			mem[t][c][d[2]] = v;
+		}
+		else if (is_block(d))
+		{
+			u32 sz = le32(&d[3]);
+			int t = d[2] - 0xC4, c = sz >> 31;
+			sz &= 0x7FFFFFFF;
+			if (sz < 2) return false;
+			u32 ofs = d[7] | (d[8] << 8);
+			used[t][c] = true;
+			for (u32 i = 0; i + 2 < sz && ofs + i < 256; i++)
+			{
+				ch |= mem[t][c][ofs + i] != d[9 + i];
+				mem[t][c][ofs + i] = d[9 + i];
+			}
+		}
+		return ch;
+	}
+
+	WsgVoice voice(int t, int c, int v) const
+	{
+		WsgVoice o;
+		switch (t)
+		{
+		case 0:   // Pac-Man map: wave 0x05+5v, frequency nibbles 0x10+5v.. (voice 0 has the extra low nibble), volume 0x15+5v
+			o.wave = rv(t, c, 0x05 + 5 * v) & 7;
+			for (int k = v ? 1 : 0; k < 5; k++) o.freq |= (u32)(rv(t, c, 0x10 + 5 * v + k) & 15) << (4 * k);
+			o.vol = rv(t, c, 0x15 + 5 * v) & 15;
+			break;
+		case 1:   // C15: 8 bytes per voice, volume +3, frequency +4/+5/+6 low nibble, wave +6 high nibble
+			o.vol = rv(t, c, v * 8 + 3) & 15;
+			o.freq = rv(t, c, v * 8 + 4) | (rv(t, c, v * 8 + 5) << 8) | ((rv(t, c, v * 8 + 6) & 15) << 16);
+			o.wave = (rv(t, c, v * 8 + 6) >> 4) & 7;
+			break;
+		case 2:   // C30: left volume +0, wave/frequency +1, frequency +2/+3, right volume +4 (bit 7: noise of the next voice)
+			o.vol = std::max(rv(t, c, v * 8) & 15, rv(t, c, v * 8 + 4) & 15);
+			o.freq = ((rv(t, c, v * 8 + 1) & 15) << 16) | (rv(t, c, v * 8 + 2) << 8) | rv(t, c, v * 8 + 3);
+			o.wave = rv(t, c, v * 8 + 1) >> 4;
+			o.noise = (rv(t, c, ((v + 7) & 7) * 8 + 4) >> 7) & 1;
+			break;
+		case 3:   // Pole Position: frequency 4v/4v+1, volumes 4v+2 (high), 4v+3 (both nibbles), 0x23+4v (wave, external, high)
+		{
+			int w = rv(t, c, 0x23 + 4 * v), f = rv(t, c, 4 * v + 3);
+			o.freq = rv(t, c, 4 * v) | (rv(t, c, 4 * v + 1) << 8);
+			o.wave = w & 7;
+			o.vol = (w & 8) ? 0 : std::max(std::max(f >> 4, f & 15), std::max(rv(t, c, 4 * v + 2) >> 4, w >> 4));
+			break;
+		}
+		}
+		return o;
+	}
+	int audible() const
+	{
+		int n = 0;
+		for (int t = 0; t < 4; t++)
+			for (int c = 0; c < 2; c++)
+				if (used[t][c])
+					for (int v = 0; v < WSG_VOICES[t]; v++) n += voice(t, c, v).audible();
+		return n;
+	}
+
+	// write what makes a player in state `cur` reach this state (unknown = 0, the reset value). With `also`,
+	// every register / byte where `also` differs from this state is written too (loop point: the second pass
+	// arrives with the state of the end of the loop body). Memory first, as blocks of contiguous bytes.
+	void sync(Bytes& out, WsgState& cur, const WsgState* also, i64* count = nullptr) const
+	{
+		auto val = [](int16_t x) { return x < 0 ? 0 : x; };
+		for (int t = 0; t < 4; t++)
+			for (int c = 0; c < 2; c++)
+			{
+				if (!used[t][c] && !(also && also->used[t][c]) && !cur.used[t][c]) continue;
+				for (int a = 0; a < 256;)
+				{
+					auto need = [&](int i) { int16_t v = val(mem[t][c][i]); return val(cur.mem[t][c][i]) != v || (also && val(also->mem[t][c][i]) != v); };
+					if (!need(a)) { a++; continue; }
+					int b = a;
+					while (b < 256 && need(b)) b++;
+					out.insert(out.end(), {0x67, 0x66, u8(0xC4 + t)});
+					push_le32(out, (u32)(b - a + 2) | (c ? 0x80000000u : 0));
+					out.push_back(a & 0xFF); out.push_back(a >> 8);
+					for (int i = a; i < b; i++) { out.push_back((u8)val(mem[t][c][i])); cur.mem[t][c][i] = val(mem[t][c][i]); }
+					cur.used[t][c] = true;
+					if (count) (*count)++;
+					a = b;
+				}
+				for (int a = 0; a < 128; a++)
+				{
+					int16_t v = val(reg[t][c][a]);
+					if (val(cur.reg[t][c][a]) == v && !(also && val(also->reg[t][c][a]) != v)) continue;
+					out.insert(out.end(), {u8(0x45 + t), u8(a | (c << 7)), (u8)v});
+					cur.reg[t][c][a] = v;
+					cur.used[t][c] = true;
+					if (count) (*count)++;
+				}
+			}
+	}
+};
+
+// ---------------------------------------------------------------------------------------------
 // info / activity
 // ---------------------------------------------------------------------------------------------
 static void info(const VGMFile& vgm)
@@ -1371,9 +1523,10 @@ static void info(const VGMFile& vgm)
 			b.n++; b.bytes += c.len - 7;
 		}
 		u8 op = c.op;
-		if ((op >= 0x50 && op <= 0x5F) || (op >= 0x30 && op <= 0x4E) ||
-		    (op >= 0xA0 && op <= 0xDF && op != 0xBE && op != 0xD6 && op != 0xD7 && op != 0xD8) || op == 0xE0 || op == 0xE1)
-			other.insert(op);
+		if (vgm.is_wsg ? !WsgState::is_cmd(op) : true)
+			if ((op >= 0x50 && op <= 0x5F) || (op >= 0x30 && op <= 0x4E) ||
+			    (op >= 0xA0 && op <= 0xDF && op != 0xBE && op != 0xD6 && op != 0xD7 && op != 0xD8) || op == 0xE0 || op == 0xE1)
+				other.insert(op);
 		return true;
 	});
 	ui::section("File");
@@ -1388,7 +1541,16 @@ static void info(const VGMFile& vgm)
 	}
 	if (vgm.is_zsg2) kv.add("Chip", strf("ZSG-2 at %u Hz (%u Hz output), TMS57002 DSP at %u Hz", vgm.zsg2_clock, vgm.zsg2_clock / 768, vgm.zsg2_clock / 2));
 	else if (vgm.es5506_clock) kv.add("Chip", strf("%s at %u Hz, %d stereo pair(s)%s", vgm.is_es5506 ? "ES5506" : "ES5505", vgm.es5506_clock & 0x3FFFFFFF, vgm.data.size() > 0xD5 ? vgm.data[0xD5] : 0, (vgm.es5506_clock & 0x40000000) ? ", dual" : ""));
-	else kv.add("Chip", "no ES55xx / ZSG-2 clock");
+	else if (vgm.is_wsg)
+	{
+		std::string chips;
+		for (int k = 0; k < 4; k++)
+			if (vgm.wsg_clock[k])
+				chips += strf("%s%s at %u Hz%s", chips.empty() ? "" : ", ", WSG_NAME[k], vgm.wsg_clock[k] & 0x3FFFFFFF,
+				              (vgm.wsg_clock[k] & 0x40000000) ? " (dual)" : (k == 2 && (vgm.wsg_clock[k] & 0x80000000)) ? " (stereo)" : "");
+		kv.add("Chip", chips);
+	}
+	else kv.add("Chip", "no ES55xx / ZSG-2 / Namco WSG clock");
 	kv.add("Size", ui::bytes(vgm.data.size()));
 	kv.print();
 	if (!blocks.empty())
@@ -1410,6 +1572,7 @@ static void info(const VGMFile& vgm)
 
 // gaps where no voice is audible (running with a non-zero volume)
 static std::vector<std::pair<i64, i64>> zsg2_activity(const VGMFile& vgm, i64 min_gap, bool quiet);
+static std::vector<std::pair<i64, i64>> wsg_activity(const VGMFile& vgm, i64 min_gap, bool quiet);
 static void print_activity(const std::map<i64, int>& per_sec, const std::vector<std::pair<i64, i64>>& gaps, i64 min_gap)
 {
 	ui::section("Running voices per second (max)");
@@ -1425,6 +1588,7 @@ static void print_activity(const std::map<i64, int>& per_sec, const std::vector<
 static std::vector<std::pair<i64, i64>> activity(const VGMFile& vgm, i64 min_gap, bool quiet)
 {
 	if (vgm.is_zsg2) return zsg2_activity(vgm, min_gap, quiet);
+	if (vgm.is_wsg) return wsg_activity(vgm, min_gap, quiet);
 	const u8* d = vgm.data.data();
 	ES55xxState states[2] = {ES55xxState(vgm.is_es5506), ES55xxState(vgm.is_es5506)};
 	std::map<i64, int> per_sec;
@@ -2128,6 +2292,225 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 }
 
 
+// note events of the WSG voices, from the voice parameters after all writes of one time step: a note is a
+// voice becoming audible or changing pitch / waveform while audible (the drivers rarely key off between
+// notes); volume changes and silencing are the other events that must recur
+static void wsg_notes(const VGMFile& vgm, bool bounded, i64 search_to, std::vector<NoteEvent>& keyons, std::vector<NoteEvent>& all)
+{
+	const u8* d = vgm.data.data();
+	WsgState st;
+	WsgVoice prev[4][2][8];
+	i64 cur_t = -1;
+	bool dirty = false;
+	auto flush = [&]() {
+		if (!dirty) return;
+		dirty = false;
+		for (int t = 0; t < 4; t++)
+			for (int c = 0; c < 2; c++)
+			{
+				if (!st.used[t][c]) continue;
+				for (int v = 0; v < WSG_VOICES[t]; v++)
+				{
+					WsgVoice now = st.voice(t, c, v), &p = prev[t][c][v];
+					if (now == p) continue;
+					i64 id = t * 16 + c * 8 + v;
+					if (now.audible() && (!p.audible() || now.freq != p.freq || now.wave != p.wave || now.noise != p.noise))
+					{
+						NoteEvent e{cur_t, NoteKey{id, now.wave | (now.noise << 4), 0, (i64)now.freq}};
+						keyons.push_back(e);
+						all.push_back(e);
+					}
+					else if (now.audible() && now.vol != p.vol) all.push_back({cur_t, NoteKey{id, 0x100 + now.vol, 0, -1}});
+					else if (!now.audible() && p.audible()) all.push_back({cur_t, NoteKey{id, 0x200, 0, -1}});
+					p = now;
+				}
+			}
+	};
+	vgm.commands([&](const Cmd& c) {
+		if (c.op == 0x66 || (bounded && c.t >= search_to)) return false;
+		if (!WsgState::is_cmd(c.op) && !(c.op == 0x67 && WsgState::is_block(&d[c.p]))) return true;
+		if (c.t != cur_t) { flush(); cur_t = c.t; }
+		dirty |= st.apply(&d[c.p]);
+		return true;
+	});
+	flush();
+}
+
+// gaps where no WSG voice is audible (non-zero volume and frequency, or noise)
+static std::vector<std::pair<i64, i64>> wsg_activity(const VGMFile& vgm, i64 min_gap, bool quiet)
+{
+	const u8* d = vgm.data.data();
+	WsgState st;
+	std::map<i64, int> per_sec;
+	std::vector<std::pair<i64, i64>> gaps;
+	i64 gap_start = -1, cur_t = 0;
+	auto sample = [&](i64 t) {
+		int n = st.audible();
+		if (!quiet)
+		{
+			i64 sec = t / SAMPLE_RATE;
+			auto it = per_sec.find(sec);
+			if (it == per_sec.end()) per_sec[sec] = n; else it->second = std::max(it->second, n);
+		}
+		if (n == 0) { if (gap_start < 0) gap_start = t; }
+		else if (gap_start >= 0)
+		{
+			if (t - gap_start >= min_gap || gaps.empty()) gaps.push_back({gap_start, t});
+			gap_start = -1;
+		}
+	};
+	vgm.commands([&](const Cmd& c) {
+		if (c.op == 0x66) return false;
+		if (c.t != cur_t)
+		{
+			sample(cur_t);
+			for (i64 t = (cur_t / (SAMPLE_RATE / 10) + 1) * (SAMPLE_RATE / 10); t < c.t; t += SAMPLE_RATE / 10) sample(t);   // the seconds without writes
+			cur_t = c.t;
+		}
+		if (WsgState::is_cmd(c.op) || (c.op == 0x67 && WsgState::is_block(&d[c.p]))) st.apply(&d[c.p]);
+		return true;
+	});
+	sample(cur_t);
+	if (gap_start >= 0 && (i64)vgm.total - gap_start >= min_gap) gaps.push_back({gap_start, (i64)vgm.total});
+	if (!quiet) print_activity(per_sec, gaps, min_gap);
+	return gaps;
+}
+
+static WsgState wsg_state_at(const VGMFile& vgm, i64 at)
+{
+	const u8* d = vgm.data.data();
+	WsgState st;
+	vgm.commands([&](const Cmd& c) {
+		if (c.op == 0x66 || c.t >= at) return false;
+		if (WsgState::is_cmd(c.op) || (c.op == 0x67 && WsgState::is_block(&d[c.p]))) st.apply(&d[c.p]);
+		return true;
+	});
+	return st;
+}
+
+// voices audible at the end of the loop body and silent at the loop point: the loop re-entry cuts them
+static int wsg_loop_cut_voices(const VGMFile& vgm, i64 loop, i64 end)
+{
+	WsgState a = wsg_state_at(vgm, loop), b = wsg_state_at(vgm, end);
+	int cut = 0;
+	for (int t = 0; t < 4; t++)
+		for (int c = 0; c < 2; c++)
+			if (b.used[t][c])
+				for (int v = 0; v < WSG_VOICES[t]; v++) cut += b.voice(t, c, v).audible() && !a.voice(t, c, v).audible();
+	return cut;
+}
+
+// trim a WSG log: the register and memory state at `start` is written first, the loop point gets every
+// register / byte whose value differs between the loop point and the end of the loop body (so that both
+// passes continue from the same state), a skipped first repetition is replaced by the state it leaves.
+// --cmp drops writes that do not change the state (both passes have the same state after the loop point).
+// Other chips' commands are copied as they are (their state is not re-created).
+static Bytes trim_wsg(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 end, bool do_cmp, bool keep_gd3,
+                      TrimStats& stats, i64 skip_from = 0, i64 skip_to = 0)
+{
+	const bool skip = skip_to > skip_from;
+	const u8* d = vgm.data.data();
+	WsgState src, out, st_end;
+	if (has_loop) st_end = wsg_state_at(vgm, end);
+	Bytes other_blocks, body;
+	i64 loop_body_ofs = -1, pending_wait = 0;
+	bool init_emitted = false;
+	auto flush_wait = [&]() { if (pending_wait) { wait_cmd(body, pending_wait); pending_wait = 0; } };
+	auto emit_init = [&]() {
+		if (init_emitted) return;
+		init_emitted = true;
+		src.sync(body, out, nullptr, &stats.kept);
+	};
+	auto mark_loop = [&]() {
+		if (!has_loop || loop_body_ofs >= 0) return;
+		flush_wait();
+		loop_body_ofs = body.size();
+		src.sync(body, out, &st_end, &stats.kept);
+	};
+	vgm.commands([&](const Cmd& c) {
+		size_t p = c.p;
+		u8 op = c.op;
+		if (op == 0x66) return false;
+		const bool wsg = WsgState::is_cmd(op) || (op == 0x67 && WsgState::is_block(&d[p]));
+		if (op == 0x67 && !wsg)
+		{
+			other_blocks.insert(other_blocks.end(), &d[p], &d[p + c.len]);
+			return true;
+		}
+		i64 w = wait_of(&d[p], op);
+		if (w)
+		{
+			i64 a = c.t, b = c.t + w;
+			if (b <= start || a >= end) return true;
+			emit_init();
+			a = std::max(a, start);
+			b = std::min(b, end);
+			auto add_span = [&](i64 sa, i64 sb) {
+				if (has_loop && loop_body_ofs < 0 && sa <= loop && loop < sb)
+				{
+					pending_wait += loop - sa;
+					mark_loop();
+					sa = loop;
+				}
+				pending_wait += sb - sa;
+			};
+			if (skip)
+			{
+				if (std::min(b, skip_from) > a) add_span(a, std::min(b, skip_from));
+				if (b > std::max(a, skip_to)) add_span(std::max(a, skip_to), b);
+			}
+			else
+				add_span(a, b);
+			return true;
+		}
+		const bool in_skip = skip && c.t >= skip_from && c.t < skip_to;
+		if (wsg) src.apply(&d[p]);
+		if (c.t < start || in_skip) { stats.skipped++; return true; }
+		if (c.t >= end) return true;
+		emit_init();
+		if (has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
+		if (wsg)
+		{
+			bool changed = out.apply(&d[p]);
+			if (do_cmp && !changed && !(op == 0x46 && (d[p + 1] & 7) == 2)) { stats.dropped++; return true; }   // C15 +2 sets the phase
+		}
+		flush_wait();
+		body.insert(body.end(), &d[p], &d[p + c.len]);
+		stats.kept++;
+		return true;
+	});
+	flush_wait();
+	if (has_loop && loop_body_ofs < 0) loop_body_ofs = body.size();
+	body.push_back(0x66);
+	stats.rom_bytes = 0;
+
+	Bytes o(vgm.data.begin(), vgm.data.begin() + vgm.data_ofs);
+	fix_version(o);
+	if (g_volume_mod != INT_MIN)
+	{
+		if (le32(&o[0x08]) < 0x160) put_le32(&o[0x08], 0x160);
+		if (o.size() < 0x80) { o.resize(0x80, 0); put_le32(&o[0x34], 0x80 - 0x34); }
+		o[0x7C] = volume_byte_from_mod(g_volume_mod);
+	}
+	size_t data_start = o.size();
+	put_le32(&o[0x18], (u32)(end - start - (skip ? skip_to - skip_from : 0)));
+	put_le32(&o[0x1C], has_loop ? (u32)(data_start + other_blocks.size() + loop_body_ofs - 0x1C) : 0);
+	put_le32(&o[0x20], has_loop ? (u32)(end - loop) : 0);
+	o.insert(o.end(), other_blocks.begin(), other_blocks.end());
+	o.insert(o.end(), body.begin(), body.end());
+	Bytes gd3;
+	if (keep_gd3 && vgm.gd3 && vgm.gd3 + 12 <= vgm.data.size())
+	{
+		u32 gd3_len = le32(&d[vgm.gd3 + 8]);
+		size_t e = std::min<size_t>(vgm.gd3 + 12 + gd3_len, vgm.data.size());
+		gd3.assign(&d[vgm.gd3], &d[e]);
+	}
+	put_le32(&o[0x14], gd3.empty() ? 0 : (u32)(o.size() - 0x14));
+	o.insert(o.end(), gd3.begin(), gd3.end());
+	put_le32(&o[0x04], (u32)(o.size() - 4));
+	return o;
+}
+
 static int g_loop_pass = 0;   // --loop-pass: 0 = auto, 1 = loop body is the first repetition (file = intro + 1 repetition), 2 = the second one (seamless, file = intro + 2 repetitions)
 struct LoopResult { i64 start, loop1, end1, loop2, end2; bool has2; };
 static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool bounded, LoopResult& lr,
@@ -2138,6 +2521,7 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 	std::vector<NoteEvent> events;   // key-ons: the structure of the song, the candidate periods
 	std::vector<NoteEvent> all;      // key-ons + parameter changes on sustained voices: all of it must recur
 	if (vgm.is_zsg2) zsg2_notes(vgm, bounded, search_to, events, &all);
+	else if (vgm.is_wsg) wsg_notes(vgm, bounded, search_to, events, all);
 	else vgm.commands([&](const Cmd& c) {
 		if (c.op == 0x66 || (bounded && c.t >= search_to)) return false;
 		RegWrite w;
@@ -2158,7 +2542,7 @@ static bool find_loop(const VGMFile& vgm, i64 search_from, i64 search_to, bool b
 		}
 		return true;
 	});
-	if (!vgm.is_zsg2) all = events;
+	if (!vgm.is_zsg2 && !vgm.is_wsg) all = events;
 	size_t n = events.size();
 	if (n < (size_t)window * 2) return false;
 
@@ -2721,6 +3105,7 @@ static bool tms_state_fields(const u8* st, size_t len, std::vector<u32>& pgm, st
 static Bytes merge(std::vector<MergePart>& in)
 {
 	const VGMFile& a = in[0].file;
+	for (const MergePart& m : in) if (m.file.is_wsg) die("--append / --repeat: Namco WSG files are not supported");
 	const bool zsg2 = a.is_zsg2;
 	Bytes blocks, body;
 	std::set<Bytes> seen;
@@ -3203,6 +3588,7 @@ int main(int argc, char** argv)
 	VGMFile vgm;
 	vgm.load(input);
 	if (f_activity) { activity(vgm, parse_pos(gap), false); return 0; }
+	if (vgm.is_wsg && f_sro) { ui::info("--sro: no sample ROM on the Namco WSG chips, ignored"); f_sro = false; }
 	if (f_info || output.empty()) { info(vgm); return 0; }
 	if (!appends.empty() || repeats[0] >= 0)   // --repeat alone: the loop of the input unrolled N times (no loop left)
 	{
@@ -3334,7 +3720,7 @@ int main(int argc, char** argv)
 				}
 				if (pass == 0)
 				{
-					int cut = loop_cut_voices(vgm, lr.loop1, lr.end1);
+					int cut = vgm.is_wsg ? wsg_loop_cut_voices(vgm, lr.loop1, lr.end1) : loop_cut_voices(vgm, lr.loop1, lr.end1);
 					if (cut == 0)
 						pass = 1;
 					else if (lr.has2)
@@ -3377,7 +3763,8 @@ int main(int argc, char** argv)
 		}
 		if (job.has_loop && !(job.start <= job.loop && job.loop < job.end)) die("loop point must be within [start, end)");
 		TrimStats stats;
-		Bytes out = vgm.is_zsg2 ? trim_zsg2(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats, job.skip_from, job.skip_to)
+		Bytes out = vgm.is_wsg ? trim_wsg(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, gd3 == "keep", stats, job.skip_from, job.skip_to)
+		          : vgm.is_zsg2 ? trim_zsg2(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats, job.skip_from, job.skip_to)
 		                        : trim(vgm, job.start, job.loop, job.has_loop, job.end, f_cmp, f_sro, gd3 == "keep", sro_margin, sro_gap, stats, job.skip_from, job.skip_to);
 		write_output(job.output, out);
 		results.add({ui::basename(job.output), fmt_pos(job.start), fmt_pos(job.end), job.has_loop ? fmt_pos(job.loop) : "-",
