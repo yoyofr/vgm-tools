@@ -1413,6 +1413,7 @@ async function postJson(url, body) {
   const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const ct = r.headers.get('Content-Type') || '';
   if (ct.startsWith('audio/')) return { blob: await r.blob(), junction: r.headers.get('X-Junction') };
+  if (!ct.includes('json')) throw new Error(r.status === 404 ? 'le serveur ne connaît pas ' + url + ' : relance vgmstudio.py (version plus ancienne que la page)' : 'réponse inattendue du serveur (HTTP ' + r.status + ')');
   const j = await r.json();
   if (!j.ok) throw new Error((j.error || 'erreur serveur') + (j.log ? '\n' + j.log : ''));
   return j;
