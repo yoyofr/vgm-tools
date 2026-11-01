@@ -1,0 +1,25 @@
+diff --git a/emu/cores/namcoc30.c b/emu/cores/namcoc30.c
+index 514851d..59e08f4 100644
+--- a/emu/cores/namcoc30.c
++++ b/emu/cores/namcoc30.c
+@@ -58,6 +58,7 @@ typedef struct _namcoc30_state
+ 		UINT32 addr;
+ 		UINT8 noise_enable;
+ 		INT32 noise_hold;
++		UINT32 noise_counter;	// EXPERIMENT: separate noise counter (MAME keeps the wave counter frozen during noise)
+ 		UINT32 noise_seed;
+ 		UINT8 noise_state;
+ 	} voice[8];
+@@ -243,9 +244,9 @@ static void namcoc30_update(void* param, UINT32 samples, DEV_SMPL** outputs)
+ 				}
+ 
+ 				info->voice[ch].noise_hold = hold_time;
+-				info->voice[ch].addr += noise_delta;
+-				noise_cnt = (info->voice[ch].addr >> 12);
+-				info->voice[ch].addr &= (1 << 12) - 1;
++				info->voice[ch].noise_counter += noise_delta;
++				noise_cnt = (info->voice[ch].noise_counter >> 12);
++				info->voice[ch].noise_counter &= (1 << 12) - 1;
+ 				for (; noise_cnt > 0; noise_cnt--)
+ 				{
+ 					if ((info->voice[ch].noise_seed + 1) & 2)

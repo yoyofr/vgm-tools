@@ -236,6 +236,9 @@ struct VGMFile
 {
 	Bytes data;
 	u32 version = 0, eof = 0, gd3 = 0, total = 0, loop_ofs = 0, loop_samples = 0, data_ofs = 0;
+	// sample position of the command at loop_ofs (-1: the offset does not fall on a command). The header's
+	// loop sample count is not trusted for it: some released files carry a count a few samples too large
+	i64 loop_t = -1;
 	u32 es5506_clock = 0, zsg2_clock = 0, wsg_clock[4] = {};
 	bool is_es5506 = false, is_zsg2 = false, is_wsg = false;
 
@@ -291,6 +294,27 @@ struct VGMFile
 		if (data_ofs >= 0x110 && !is_zsg2)
 			for (int k = 0; k < 4; k++) { wsg_clock[k] = le32(&data[0x100 + 4 * k]); if (wsg_clock[k]) is_wsg = true; }
 		if (is_wsg && es5506_clock) die("Namco WSG and ES55xx in the same file: not supported");
+		// the header's sample count is checked against the command stream: some released files are a
+		// few samples short in the header (an old trim tool), and a cut at the header length would
+		// drop the end of the last wait
+		{
+			i64 stream_total = 0;
+			commands([&](const Cmd& c) { stream_total = c.t + wait_of(&data[c.p], c.op); return c.op != 0x66; });
+			if (stream_total != (i64)total)
+			{
+				ui::warn(strf("%s: header length %u samples, the commands last %lld; the commands are trusted", path.c_str(), total, (long long)stream_total));
+				total = (u32)stream_total;
+			}
+		}
+		if (loop_ofs)
+		{
+			commands([&](const Cmd& c) { if (c.p < loop_ofs) return true; if (c.p == loop_ofs) loop_t = c.t; return false; });
+			if (loop_t < 0) ui::warn(path + ": the loop offset does not fall on a command, loop ignored");
+			else if ((i64)total - (i64)loop_samples != loop_t)
+				ui::warn(strf("%s: header loop length %u samples (%lld from the loop offset) disagrees with the loop offset (loop at %s); the offset is used",
+				              path.c_str(), loop_samples, (long long)total - loop_t, fmt_pos(loop_t).c_str()));
+			if (loop_t < 0) loop_ofs = 0;
+		}
 	}
 
 	// iterate the commands: f(cmd) returns false to stop
@@ -1285,17 +1309,13 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 		}
 		if (do_cmp && in_body && nwrites > 0 && rw.reg != PAGE_REG)
 		{
-			// keep the write when it changes the register in the second pass; a byte-lane write
-			// becomes a full write when the other lane differs in the second pass (if that lane is
-			// host-owned); lane_opt may only skip a lane that is equal in both passes
+			// keep the write when it changes the register in the second pass; lane_opt may only
+			// skip a lane that is equal in both passes. A byte-lane write of the input stays a
+			// byte-lane write: the other lane may differ between the passes (Elevator Action Returns
+			// 26, voice 3 FC: 03xx over f2 in the first pass, over 00 in the second), and only the
+			// lane write reproduces both
 			if (rw2.changed) rw.changed = true;
 			if (!rw2.has_prev || rw2.prev != rw.prev) rw.has_prev = false;
-			if (rw.lane >= 0)
-			{
-				u32 om = (rw.lane == 0 ? 0x00FF : 0xFF00) & st.mask(rw.page, rw.reg);
-				bool other_differs = !rw2.has_prev || ((rw2.prev ^ rw.value) & om) != 0;
-				if (other_differs && Emitter::lane_trusted(page_group(rw.page), rw.reg, 1 - rw.lane)) rw.lane = -1;
-			}
 		}
 		if (c.t < start || in_skip) { stats.skipped++; return true; }
 		if (c.t >= end) return true;
@@ -1556,7 +1576,7 @@ static void info(const VGMFile& vgm)
 	ui::KV kv;
 	kv.add("Version", strf("%X.%02X (header 0x%X)%s", vgm.version >> 8, vgm.version & 0xFF, vgm.data_ofs, vgm.version == 0x173 ? ", early ZSG-2 logger: written back as 1.72 on output" : ""));
 	kv.add("Length", fmt_pos(vgm.total));
-	kv.add("Loop", vgm.loop_ofs ? fmt_pos(vgm.loop_samples) : "none");
+	kv.add("Loop", vgm.loop_ofs ? fmt_pos(vgm.loop_t) + ((i64)vgm.total - (i64)vgm.loop_samples != vgm.loop_t ? strf(" (header loop length %u, should be %lld)", vgm.loop_samples, (long long)vgm.total - vgm.loop_t) : "") : "none");
 	if (vgm.version >= 0x160 && vgm.data_ofs > 0x7C && vgm.data[0x7C] != 0)
 	{
 		int n = volume_mod_from_byte(vgm.data[0x7C]);
@@ -1801,12 +1821,19 @@ struct ZSG2State
 		if (!position(vi, p)) { voice[vi].active = false; return false; }
 		return voice[vi].vol_target > 0 || voice[vi].vol > 0;
 	}
+	// blocks the voice can read: start..end, and loop..end when the loop point lies before the
+	// start (the Zoom driver often keys a sample a few hundred blocks in and loops back before it)
 	void note_rom_use(int vi)
 	{
 		const ZSG2Voice& w = voice[vi];
 		if (!w.known[0] || !w.known[1] || !w.known[6]) return;
 		u32 page = (u32)(w.v[1] & 0xFF00) << 8;
 		u32 s = page | ((w.v[0] >> 8) | ((w.v[1] & 0xFF) << 8)), e = page | w.v[6];
+		if (w.known[5] && w.known[7])
+		{
+			u32 loop = page | (w.v[5] & 0xFF) | ((w.v[7] & 0xFF) << 8);
+			if (loop < s) s = loop;
+		}
 		if (e <= s) e = s + 1;
 		rom_used.push_back({(i64)s * 2, (i64)e * 2 + 2});
 	}
@@ -1821,6 +1848,9 @@ struct ZSG2State
 			advance(vi, now);
 			bool same = w.known[reg] && w.v[reg] == data;
 			w.v[reg] = data; w.known[reg] = true;
+			// the address registers act on a playing voice too (page, loop and end are read at every
+			// block / wrap): the ROM it can reach from now on is noted again
+			if (w.active && !same && (reg <= 1 || reg == 5 || reg == 6 || reg == 7)) note_rom_use(vi);
 			switch (reg)
 			{
 			case 0x8: w.cutoff_initial = data; break;
@@ -3353,7 +3383,7 @@ static Bytes merge(std::vector<MergePart>& in)
 			for (size_t i = intro_end; i < cmds.size(); i++) emit(i);
 		}
 		std::string played = !has_loop ? "once" : repeat < 0 ? "intro + loop" : repeat == 0 ? "intro only" : strf("intro + %d x loop", repeat);
-		parts_table.add({strf("%zu", k + 1), fmt_pos(part_start), fmt_pos(total - part_start), v.loop_ofs ? fmt_pos(v.loop_samples) : "-", played});
+		parts_table.add({strf("%zu", k + 1), fmt_pos(part_start), fmt_pos(total - part_start), v.loop_ofs ? fmt_pos((i64)v.total - v.loop_t) : "-", played});
 	}
 	body.push_back(0x66);
 	Bytes out(a.data.begin(), a.data.begin() + a.data_ofs);
@@ -3712,9 +3742,9 @@ int main(int argc, char** argv)
 		Job job{start_s.empty() ? 0 : parse_pos(start_s), loop_s.empty() ? 0 : parse_pos(loop_s),
 		        end_s.empty() ? (i64)vgm.total : parse_pos(end_s), !loop_s.empty(), output, !start_s.empty()};
 		// the file's own loop is kept when no other loop is asked for and the end is not moved
-		if (!job.has_loop && !f_find_loop && vgm.loop_ofs && vgm.loop_samples && end_s.empty() && job.start <= (i64)vgm.total - vgm.loop_samples)
+		if (!job.has_loop && !f_find_loop && vgm.loop_ofs && end_s.empty() && job.start <= vgm.loop_t)
 		{
-			job.loop = (i64)vgm.total - vgm.loop_samples;
+			job.loop = vgm.loop_t;
 			job.has_loop = true;
 			g_loop_as_is = true;
 		}

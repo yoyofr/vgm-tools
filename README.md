@@ -38,9 +38,15 @@ bit-identical, since the DSP ran during the silence (modulation phase, delay mem
 `--sro` keeps the sample ranges played by both passes of the loop: the second pass starts from the state
 left at the end of the body and can read ranges the first pass never does (Darius Gaiden 05). VGM Studio
 still checks every result by rendering and falls back to `--cmp` alone if `--sro` ever changes the sound.
-Known limit (2026-11-01, re-trim of the released packs with the loop kept): `--cmp` alone is not exact on
-some Elevator Action Returns / RayForce / RayStorm / Super Puzzle Bobble files, `--sro` alone on some
-G-Darius / RayStorm / Super Puzzle Bobble files; VGM Studio detects it and leaves those files unchanged.
+On the ZSG-2 the kept ranges cover the loop point too (the Zoom driver often keys a sample a few hundred
+blocks in and loops back before the start) and are noted again when the address registers of a playing
+voice change (page, loop, end act live).
+
+The header is checked against the command stream when a file is loaded: the loop position comes from the
+loop offset (not from the header loop length) and the length from the waits (some files written by older
+tools are a few samples short in the header); a warning names the file when they disagree. Re-trimming the
+released packs (v1 and v3, loop kept) with `--cmp` and `--sro` renders byte-identical on every file
+(vgm2wav, 2 loops).
 
 A `.wav` input (for example the `<capture>.wav` that MAME's `-vgmwav` option records alongside each
 capture: same start and stop, same numbering) goes through the same silence split, margins, `--start`
