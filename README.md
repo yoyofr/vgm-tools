@@ -29,6 +29,16 @@ vgm_trim capture.wav tracks.wav --auto --track all --gap 3s   # a .wav input is 
 
 All reductions are output-neutral: rendered audio is byte-identical before and after.
 
+Without `--loop` / `--find-loop` and with the end unchanged, a file's own loop is kept as it is: same byte
+offset, no state image added at the loop point, so the second pass plays exactly as in the input (before,
+`--cmp` / `--sro` alone dropped the loop). `--trim-lead` moves the start to the first audible voice minus
+50 ms when that removes 0.25 s or more; with an effect DSP (ES5510 of the Taito F3) the render is then not
+bit-identical, since the DSP ran during the silence (modulation phase, delay memory).
+
+Known limit: on a file whose loop body was made by an earlier vgm_trim run, `--sro` can drop a sample range
+that only the second pass of the loop reads (seen on Darius Gaiden 05); VGM Studio checks every result by
+rendering and falls back to `--cmp` alone in that case.
+
 A `.wav` input (for example the `<capture>.wav` that MAME's `-vgmwav` option records alongside each
 capture: same start and stop, same numbering) goes through the same silence split, margins, `--start`
 `--end` and numbering, and comes out as 16-bit PCM wav files; the VGM-only options are ignored.
@@ -75,6 +85,13 @@ off between notes), volume changes must recur too. Checked by replaying the cut 
 against the capture: the chip state is identical at every write. `--sro` and `--append` do not apply.
 
 ## vgmstudio.html (formerly gd3edit.html)
+
+**Optimiser** tab: the VGM files of the list go through `vgm_trim --cmp --sro` then `--trim-lead` (each
+optional), on the server (`/api/optimize`). Step 1 must render byte-identical (2 loops) or it is refused
+(`--sro` is retried without it first); step 2 is compared with step 1 from the cut point, the measured
+difference is shown, and a non-identical result is only applied when « accepter un rendu non identique » is
+ticked. A result that saves nothing is not applied. Loop, tags, volume and encoding (v1 / v3) are kept; the
+optimised file replaces the one of the list (marked •), « Enregistrer » writes it.
 
 Local, single-file tool with two modules: **Tags** (the GD3 editor below) and **Assemblage**, which chains
 parts into one file (`vgm_trim --repeat/--append` above): pick the parts among the loaded files, set the

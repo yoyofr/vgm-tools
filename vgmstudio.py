@@ -140,6 +140,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/concat": self.api_concat()
             elif self.path == "/api/junction": self.api_junction()
             elif self.path == "/api/render": self.api_render()
+            elif self.path == "/api/optimize": self.api_optimize()
             elif self.path.startswith("/api/v3pack/start"): self.api_v3pack_start()
             else: self.send_error(404)
         except Exception as e:   # report, never crash the server
@@ -255,6 +256,95 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": str(e), "log": "\n".join(log)})
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    # {name, data (base64), cmp, sro, lead (bools), verify (bool)} -> {ok, data (base64, same compression as the
+    # input), before / after sizes, cut (samples removed at the start), exact, diff, sro_dropped, log}
+    # Step 1, --cmp / --sro: the result must render byte-identical (2 loops). --sro keeps the sample ranges the
+    # log shows played; if the render shows one missing (a loop's second pass can read elsewhere than the
+    # first), step 1 is done again without --sro; still different: refused.
+    # Step 2, --trim-lead on the step 1 result: compared with it from the cut point. Identical unless an effect
+    # DSP ran during the silence (its state at the first note then differs): exact = false and the measured
+    # difference, the page decides.
+    def api_optimize(self):
+        req = self.read_json()
+        tmp = tempfile.mkdtemp(prefix="vgmstudio_")
+        log = []
+        verify = req.get("verify", True)
+        try:
+            src = write_part(tmp, 0, req)
+            ext = ".vgz" if open(src, "rb").read(2) == b"\x1f\x8b" else ".vgm"
+            def trim(inp, name, opts):
+                o = os.path.join(tmp, name + ext)
+                rc, txt = run([TOOLS["vgm_trim"], inp, o, "--color", "never"] + opts, tmp)
+                log.append(txt)
+                if rc != 0 or not os.path.isfile(o): raise RuntimeError("vgm_trim failed")
+                return o
+            cur, res, sro_dropped = src, None, False
+            o1 = [x for x, k in (("--cmp", "cmp"), ("--sro", "sro")) if req.get(k)]
+            if o1:
+                out = trim(src, "step1", o1)
+                res, refused = self.optimize_check(verify, src, out)
+                if refused and "--sro" in o1:
+                    log.append("render differs with --sro: step 1 done again without it")
+                    o1.remove("--sro"); sro_dropped = True
+                    out = trim(src, "step1b", o1) if o1 else src
+                    res, refused = self.optimize_check(verify, src, out) if o1 else (None, None)
+                if refused: self.send_json({"ok": False, **refused, "log": "\n".join(log)}); return
+                cur = out
+            if req.get("lead"):
+                out = trim(cur, "step2", ["--trim-lead"] + (["--sro"] if "--sro" in o1 else []))
+                r2, _ = self.optimize_check(verify, cur, out, allow_cut_diff=True)
+                if r2 is not None and r2["cut"] > 0:
+                    cur, res = out, r2
+            if res is None: res, _ = self.optimize_check(False, src, cur)
+            res["before"] = os.path.getsize(src)
+            res["after"] = os.path.getsize(cur)
+            res["cut"] = vgm_info(src)["total"] - vgm_info(cur)["total"]
+            res["sro_dropped"] = sro_dropped
+            with open(cur, "rb") as f: res["data"] = base64.b64encode(f.read()).decode()
+            res["log"] = "\n".join(log)
+            self.send_json(res)
+        except RuntimeError as e:
+            self.send_json({"ok": False, "error": str(e), "log": "\n".join(log)})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # verify an optimised file against its source: returns (result, None), or (None, refusal) when the render
+    # differs without a leading cut (only removing the leading silence may change it: an effect DSP ran then)
+    @staticmethod
+    def optimize_check(verify, src, out, allow_cut_diff=False):
+        import math, wave
+        tmp = os.path.dirname(out)
+        a, b = vgm_info(src), vgm_info(out)
+        res = {"ok": True, "before": os.path.getsize(src), "after": os.path.getsize(out), "cut": a["total"] - b["total"],
+               "loop_before": a["loop"], "loop_after": b["loop"], "exact": None, "diff": None}
+        if a["loop"] != b["loop"]: return None, {"error": "boucle modifiée"}
+        if not verify: return res, None
+        def render(p, w):
+            rc, o = run([vgm2wav_for(p), "--loops", "2", "--fade", "0", p, w], tmp)
+            if rc != 0 or not os.path.isfile(w): raise RuntimeError("vgm2wav failed: " + o[-300:])
+            with wave.open(w) as f: return f.readframes(f.getnframes()), f.getnchannels()
+        ra, ch = render(src, os.path.join(tmp, "a.wav"))
+        rb, _ = render(out, os.path.join(tmp, "b.wav"))
+        ra = ra[res["cut"] * 2 * ch:]
+        res["exact"] = ra == rb
+        if res["exact"]: return res, None
+        import array
+        n = min(len(ra), len(rb)) // 2
+        xa, xb = array.array("h", ra[:n * 2]), array.array("h", rb[:n * 2])
+        try:
+            import numpy as np
+            va, vb = np.frombuffer(xa, np.int16).astype(np.float64), np.frombuffer(xb, np.int16).astype(np.float64)
+            d = va - vb
+            peak, rms, sig = (float(np.abs(d).max()), float(np.sqrt((d * d).mean())), float(np.sqrt((va * va).mean()))) if n else (0, 0, 0)
+        except ImportError:
+            peak = max(abs(x - y) for x, y in zip(xa, xb)) if n else 0
+            rms = math.sqrt(sum((x - y) ** 2 for x, y in zip(xa, xb)) / n) if n else 0
+            sig = math.sqrt(sum(x * x for x in xa) / n) if n else 0
+        db = lambda v: round(20 * math.log10(v / 32768), 1) if v > 0 else None
+        res["diff"] = {"peak": db(peak), "rms": db(rms), "signal": db(sig), "length_ok": len(ra) == len(rb)}
+        if not (allow_cut_diff and res["cut"] > 0): return None, {"error": "rendu différent après optimisation (refusé)", "diff": res["diff"]}
+        return res, None
 
     # body = the pack zip (application/zip), ?name=<file name>&verify=0|1 -> {id}; then poll
     # GET /api/v3pack/status?id= and fetch GET /api/v3pack/result?id= (the converted zip)

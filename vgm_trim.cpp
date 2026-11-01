@@ -228,6 +228,9 @@ struct Cmd { size_t p; u8 op; size_t len; i64 t; };
 // the ES55xx / ZSG-2 logic works on the v1 encoding: a v3 input is converted to v1 when loaded, and
 // the output is converted back to v3 when written (lossless both ways, see vgm_v3.h)
 static bool g_v3_output = false;
+// the loop is the file's own (kept by an optimisation: --cmp / --sro / --trim-lead without --loop): its body is
+// left as it is, no state image is added at the loop point, so the second pass plays exactly as in the input
+static bool g_loop_as_is = false;
 
 struct VGMFile
 {
@@ -1183,7 +1186,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			// first thing in the loop body: the full voice state as it plays here in the first pass,
 			// so that the second pass starts from the same sound whatever the body left behind
 			for (int ci = 0; ci < 2; ci++)
-				if (states[ci].reg_count) emitters[ci].voice_image(body, states[ci], loop);
+				if (states[ci].reg_count && !g_loop_as_is) emitters[ci].voice_image(body, states[ci], loop);
 		}
 	};
 
@@ -1191,6 +1194,8 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 		size_t p = c.p;
 		u8 op = c.op;
 		if (op == 0x66) return false;
+		// the file's own loop kept as is: it starts at its byte offset (commands of the same instant before it stay in the intro)
+		if (g_loop_as_is && has_loop && loop_body_ofs < 0 && c.p >= vgm.loop_ofs && c.t >= start && c.t < end) { emit_init(); mark_loop(); }
 		if (op == 0x67)
 		{
 			if (d[p + 2] == 0x90 && c.len >= 15)
@@ -1212,7 +1217,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 			a = std::max(a, start);
 			b = std::min(b, end);
 			auto add_span = [&](i64 sa, i64 sb) {
-				if (has_loop && loop_body_ofs < 0 && sa <= loop && loop < sb)
+				if (!g_loop_as_is && has_loop && loop_body_ofs < 0 && sa <= loop && loop < sb)
 				{
 					pending_wait += loop - sa;
 					mark_loop();
@@ -1282,7 +1287,7 @@ static Bytes trim(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i64 en
 		if (c.t < start || in_skip) { stats.skipped++; return true; }
 		if (c.t >= end) return true;
 		emit_init();
-		if (has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
+		if (!g_loop_as_is && has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
 		if (nwrites >= 0)
 		{
 			if (nwrites == 0)
@@ -2166,6 +2171,7 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 			if (skip) emit_splice();
 			loop_body_ofs = body.size();
 			if (st_end) { st2.reset(new ZSG2State(*st_end)); track2 = do_cmp; }
+			if (g_loop_as_is) return;
 			int rekeyed, lost;
 			st.image(body, loop, ZSG2State::IMAGE_LOOP, rekeyed, lost, st2.get());
 			if (rekeyed || lost)
@@ -2178,6 +2184,8 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 		size_t p = c.p;
 		u8 op = c.op;
 		if (op == 0x66) return false;
+		// the file's own loop kept as is: it starts at its byte offset (commands of the same instant before it stay in the intro)
+		if (g_loop_as_is && has_loop && loop_body_ofs < 0 && c.p >= vgm.loop_ofs && c.t >= start && c.t < end) { emit_init(); mark_loop(); }
 		if (op == 0x67)
 		{
 			if (d[p + 2] == 0x97 && c.len >= 15)
@@ -2191,7 +2199,7 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 				if (c.t >= start && c.t < end && !(skip && c.t >= skip_from && c.t < skip_to))
 				{
 					emit_init();
-					if (has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
+					if (!g_loop_as_is && has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
 					flush_wait();
 					body.insert(body.end(), &d[p], &d[p + c.len]);
 				}
@@ -2209,7 +2217,7 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 			a = std::max(a, start);
 			b = std::min(b, end);
 			auto add_span = [&](i64 sa, i64 sb) {
-				if (has_loop && loop_body_ofs < 0 && sa <= loop && loop < sb)
+				if (!g_loop_as_is && has_loop && loop_body_ofs < 0 && sa <= loop && loop < sb)
 				{
 					pending_wait += loop - sa;
 					mark_loop();
@@ -2251,7 +2259,7 @@ static Bytes trim_zsg2(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i
 		if (c.t < start || in_skip) { stats.skipped++; return true; }
 		if (c.t >= end) return true;
 		emit_init();
-		if (has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
+		if (!g_loop_as_is && has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
 		if (do_cmp && !changed) { stats.dropped++; return true; }
 		flush_wait();
 		body.insert(body.end(), &d[p], &d[p + c.len]);
@@ -2410,7 +2418,8 @@ static Bytes trim_wsg(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i6
 {
 	const bool skip = skip_to > skip_from;
 	const u8* d = vgm.data.data();
-	WsgState src, out, st_end;
+	WsgState src, out, st_end, st2;
+	bool track2 = false;   // loop kept as is: a write is redundant only when it is in both passes
 	if (has_loop) st_end = wsg_state_at(vgm, end);
 	Bytes other_blocks, body;
 	i64 loop_body_ofs = -1, pending_wait = 0;
@@ -2425,12 +2434,15 @@ static Bytes trim_wsg(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i6
 		if (!has_loop || loop_body_ofs >= 0) return;
 		flush_wait();
 		loop_body_ofs = body.size();
-		src.sync(body, out, &st_end, &stats.kept);
+		if (g_loop_as_is) { st2 = st_end; track2 = true; }
+		else src.sync(body, out, &st_end, &stats.kept);
 	};
 	vgm.commands([&](const Cmd& c) {
 		size_t p = c.p;
 		u8 op = c.op;
 		if (op == 0x66) return false;
+		// the file's own loop kept as is: it starts at its byte offset (commands of the same instant before it stay in the intro)
+		if (g_loop_as_is && has_loop && loop_body_ofs < 0 && c.p >= vgm.loop_ofs && c.t >= start && c.t < end) { emit_init(); mark_loop(); }
 		const bool wsg = WsgState::is_cmd(op) || (op == 0x67 && WsgState::is_block(&d[p]));
 		if (op == 0x67 && !wsg)
 		{
@@ -2446,7 +2458,7 @@ static Bytes trim_wsg(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i6
 			a = std::max(a, start);
 			b = std::min(b, end);
 			auto add_span = [&](i64 sa, i64 sb) {
-				if (has_loop && loop_body_ofs < 0 && sa <= loop && loop < sb)
+				if (!g_loop_as_is && has_loop && loop_body_ofs < 0 && sa <= loop && loop < sb)
 				{
 					pending_wait += loop - sa;
 					mark_loop();
@@ -2468,10 +2480,11 @@ static Bytes trim_wsg(const VGMFile& vgm, i64 start, i64 loop, bool has_loop, i6
 		if (c.t < start || in_skip) { stats.skipped++; return true; }
 		if (c.t >= end) return true;
 		emit_init();
-		if (has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
+		if (!g_loop_as_is && has_loop && loop_body_ofs < 0 && c.t >= loop) mark_loop();
 		if (wsg)
 		{
 			bool changed = out.apply(&d[p]);
+			if (track2) changed |= st2.apply(&d[p]);
 			if (do_cmp && !changed && !(op == 0x46 && (d[p + 1] & 7) == 2)) { stats.dropped++; return true; }   // C15 +2 sets the phase
 		}
 		flush_wait();
@@ -3491,6 +3504,9 @@ static void usage()
 	        "  --loop-pass N          --find-loop: 1 = loop body is the 1st repetition, 2 = the 2nd one (seamless loop, the 1st is\n"
 	        "                         left out, file = intro + 1 repetition); default: 2 only when the loop re-entry would cut voices\n"
 	        "  --cmp                  drop register writes that do not change the chip state\n"
+	        "  --trim-lead            start at the first audible voice (from the log) minus 50 ms when that removes 0.25 s or more;\n"
+	        "                         end and loop are kept (with an effect DSP the render is not bit-identical: it ran during\n"
+	        "                         the silence)\n"
 	        "  --sro                  keep only the sample ROM ranges that are played\n"
 	        "  --sro-margin N         --sro: margin in words around each used range (default 256)\n"
 	        "  --sro-gap N            --sro: merge used ranges closer than this many words (default 0)\n"
@@ -3520,7 +3536,7 @@ int main(int argc, char** argv)
 {
 	std::string input, output, start_s, end_s, loop_s, gd3 = "keep", split = "wav", track = "1", vgm2wav = "vgm2wav";
 	std::string gap = "1.0s", pre = "0.05s", post = "0.3s", min_length = "0.5s";
-	bool f_info = false, f_activity = false, f_find_loop = false, f_cmp = false, f_sro = false, f_auto = false;
+	bool f_info = false, f_activity = false, f_find_loop = false, f_cmp = false, f_sro = false, f_auto = false, f_trim_lead = false;
 	i64 sro_margin = 256, sro_gap = 0;
 	int silence = -1;   // -1: automatic (noise floor)
 	std::vector<std::string> positional, appends;
@@ -3540,6 +3556,7 @@ int main(int argc, char** argv)
 		else if (name == "--activity") f_activity = true;
 		else if (name == "--find-loop") f_find_loop = true;
 		else if (name == "--cmp") f_cmp = true;
+		else if (name == "--trim-lead") f_trim_lead = true;
 		else if (name == "--sro") f_sro = true;
 		else if (name == "--auto") f_auto = true;
 		else if (name == "--fast-dsp") g_fast_dsp = true;
@@ -3602,7 +3619,7 @@ int main(int argc, char** argv)
 		return 0;
 	}
 
-	if (!f_auto && !f_find_loop && !f_cmp && !f_sro && start_s.empty() && end_s.empty() && loop_s.empty() && g_volume_mod == INT_MIN && gd3 == "keep")
+	if (!f_auto && !f_find_loop && !f_cmp && !f_sro && !f_trim_lead && start_s.empty() && end_s.empty() && loop_s.empty() && g_volume_mod == INT_MIN && gd3 == "keep")
 	{
 		// nothing to trim: rewrite the file as is (loop kept), only the version word is normalised
 		Bytes out = vgm.data;
@@ -3666,8 +3683,32 @@ int main(int argc, char** argv)
 			                track == "all" ? next_track_name(output) : output, true});
 	}
 	else
-		jobs.push_back({start_s.empty() ? 0 : parse_pos(start_s), loop_s.empty() ? 0 : parse_pos(loop_s),
-		                end_s.empty() ? (i64)vgm.total : parse_pos(end_s), !loop_s.empty(), output, !start_s.empty()});
+	{
+		Job job{start_s.empty() ? 0 : parse_pos(start_s), loop_s.empty() ? 0 : parse_pos(loop_s),
+		        end_s.empty() ? (i64)vgm.total : parse_pos(end_s), !loop_s.empty(), output, !start_s.empty()};
+		// the file's own loop is kept when no other loop is asked for and the end is not moved
+		if (!job.has_loop && !f_find_loop && vgm.loop_ofs && vgm.loop_samples && end_s.empty() && job.start <= (i64)vgm.total - vgm.loop_samples)
+		{
+			job.loop = (i64)vgm.total - vgm.loop_samples;
+			job.has_loop = true;
+			g_loop_as_is = true;
+		}
+		if (f_trim_lead && start_s.empty())
+		{
+			auto gaps = activity(vgm, 1, true);
+			if (!gaps.empty() && gaps[0].first == 0 && gaps[0].second - 2205 >= SAMPLE_RATE / 4)   // at least 0.25 s to gain
+			{
+				i64 s = gaps[0].second - 2205;
+				if (job.has_loop && s > job.loop) s = job.loop;
+				job.start = s;
+				job.explicit_start = true;
+				ui::info(strf("leading silence: first audible voice at %s, start moved to %s", fmt_pos(gaps[0].second).c_str(), fmt_pos(s).c_str()));
+			}
+			else
+				ui::info("leading silence: none (less than 0.25 s before the first audible voice)");
+		}
+		jobs.push_back(job);
+	}
 
 	ui::Table results({"Output", "Start", "End", "Loop", "Writes kept", "Dropped", "Skipped", "ROM", "Size"}, {false, false, false, false, true, true, true, true, true});
 	for (Job& job : jobs)

@@ -124,7 +124,15 @@ button.mini { font-size: 12px; padding: 2px 8px }
 #v3tbl td.st { font-family: var(--mono); font-size: 12px; white-space: nowrap }
 #v3tbl td.lg { font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: pre-wrap; word-break: break-word }
 #v3tbl:empty { display: none }
-#v3 label.chk { display: flex; gap: 6px; align-items: center }
+#v3 label.chk, #opt label.chk { display: flex; gap: 6px; align-items: center }
+#opt { padding: 16px; display: grid; gap: 14px; max-width: 900px }
+#opt h2 { font-size: 14px; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-weight: 600 }
+#opt .opts { display: grid; gap: 6px }
+#opttbl { width: 100%; border-collapse: collapse; font-size: 13px }
+#opttbl td { padding: 4px 8px; border-top: 1px solid var(--line); vertical-align: top }
+#opttbl td.st { font-family: var(--mono); font-size: 12px; white-space: nowrap }
+#opttbl td.lg { font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: pre-wrap; word-break: break-word }
+#opttbl:empty { display: none }
 .player { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 6px }
 .player audio { width: 100%; height: 36px }
 .player .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
@@ -136,7 +144,7 @@ button.mini { font-size: 12px; padding: 2px 8px }
 <body>
 <header>
   <div>
-    <div class="titlebar"><h1>VGM Studio</h1><nav class="tabs" id="tabs"><button type="button" data-mod="tags" class="on">Tags</button><button type="button" data-mod="asm">Assemblage</button><button type="button" data-mod="v3">Conversion v3</button></nav><span id="srv" class="hint" title="Serveur local vgmstudio.py : assemblage et écoute"></span></div>
+    <div class="titlebar"><h1>VGM Studio</h1><nav class="tabs" id="tabs"><button type="button" data-mod="tags" class="on">Tags</button><button type="button" data-mod="asm">Assemblage</button><button type="button" data-mod="opt">Optimiser</button><button type="button" data-mod="v3">Conversion v3</button></nav><span id="srv" class="hint" title="Serveur local vgmstudio.py : assemblage et écoute"></span></div>
     <div id="status">Ouvre des fichiers .vgm ou .vgz. Les tags japonais sont en UTF-16, saisie directe.</div>
   </div>
   <div class="toolbar">
@@ -171,6 +179,23 @@ button.mini { font-size: 12px; padding: 2px 8px }
       <div class="row single"><label for="loopMul">Boucles</label><div class="volbox"><span>×</span><input type="number" id="loopMul" step="0.25" min="0.0625" max="15.9375" placeholder="1"><span>−</span><input type="number" id="loopBase" step="1" min="-128" max="127" placeholder="0"><span id="loopHint"></span></div><button class="all" id="loopAll">→ tous</button></div>
     </div>
     <div id="info"></div>
+    </div>
+    <div class="mod" id="mod-opt" hidden>
+      <div id="opt">
+        <div>
+          <h2>Nettoyer / optimiser</h2>
+          <div class="hint">Les fichiers VGM de la liste passent par vgm_trim, puis le résultat est vérifié par rendu (2 boucles) : il doit sonner exactement comme l’original, sinon il est refusé. La boucle, les tags, le volume et l’encodage (v1 / v3) sont conservés. Le fichier optimisé remplace celui de la liste (marqué •) : « Enregistrer » pour l’écrire.</div>
+        </div>
+        <div class="opts">
+          <label class="chk"><input type="checkbox" id="optCmp" checked> supprimer les écritures de registres qui ne changent rien (--cmp)</label>
+          <label class="chk"><input type="checkbox" id="optSro" checked> ROM : ne garder que les plages d’échantillons jouées (--sro)</label>
+          <label class="chk"><input type="checkbox" id="optLead" checked> supprimer le silence du début (jusqu’à 50 ms avant la première voix audible)</label>
+          <label class="chk hint"><input type="checkbox" id="optLossy"> accepter un rendu non identique pour le silence du début (sinon le fichier n’est pas modifié)</label>
+          <div class="hint">Le silence du début n’est pas toujours neutre : un DSP d’effets (ES5510 des Taito F3…) tourne pendant ce silence, son état à la première note diffère alors un peu (modulation, réverbération). L’écart mesuré est affiché.</div>
+        </div>
+        <div class="asmbar"><button type="button" class="primary" id="optOne" disabled>Fichier courant</button><button type="button" id="optAll" disabled>Tous les fichiers</button><span class="hint" id="optMsg"></span></div>
+        <table id="opttbl"></table>
+      </div>
     </div>
     <div class="mod" id="mod-v3" hidden>
       <div id="v3">
@@ -539,6 +564,7 @@ function renderList() {
   $('saveAll').disabled = !files.some(f => f.dirty);
   $('clear').disabled = !files.length;
   $('pack').disabled = !files.length;
+  if (typeof optButtons === 'function') optButtons();
   $('rename').disabled = !files.some(f => f.handle);
   $('renameOne').disabled = current < 0 || !files[current].handle;
 }
@@ -1060,7 +1086,8 @@ document.addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.ke
 let serverOk = false;
 function showModule(m) {
   for (const b of $('tabs').querySelectorAll('button')) b.classList.toggle('on', b.dataset.mod === m);
-  $('mod-tags').hidden = m !== 'tags'; $('mod-asm').hidden = m !== 'asm'; $('mod-v3').hidden = m !== 'v3';
+  $('mod-tags').hidden = m !== 'tags'; $('mod-asm').hidden = m !== 'asm'; $('mod-v3').hidden = m !== 'v3'; $('mod-opt').hidden = m !== 'opt';
+  if (m === 'opt') optButtons();
   try { localStorage.setItem('vgmstudio.module', m); } catch (e) {}
   if (m === 'asm') renderAsm();
 }
@@ -1072,6 +1099,7 @@ async function pingServer() {
   $('srv').className = serverOk ? 'hint ok' : 'hint warn';
   renderAsm();
   if (typeof v3Buttons === 'function') v3Buttons();
+  if (typeof optButtons === 'function') optButtons();
 }
 function totalOf(b) { return le32(b, 0x18); }
 function loopOf(b) { return le32(b, 0x1C) ? le32(b, 0x20) : 0; }
@@ -1412,6 +1440,57 @@ $('asmGo').addEventListener('click', async () => {
   } catch (e) { $('asmMsg').textContent = e.message.split('\n')[0]; $('asmMsg').className = 'hint warn'; $('asmLog').textContent = e.message; }
   renderAsm();
 });
+// ---- Optimiser: vgm_trim --cmp / --sro / --trim-lead through vgmstudio.py /api/optimize (render check) ----
+var optBusy = false;   // var: optButtons may run (from renderList) before this line
+function optButtons() {
+  const ok = serverOk && !optBusy;
+  $('optOne').disabled = !ok || current < 0 || !!files[current].audio;
+  $('optAll').disabled = !ok || !files.some(f => !f.audio);
+}
+const kb = n => (n / 1024).toFixed(1) + ' Ko';
+async function optimizeFiles(list) {
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+  const opts = { cmp: $('optCmp').checked, sro: $('optSro').checked, lead: $('optLead').checked };
+  if (!opts.cmp && !opts.sro && !opts.lead) { $('optMsg').textContent = 'aucune option cochée'; $('optMsg').className = 'hint warn'; return; }
+  optBusy = true; optButtons();
+  $('opttbl').innerHTML = '';
+  let changed = 0, k = 0;
+  for (const f of list) {
+    k++;
+    $('optMsg').innerHTML = '<span class="spin"></span> ' + k + '/' + list.length + ' ' + esc(f.name); $('optMsg').className = 'hint';
+    const row = document.createElement('tr'); $('opttbl').appendChild(row);
+    let st = '', lg = '';
+    try {
+      const j = await postJson('/api/optimize', { name: f.name, data: fileData(f), ...opts, verify: true });
+      const parts = [kb(j.before) + ' → ' + kb(j.after)];
+      if (j.cut > 0) parts.push('silence retiré : ' + (j.cut / 44100).toFixed(3) + ' s');
+      if (j.loop_after) parts.push('boucle conservée (' + fmtTime(j.loop_after) + ')');
+      if (j.sro_dropped) parts.push('--sro non appliqué : il changeait le rendu (2e passage de la boucle)');
+      let apply = true;
+      if (j.exact || (j.exact == null && j.cut === 0)) st = '<span class="ok">✓ rendu identique</span>';
+      else {
+        const d = j.diff || {};
+        parts.push('écart : crête ' + d.peak + ' dBFS, efficace ' + d.rms + ' dBFS (signal ' + d.signal + ' dBFS)');
+        apply = $('optLossy').checked;
+        st = apply ? '<span class="warn">⚠ appliqué, rendu non identique</span>' : '<span class="warn">non modifié : rendu non identique</span>';
+      }
+      if (j.cut === 0 && j.after >= j.before) { st = 'rien à gagner, fichier inchangé'; apply = false; }
+      if (apply) {
+        const nf = await readFile(new File([unb64(j.data)], f.name), null);
+        f.bytes = nf.bytes; f.raw = null; f.dirty = true; changed++;
+      }
+      lg = parts.join(' · ');
+    } catch (e) { st = '<span class="warn">ERREUR</span>'; lg = e.message; }
+    row.innerHTML = '<td>' + esc(f.name) + '</td><td class="st">' + st + '</td><td class="lg">' + esc(lg) + '</td>';
+  }
+  optBusy = false; optButtons();
+  renderList(); if (current >= 0) select(current);
+  $('optMsg').textContent = changed + ' fichier(s) optimisé(s)' + (changed ? ', « Enregistrer » / « Tout enregistrer » pour les écrire' : '');
+  $('optMsg').className = 'hint ok';
+}
+$('optOne').addEventListener('click', () => { if (current >= 0 && !files[current].audio) optimizeFiles([files[current]]); });
+$('optAll').addEventListener('click', () => optimizeFiles(files.filter(f => !f.audio)));
+
 // ---- Conversion v3: pack zip -> vgmstudio.py /api/v3pack (vgm_v3conv + render check) ----
 const v3 = { file: null, loose: null, job: null, zipName: '' };   // loose: names of .vgz / .vgm dropped without a zip
 // files of a stored zip (the server writes them stored): [{name, data}]
