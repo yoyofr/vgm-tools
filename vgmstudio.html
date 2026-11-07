@@ -174,7 +174,7 @@ button.mini { font-size: 12px; padding: 2px 8px }
       <div class="row"><label for="gameE">Jeu</label><input type="text" id="gameE" data-i="2"><input type="text" id="gameJ" data-i="3" lang="ja"><button class="all" data-all="2,3">→ tous</button></div>
       <div class="row"><label for="systemE">Système</label><input type="text" id="systemE" data-i="4"><input type="text" id="systemJ" data-i="5" lang="ja"><button class="all" data-all="4,5">→ tous</button></div>
       <div class="row"><label for="authorE">Compositeur</label><input type="text" id="authorE" data-i="6"><input type="text" id="authorJ" data-i="7" lang="ja"><button class="all" data-all="6,7">→ tous</button></div>
-      <div class="row single"><label for="date">Date (AAAA/MM/JJ)</label><input type="text" id="date" data-i="8" placeholder="1994/12/15"><button class="all" data-all="8">→ tous</button></div>
+      <div class="row single"><label for="date">Date (AAAA-MM-JJ)</label><input type="text" id="date" data-i="8" placeholder="1994-12-15"><button class="all" data-all="8">→ tous</button></div>
       <div class="row single"><label for="creator">Rippé par</label><input type="text" id="creator" data-i="9"><button class="all" data-all="9">→ tous</button></div>
       <div class="row single"><label for="notes">Notes</label><textarea id="notes" data-i="10"></textarea><button class="all" data-all="10">→ tous</button></div>
       <div class="row single"><label for="vol">Volume (dB)</label><div class="volbox"><input type="number" id="vol" step="0.5" min="-12" max="36" placeholder="0"><span id="volHint"></span></div><button class="all" id="volAll">→ tous</button></div>
@@ -895,7 +895,9 @@ const CHIPS = [[0x0C, 'SN76489'], [0x10, 'YM2413'], [0x2C, 'YM2612'], [0x30, 'YM
   [0xA0, 'K054539'], [0xA4, 'HuC6280'], [0xA8, 'C140'], [0xAC, 'K053260'], [0xB0, 'Pokey'], [0xB4, 'QSound'], [0xB8, 'SCSP'],
   [0xC0, 'WonderSwan'], [0xC4, 'VSU'], [0xC8, 'SAA1099'], [0xCC, 'ES5503'], [0xD0, 'ES5505'], [0xD8, 'X1-010'], [0xDC, 'C352'],
   [0xE0, 'GA20'], [0xE4, 'Mikey'], [0xE8, 'K007232'], [0xEC, 'K005289'], [0xF0, 'MSM5205'], [0xF4, 'MSM5232'], [0xF8, 'BSMT2000'],
-  [0xFC, 'ICS2115'], [0x100, 'ZSG-2 + TMS57002']];
+  [0xFC, 'ICS2115'], [0x100, 'Namco WSG'], [0x104, 'Namco C15'], [0x108, 'Namco C30'], [0x10C, 'Pole Position WSG'],
+  [0x110, 'ZSG-2'], [0x118, 'TMS57002']];
+// v3 layout (VGM-proposal-v3-allocation.md); a v1 ZSG-2 log has a 0x110-byte header with its clock at 0x100
 function chipsOf(b) {
   const dataOfs = le32(b, 0x34) + 0x34, hdrEnd = Math.min(dataOfs, b.length), out = [];
   for (const [o, n] of CHIPS) {
@@ -903,6 +905,8 @@ function chipsOf(b) {
     const v = le32(b, o);
     if (!(v & 0x3FFFFFFF)) continue;
     let name = n;
+    if (o === 0x100 && hdrEnd < 0x120) { out.push((v & 0x40000000 ? '2x ' : '') + 'ZSG-2', 'TMS57002'); continue; }
+    if (o === 0x108 && (v & 0x80000000)) name = 'Namco C30 (stereo)';
     if (o === 0xD0) name = v & 0x80000000 ? 'ES5506' : 'ES5505';
     if (o === 0x8C && (v & 0x80000000)) name = 'uPD7759';
     if (o === 0x0C && b.length > 0x2B && le32(b, 0x28)) name = 'SN76489';
