@@ -57,34 +57,52 @@ def vgm2wav_for(path):
 
 JOBS = {}   # v3 pack conversions: id -> {done, total, current, finished, report, zip, error, name}
 
+def secs_to_samples(v):
+    return int(round(float(v) * SR)) if v not in (None, "") and float(v) > 0 else 0
+
 def prepare_part(tmp, i, part, log, fast=False):
-    """write the part, unroll its loop (repeat N), cut it (start / end, seconds in the played part).
+    """write the part, unroll its loop (repeat N), cut it (start / end, seconds in the played part), fade it
+    (fade_in / fade_out, seconds: mixer gain ramps from the in point / to the out point).
     Returns the path to feed the merge and whether it still loops."""
     src = write_part(tmp, i, part)
     info = vgm_info(src)
     repeat, start, end = part.get("repeat"), part.get("start"), part.get("end")
+    fin, fout = secs_to_samples(part.get("fade_in")), secs_to_samples(part.get("fade_out"))
     loops = info["loop"] > 0
-    if repeat is not None and loops:
-        u = os.path.join(tmp, f"u{i}.vgm")
-        rc, out = run([TOOLS["vgm_trim"], src, u, "--repeat", str(int(repeat)), "--color", "never"], tmp)
+    def trim(dst, opts, what):
+        rc, out = run([TOOLS["vgm_trim"], src, dst] + opts + ["--color", "never"], tmp)
         log.append(out)
-        if rc != 0 or not os.path.isfile(u): raise RuntimeError(f"part {i + 1}: unroll failed")
-        src, loops = u, False
+        if rc != 0 or not os.path.isfile(dst):
+            err = next((l for l in out.splitlines() if l.startswith("✖")), "")
+            raise RuntimeError(f"part {i + 1}: {what} failed" + (": " + err.lstrip("✖ ") if err else ""))
+        return dst
+    if repeat is not None and loops:
+        src, loops = trim(os.path.join(tmp, f"u{i}.vgm"), ["--repeat", str(int(repeat))], "unroll"), False
         info = vgm_info(src)
     total = info["total"]
     s = int(round(float(start) * SR)) if start not in (None, "") else 0
     e = int(round(float(end) * SR)) if end not in (None, "") else total
     s = max(0, min(s, total)); e = max(s + 1, min(e, total))
-    if s == 0 and e == total: return src, loops
-    c = os.path.join(tmp, f"c{i}.vgm")
-    cmd = [TOOLS["vgm_trim"], src, c, "--start", str(s), "--end", str(e), "--color", "never"] + (["--fast-dsp"] if fast else [])
     loop_at = total - info["loop"] if loops else None
-    if loops and e == total and s < loop_at: cmd += ["--loop", str(loop_at)]   # the part keeps its loop
-    else: loops = False
-    rc, out = run(cmd, tmp)
-    log.append(out)
-    if rc != 0 or not os.path.isfile(c): raise RuntimeError(f"part {i + 1}: cut failed")
-    return c, loops
+    extra = False
+    if loops and e == total and s < loop_at and fin > loop_at - s:
+        # the fade-in would reach into the loop body (replayed at each loop): one more pass of the body is
+        # written out, the loop moves to the start of that pass (same music, the fade stays in the intro)
+        src = trim(os.path.join(tmp, f"u{i}.vgm"), ["--repeat", "2"], "unroll")
+        loop_at, total = total, vgm_info(src)["total"]
+        e, extra = total, True
+    if s == 0 and e == total and not extra:
+        out = src
+    else:
+        cmd = ["--start", str(s), "--end", str(e)] + (["--fast-dsp"] if fast else [])
+        if loops and e == total and s < loop_at: cmd += ["--loop", str(loop_at)]   # the part keeps its loop
+        else: loops = False
+        out = trim(os.path.join(tmp, f"c{i}.vgm"), cmd, "cut")
+    if fin or fout:
+        if loops and fout: raise RuntimeError(f"part {i + 1}: fondu sortant impossible sur une partie qui garde sa boucle (mets « Boucles » à 0 ou un nombre de passages)")
+        src = out
+        out = trim(os.path.join(tmp, f"f{i}.vgm"), (["--fade-in", str(fin)] if fin else []) + (["--fade-out", str(fout)] if fout else []), "fade")
+    return out, loops
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "vgmstudio/1.0"
@@ -146,7 +164,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:   # report, never crash the server
             self.send_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
 
-    # parts: [{name, data (base64), repeat (int|null), start (s|null), end (s|null)}], output: file name
+    # parts: [{name, data (base64), repeat (int|null), start (s|null), end (s|null), fade_in / fade_out (s|null)}], output: file name
     # each part is unrolled / cut first, then the parts are merged (seamless junctions), then the used
     # sample ROM ranges of the whole result are recomputed (--sro)
     def api_concat(self):
@@ -193,18 +211,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             A, B = dict(req["a"]), dict(req["b"])
             # A: unrolled first (its played length is known then), then only its tail is cut
-            pa, _ = prepare_part(tmp, 0, {**A, "start": None, "end": None}, log)
+            pa, _ = prepare_part(tmp, 0, {**A, "start": None, "end": None, "fade_in": None, "fade_out": None}, log)
             ta = vgm_info(pa)["total"] / SR
             a1 = ta if A.get("end") in (None, "") else min(float(A["end"]), ta)
             a0 = max(float(A.get("start") or 0), a1 - w)
             pa2 = os.path.join(tmp, "a_tail.vgm")
-            rc, out = run([TOOLS["vgm_trim"], pa, pa2, "--start", str(int(round(a0 * SR))), "--end", str(int(round(a1 * SR))), "--color", "never", "--fast-dsp"], tmp)
+            fo = secs_to_samples(A.get("fade_out"))   # relative to the out point: a fade longer than the window starts before it
+            rc, out = run([TOOLS["vgm_trim"], pa, pa2, "--start", str(int(round(a0 * SR))), "--end", str(int(round(a1 * SR))), "--color", "never", "--fast-dsp"]
+                          + (["--fade-out", str(fo)] if fo else []), tmp)
             log.append(out)
             if rc != 0 or not os.path.isfile(pa2): raise RuntimeError("part A: cut failed")
             ja = vgm_info(pa2)["total"] / SR
             b0 = float(B.get("start") or 0)
             b1 = b0 + w if B.get("end") in (None, "") else min(float(B["end"]), b0 + w)
-            pb, _ = prepare_part(tmp, 1, {**B, "end": b1}, log, fast=True)   # previews: approximate DSP image (--fast-dsp)
+            pb, _ = prepare_part(tmp, 1, {**B, "end": b1, "fade_out": None}, log, fast=True)   # previews: approximate DSP image (--fast-dsp)
             merged = os.path.join(tmp, "j.vgm")
             rc, out = run([TOOLS["vgm_trim"], pa2, merged, "--append", pb, "--color", "never"], tmp)
             log.append(out)

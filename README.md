@@ -23,6 +23,7 @@ vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --loop 30.0s --cmp --sro
 vgm_trim capture.vgm out.vgz --start 18.2s --end 1:05.5 --volume +6dB
 vgm_trim part1.vgz merged.vgz --append part2.vgz
 vgm_trim part1.vgz merged.vgz --repeat 2 --append part2.vgz   # intro + 2 loop passes of part 1, then part 2 (its loop is kept)
+vgm_trim part1.vgz part1_out.vgz --end 1:20 --fade-out 6s     # fade out over the last 6 s (fade-in: --fade-in)
 vgm_trim capture.vgm capture.vgz            # no option: rewrite as is (loop kept); 1.73 files become 1.72
 vgm_trim capture.wav tracks.wav --auto --track all --gap 3s   # a .wav input is split / cut the same way (16-bit PCM out)
 ```
@@ -64,6 +65,16 @@ delay lines refill during their first second). Final files are always cut with t
 2^(n/32) to its output, n = round(dB / 6.02 × 32), range -12 dB..+36 dB. The chip data is untouched,
 so it stays lossless and reversible; `--info` prints the current value.
 
+`--fade-in P` / `--fade-out P` fade the written file in / out (ES5505 / ES5506 and ZSG-2) through the
+board mixer gain commands of the format (`0xE3` gains, ZSG-2 `0xE4` sub 6), never through the voice
+registers: overall curve x², applied before the effect DSP (the reverb is fed the faded signal, no
+full-level tail when the fade ends) and after it (a reverb state loaded at the cut, or a tail from a
+previous part, fades too). Gains are updated every 32 samples when their 8.8 value changes (about 1-2 KB
+per second of fade); a gain the log writes during a fade is scaled. A fade longer than the file starts or
+ends beyond it (the file begins / ends mid-fade). A looping file only fades in, within its intro. Outside
+the fades the output is byte-identical to the input; after a fade-in the reverb fed during the fade
+differs for its decay time.
+
 `--append` (repeatable) concatenates captures: data blocks of every part first, then the command
 streams in order. The initial register image of an appended part re-creates its state at the
 junction and the ESP keeps the tail of the previous part. Header, GD3 and volume come from the
@@ -74,7 +85,10 @@ loop. ZSG-2 junctions are seamless: the voices still sounding get a 0.1 s releas
 next part (its register image is applied voice by voice when it first uses them, its idle key-offs leave
 them alone until then), and the DSP runs on, reverb tail included: the next part's state block is left
 out when its program is the one already running and only the coefficients that differ are sent through
-the host port.
+the host port. At each junction the mixer gains the next part does not set in its first commands go back
+to the player defaults (a fade-out or a game volume change does not carry over), and when the previous
+part ends faded out (all its pre-DSP gains at 0) its voices still keyed are silenced at once instead of the
+0.1 s release.
 
 ZSG-2 logs (Taito FX-1B / G-NET, VGM 1.72 with a 0x110-byte header) are handled by a dedicated path: a cut re-creates the
 board gains, the DSP (simulated from the start of the capture with libvgm's TMS57002 core, a copy of
@@ -110,7 +124,10 @@ like in an audio editor (in / out points typed or dragged on its waveform, click
 the backend unrolls the loops, cuts with `vgm_trim --start/--end`, merges, then recomputes the used ROM
 ranges), listen to each junction before assembling
 (between two parts, "▶ enchaînement": the last seconds of the first part chained to the first seconds of
-the next, from the current settings, rendered in about 2 s), assemble, then listen to the result or to a
+the next, from the current settings, rendered in about 2 s), set a fade-out of the first part and / or a
+fade-in of the next one on that junction (seconds, `--fade-out` / `--fade-in` above, drawn on the
+waveforms; when the last part keeps its loop and its fade-in is longer than its intro, one more pass of the
+loop body is written so that the loop never replays the fade), assemble, then listen to the result or to a
 ±2/5/10 s window around each junction (renders are cached per file and window: switching back plays at once and resumes where it was left). The result is added to the list (its GD3 =
 the first part's, editable in Tags) and saved with the usual button. Assembling and listening need the
 local backend, which runs `vgm_trim` and `vgm2wav` (libvgm's own player, so what you hear is what any

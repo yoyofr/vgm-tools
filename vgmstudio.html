@@ -107,9 +107,11 @@ button.mini { font-size: 12px; padding: 2px 8px }
 .jbar { display: grid; grid-template-columns: 15em minmax(0, 1fr); gap: 8px; align-items: center; padding: 2px 8px 2px 24px; border-left: 3px solid var(--ok); margin-left: 12px }
 @media (max-width: 700px) { .jbar { grid-template-columns: 1fr } }
 .jrow { display: grid; grid-template-columns: 15em minmax(0, 1fr); gap: 8px; align-items: center; margin-top: 6px }
-@media (max-width: 700px) { .jbar { display: grid; grid-template-columns: 15em minmax(0, 1fr); gap: 8px; align-items: center; padding: 2px 8px 2px 24px; border-left: 3px solid var(--ok); margin-left: 12px }
-@media (max-width: 700px) { .jbar { grid-template-columns: 1fr } }
-.jrow { grid-template-columns: 1fr } }
+@media (max-width: 700px) { .jrow { grid-template-columns: 1fr } }
+.jfade { grid-column: 1 / -1; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em }
+.jfade label { display: flex; gap: 4px; align-items: center }
+.jfade input { width: 4.5em; font: 13px var(--mono); padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--fg) }
+.jfade .hint { text-transform: none; letter-spacing: 0 }
 #asm select#jWin { font: inherit; padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--fg) }
 .asmbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
 .asmbar input[type=text] { flex: 1; min-width: 12em }
@@ -214,7 +216,7 @@ button.mini { font-size: 12px; padding: 2px 8px }
       <div id="asm">
         <div>
           <h2>Parties</h2>
-          <div class="hint">Chaque partie est un fichier de la liste. « Boucles » = passages du corps de boucle, écrits dans le fichier (0 = intro seule) ; pour la dernière partie, la boucle reste une vraie boucle VGM et N = nombre de boucles demandé au lecteur (en-tête, champ « Boucles » des tags), vide = défaut du lecteur. « Entrée » / « Sortie » coupent la partie jouée (m:ss.sss) : tape la valeur ou tire les poignées sur l’onde ; un clic sur l’onde écoute depuis cet endroit. Les parties s’enchaînent sans silence : les voix encore actives à la jonction s’éteignent en 0,1 s pendant que la suite démarre, le DSP (réverbération) continue.</div>
+          <div class="hint">Chaque partie est un fichier de la liste. « Boucles » = passages du corps de boucle, écrits dans le fichier (0 = intro seule) ; pour la dernière partie, la boucle reste une vraie boucle VGM et N = nombre de boucles demandé au lecteur (en-tête, champ « Boucles » des tags), vide = défaut du lecteur. « Entrée » / « Sortie » coupent la partie jouée (m:ss.sss) : tape la valeur ou tire les poignées sur l’onde ; un clic sur l’onde écoute depuis cet endroit. Les parties s’enchaînent sans silence : les voix encore actives à la jonction s’éteignent en 0,1 s pendant que la suite démarre, le DSP (réverbération) continue. Entre deux parties, « fondu sortie » / « fondu entrée » (secondes) ajoutent un fondu à la fin de la première et au début de la suivante : rampes des gains de mixage du VGM (avant et après le DSP, pas de registre de voix modifié), courbe en x², 0 ou vide = pas de fondu. Une partie qui finit en fondu coupe ses voix restantes à la jonction.</div>
         </div>
         <div class="parts" id="asmParts"></div>
         <div class="asmbar"><button type="button" id="asmAdd">+ Partie</button><span class="hint" id="asmTotal"></span></div>
@@ -1196,6 +1198,7 @@ function cutOf(f, p) {   // effective in / out points (s)
   return { a, b, P, keepsLoop: P.loop > 0 && b >= P.len - 1e-6 && a < P.len - P.loop };
 }
 const partKey = (f, p) => 'p|' + fileId(f) + '|' + (repeatOf(p) ?? 'L');
+const fadeOf = v => (v == null || isNaN(+v) || +v <= 0) ? 0 : +v;   // fade length (s), 0 = none
 
 function drawWave(cv, e, opts) {
   // opts: {dur (timeline length s), a, b (shaded outside), marks: [{t, color}], playhead}
@@ -1220,6 +1223,13 @@ function drawWave(cv, e, opts) {
     g.fillRect(0, 0, X(opts.a), H); g.fillRect(X(opts.b), 0, W - X(opts.b), H);
     g.fillStyle = col('--accent');
     for (const t of [opts.a, opts.b]) { const x = Math.round(X(t)); g.fillRect(x - 1, 0, 2, H); g.fillRect(x - 5, 0, 10, 6); }
+  }
+  if (opts.a != null && (opts.fi > 0 || opts.fo > 0)) {   // fade curves (gain x², top = full level)
+    g.strokeStyle = col('--accent'); g.lineWidth = 1.5; g.beginPath();
+    const curve = (t0, len, up) => { for (let k = 0; k <= 32; k++) { const x = k / 32, G = up ? x * x : (1 - x) * (1 - x); const px = X(t0 + x * len), py = 2 + (1 - G) * (H - 4); k ? g.lineTo(px, py) : g.moveTo(px, py); } };
+    if (opts.fi > 0) curve(opts.a, Math.min(opts.fi, opts.b - opts.a), true);
+    if (opts.fo > 0) { const l = Math.min(opts.fo, opts.b - opts.a); curve(opts.b - l, l, false); }
+    g.stroke();
   }
   for (const m of opts.marks || []) { g.fillStyle = m.color || col('--ok'); g.fillRect(Math.round(X(m.t)) - 1, 0, 2, H); }
   if (opts.playhead != null) { g.fillStyle = col('--fg'); g.fillRect(Math.round(X(opts.playhead)), 0, 1, H); }
@@ -1252,7 +1262,7 @@ function renderAsm() {
       const C = cutOf(f, p);
       if (k) junctions.push(t);
       const len = C.b - C.a;
-      info.textContent = fmtSec(t) + ' → ' + fmtSec(t + len) + ' · ' + fmtSec(len) + ' · ' + (C.keepsLoop ? (lastLoops(p) != null ? 'boucle ' + fmtSec(C.P.loop) + ' × ' + lastLoops(p) + ' au lecteur' : 'garde sa boucle (' + fmtSec(C.P.loop) + ')') : C.P.text + (C.a > 0 || C.b < C.P.len - 1e-6 ? ', coupée' : ''));
+      info.textContent = fmtSec(t) + ' → ' + fmtSec(t + len) + ' · ' + fmtSec(len) + ' · ' + (C.keepsLoop ? (lastLoops(p) != null ? 'boucle ' + fmtSec(C.P.loop) + ' × ' + lastLoops(p) + ' au lecteur' : 'garde sa boucle (' + fmtSec(C.P.loop) + ')') : C.P.text + (C.a > 0 || C.b < C.P.len - 1e-6 ? ', coupée' : '')) + (k > 0 && C.keepsLoop && fadeOf(p.fadeIn) > C.P.len - C.P.loop - C.a ? ' · fondu plus long que l’intro : +1 passage de boucle écrit' : '');
       info.title = info.textContent;
       t += len;
       if (C.keepsLoop) loopKept = k;
@@ -1260,7 +1270,7 @@ function renderAsm() {
       const tl = document.createElement('div'); tl.className = 'tl';
       const cv = document.createElement('canvas'); cv.className = 'wave';
       const key = partKey(f, p);
-      cv._draw = () => drawWave(cv, renderCache.get(key), { dur: C.P.len, a: C.a, b: C.b, empty: 'onde non rendue : « Onde » ou clic pour écouter (rend la partie)', playhead: playingKey === key ? $('player').currentTime : null, marks: C.P.loop ? [{ t: C.P.len - C.P.loop, color: getComputedStyle(document.documentElement).getPropertyValue('--warn') }] : [] });
+      cv._draw = () => drawWave(cv, renderCache.get(key), { dur: C.P.len, a: C.a, b: C.b, fi: k > 0 ? fadeOf(p.fadeIn) : 0, fo: k < asm.parts.length - 1 ? fadeOf(p.fadeOut) : 0, empty: 'onde non rendue : « Onde » ou clic pour écouter (rend la partie)', playhead: playingKey === key ? $('player').currentTime : null, marks: C.P.loop ? [{ t: C.P.len - C.P.loop, color: getComputedStyle(document.documentElement).getPropertyValue('--warn') }] : [] });
       cv._key = key;
       let drag = null;
       const tAt = ev => { const r = cv.getBoundingClientRect(); return Math.max(0, Math.min(C.P.len, (ev.clientX - r.left) / r.width * C.P.len)); };
@@ -1310,9 +1320,9 @@ function renderAsm() {
 // preview of a junction from the current settings, without assembling: end of part i, start of part j
 function junctionReq(i, j, w) {
   const pa = asm.parts[i], pb = asm.parts[j], fa = partFile(pa), fb = partFile(pb), A = cutOf(fa, pa), B = cutOf(fb, pb);
-  const part = (f, p, C) => ({ name: f.name, data: fileData(f), repeat: repeatOf(p), start: C.a > 0 ? C.a : null, end: C.b < C.P.len - 1e-6 ? C.b : null });
-  const key = ['J', fileId(fa), repeatOf(pa) ?? 'L', A.a.toFixed(3), A.b.toFixed(3), fileId(fb), repeatOf(pb) ?? 'L', B.a.toFixed(3), B.b.toFixed(3), w].join('|');
-  return { key, req: () => ({ a: part(fa, pa, A), b: part(fb, pb, B), window: w }), fa, A, B };
+  const part = (f, p, C) => ({ name: f.name, data: fileData(f), repeat: repeatOf(p), start: C.a > 0 ? C.a : null, end: C.b < C.P.len - 1e-6 ? C.b : null, fade_in: fadeOf(p.fadeIn) || null, fade_out: fadeOf(p.fadeOut) || null });
+  const key = ['J', fileId(fa), repeatOf(pa) ?? 'L', A.a.toFixed(3), A.b.toFixed(3), fadeOf(pa.fadeOut), fileId(fb), repeatOf(pb) ?? 'L', B.a.toFixed(3), B.b.toFixed(3), fadeOf(pb.fadeIn), w].join('|');
+  return { key, req: () => ({ a: part(fa, pa, A), b: part(fb, pb, B), window: w }), fa, A, B, pa, pb };
 }
 function junctionBar(i, j) {
   const w = +$('jWin').value, J = junctionReq(i, j, w);
@@ -1334,7 +1344,19 @@ function junctionBar(i, j) {
   };
   b.addEventListener('click', () => go(null));
   cv.addEventListener('click', ev => { const e = renderCache.get(J.key), r = cv.getBoundingClientRect(); go(e ? (ev.clientX - r.left) / r.width * e.dur : null); });
-  bar.append(b, cv);
+  const fades = document.createElement('div'); fades.className = 'jfade';
+  const fadeIn = (txt, p, prop, maxLen, title) => {
+    const l = document.createElement('label'); l.title = title;
+    const inp = document.createElement('input'); inp.type = 'text'; inp.placeholder = '0'; inp.value = fadeOf(p[prop]) ? String(+p[prop]) : '';
+    const on = () => { const v = parseFloat(inp.value.replace(',', '.')); p[prop] = isNaN(v) || v <= 0 ? null : Math.min(Math.round(v * 1000) / 1000, Math.max(0.001, Math.round(maxLen * 1000) / 1000)); renderAsm(); };
+    inp.addEventListener('change', on); inp.addEventListener('keydown', e => { if (e.key === 'Enter') on(); });
+    l.append(txt, inp, 's'); return l;
+  };
+  const lastKeepsLoop = j === asm.parts.length - 1 && J.B.keepsLoop;
+  fades.append(fadeIn('Fondu sortie ' + (i + 1), J.pa, 'fadeOut', J.A.b - J.A.a, 'Fondu sortant (secondes) se terminant au point de sortie de la partie ' + (i + 1) + ' ; vide ou 0 = aucun'),
+    fadeIn('Fondu entrée ' + (j + 1), J.pb, 'fadeIn', J.B.b - J.B.a, 'Fondu entrant (secondes) partant du point d’entrée de la partie ' + (j + 1) + ' ; vide ou 0 = aucun' + (lastKeepsLoop ? '. Si le fondu dépasse l’intro, un passage de la boucle est écrit en plus (la boucle ne rejoue pas le fondu)' : '')));
+  if (fadeOf(J.pa.fadeOut) || fadeOf(J.pb.fadeIn)) fades.append(Object.assign(document.createElement('span'), { className: 'hint', textContent: '▶ enchaînement pour écouter le fondu' + (fadeOf(J.pa.fadeOut) > w ? ' (fondu sortant plus long que la fenêtre : on en entend la fin)' : '') }));
+  bar.append(b, cv, fades);
   requestAnimationFrame(() => cv._draw());
   return bar;
 }
@@ -1405,7 +1427,7 @@ $('asmAdd').addEventListener('click', () => {
   const list = vgmFiles();
   const used = new Set(asm.parts.map(p => p.name + '|' + p.size));
   const next = list.find(x => !used.has(x.f.name + '|' + x.f.size)) || list[0];
-  asm.parts.push(next ? { name: next.f.name, size: next.f.size, repeat: '', start: null, end: null } : { name: null, size: 0, repeat: '', start: null, end: null });
+  asm.parts.push(next ? { name: next.f.name, size: next.f.size, repeat: '', start: null, end: null, fadeIn: null, fadeOut: null } : { name: null, size: 0, repeat: '', start: null, end: null, fadeIn: null, fadeOut: null });
   if (asm.parts.length >= 2) { const prev = asm.parts[asm.parts.length - 2]; if (prev.repeat === '') prev.repeat = '1'; }
   renderAsm();
 });
@@ -1419,8 +1441,8 @@ async function postJson(url, body) {
   return j;
 }
 $('asmGo').addEventListener('click', async () => {
-  const parts = asm.parts.map(p => { const f = partFile(p), C = cutOf(f, p); return { name: f.name, data: fileData(f), repeat: repeatOf(p),
-    start: C.a > 0 ? C.a : null, end: C.b < C.P.len - 1e-6 ? C.b : null }; });
+  const parts = asm.parts.map((p, k) => { const f = partFile(p), C = cutOf(f, p); return { name: f.name, data: fileData(f), repeat: repeatOf(p),
+    start: C.a > 0 ? C.a : null, end: C.b < C.P.len - 1e-6 ? C.b : null, fade_in: k > 0 ? fadeOf(p.fadeIn) || null : null, fade_out: k < asm.parts.length - 1 ? fadeOf(p.fadeOut) || null : null }; });
   let name = ($('asmName').value.trim() || 'assemblage.vgz').replace(/\.(vgm)$/i, '.vgz');
   if (!/\.vgz$/i.test(name)) name += '.vgz';
   name = uniqueName(name, asm.result);

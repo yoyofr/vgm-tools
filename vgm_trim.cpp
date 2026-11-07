@@ -269,6 +269,13 @@ struct VGMFile
 			data.swap(raw);
 			n = (long)data.size();
 		}
+		init(path);
+	}
+
+	// header and loop of `data` (a whole file, already inflated); `path` names it in the messages
+	void init(const std::string& path)
+	{
+		const size_t n = data.size();
 		if (n < 0x40 || memcmp(data.data(), "Vgm ", 4) != 0) die("not a VGM file");
 		if (vgmv3::is_v3_ext(data))
 		{
@@ -3144,6 +3151,176 @@ static bool ends_with_nocase(const std::string& s, const char* suffix)
 	return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// mixer gains (fades, junctions)
+// ---------------------------------------------------------------------------------------------
+// The board mixer gains of the v1 encoding, 8.8 (0x0100 = unity), with the player's defaults (libvgm
+// es5506.c / zsg2.c):
+//   ES55xx  0xE3 pp cc gggg (pp bit 7 = second chip): cc 0-11 output channels (direct mix and ESP input),
+//           0x10/0x11 ESP outputs into the mix, 0x12/0x13 direct bus (left out: the channel gains already
+//           scale the direct mix)
+//   ZSG-2   0xE4 06 aa gggg: aa 0-3 ZSG-2 output n -> DSP input n, 0x10+n / 0x14+n DSP output n -> left /
+//           right, 0x20+n / 0x24+n ZSG-2 output n -> left / right (no DSP); only the channels the v3
+//           encoding can carry are listed (the channel's own side)
+// `pre` gains act before the effect DSP (the signal and what feeds the reverb), the others after it.
+struct MixGain { u8 cs, ch; u16 def; bool pre; };
+
+static std::vector<MixGain> mix_gains(const VGMFile& v)
+{
+	std::vector<MixGain> g;
+	if (v.is_zsg2)
+	{
+		for (u8 aa = 0; aa < 4; aa++) g.push_back({0, aa, u16(aa < 2 ? 0x80 : 0x100), true});
+		for (u8 aa : {0x20, 0x22, 0x25, 0x27}) g.push_back({0, aa, 0, true});
+		for (u8 aa : {0x10, 0x12, 0x15, 0x17}) g.push_back({0, aa, u16(aa == 0x12 || aa == 0x17 ? 0x100 : 0), false});
+	}
+	else if (v.es5506_clock)
+	{
+		const int nch = v.is_es5506 ? 12 : 8;
+		for (u8 cs : {u8(0), u8(0x80)})
+		{
+			if (cs && !(v.es5506_clock & 0x40000000)) break;
+			for (int cc = 0; cc < nch; cc++) g.push_back({cs, u8(cc), 0x100, true});
+			for (u8 cc : {0x10, 0x11}) g.push_back({cs, cc, 0x100, false});
+		}
+	}
+	return g;
+}
+
+// the mixer gain a command sets: true with its (cs, ch) and value
+static bool mix_gain_cmd(const VGMFile& v, const u8* c, u8& cs, u8& ch, u16& val)
+{
+	if (v.is_zsg2 && c[0] == 0xE4 && (c[1] & 0x0F) == 6) { cs = c[1] & 0x80; ch = c[2]; val = (u16)((c[3] << 8) | c[4]); return true; }
+	if (!v.is_zsg2 && v.es5506_clock && c[0] == 0xE3) { cs = c[1] & 0x80; ch = c[2]; val = (u16)((c[3] << 8) | c[4]); return true; }
+	return false;
+}
+
+static void push_mix_gain(Bytes& out, const VGMFile& v, u8 cs, u8 ch, u16 val)
+{
+	if (v.is_zsg2) { u8 c[5] = {0xE4, u8(0x06 | cs), ch, u8(val >> 8), u8(val & 0xFF)}; out.insert(out.end(), c, c + 5); }
+	else { u8 c[5] = {0xE3, cs, ch, u8(val >> 8), u8(val & 0xFF)}; out.insert(out.end(), c, c + 5); }
+}
+
+// --fade-in D / --fade-out D: fade of the output, written as mixer gain changes (no chip register is
+// touched). Overall curve G = x^2 (x: 0 -> 1 over the fade-in, 1 -> 0 over the fade-out), applied both
+// before the effect DSP (so that the reverb holds no full-level tail when the fade ends) and after it
+// (so that a reverb state loaded at the start, or a tail ringing in from a previous part, fades too):
+// ZSG-2 (everything goes through the DSP) sqrt(G) on each side, the dry signal follows G; ES55xx G on
+// each side (the channel gains also scale the direct mix: dry G, reverb G^2). A gain written by the log
+// during a fade is scaled at once; between log writes the gains are updated every 32 samples, only
+// when the 8.8 value changes. A fade longer than the file starts (or ends) beyond it: the file then
+// begins (ends) mid-fade, which is what the junction previews need. A looping file can only fade in,
+// and only within its intro (the loop body must stay as logged).
+static i64 g_fade_in = 0, g_fade_out = 0;
+
+static Bytes apply_fades(const Bytes& in, i64 fin, i64 fout)
+{
+	VGMFile v;
+	v.data = in;
+	v.init("output");
+	if (v.is_wsg) die("--fade-in / --fade-out: Namco WSG files have no mixer gain to drive, not supported");
+	std::vector<MixGain> mg = mix_gains(v);
+	if (mg.empty()) die("--fade-in / --fade-out: only ES5505 / ES5506 and ZSG-2 files are supported (the fade drives their mixer gains)");
+	const i64 total = v.total;
+	if (v.loop_ofs)
+	{
+		if (fout > 0) die("--fade-out on a file that loops: unroll its loop first (--repeat N) or cut it without its loop");
+		if (fin > v.loop_t) die(strf("--fade-in %s is longer than the intro (loop at %s): the loop body would replay the fade", fmt_pos(fin).c_str(), fmt_pos(v.loop_t).c_str()));
+	}
+	const bool zsg2 = v.is_zsg2;
+	auto factor = [&](i64 t) {
+		double G = 1;
+		if (fin > 0 && t < fin) { double x = (double)std::max<i64>(t, 0) / fin; G *= x * x; }
+		if (fout > 0 && t > total - fout) { double x = (double)std::max<i64>(total - t, 0) / fout; G *= x * x; }
+		return zsg2 ? std::sqrt(G) : G;
+	};
+	std::map<int, size_t> idx;
+	for (size_t i = 0; i < mg.size(); i++) idx[(mg[i].cs << 8) | mg[i].ch] = i;
+	std::vector<u16> nominal(mg.size()), cur(mg.size());
+	for (size_t i = 0; i < mg.size(); i++) nominal[i] = cur[i] = mg[i].def;
+	auto want = [&](size_t i, double f) { return (u16)std::min<long>(0xFFFF, std::lround(nominal[i] * f)); };
+
+	// update points: every 32 samples inside the fades, plus their ends
+	std::vector<i64> pts;
+	const i64 GRID = 32;
+	if (fin > 0) { for (i64 t = 0; t < std::min(fin, total); t += GRID) pts.push_back(t); if (fin <= total) pts.push_back(fin); }
+	if (fout > 0) { for (i64 t = std::max<i64>(0, total - fout); t < total; t += GRID) pts.push_back(t); pts.push_back(total); }
+	std::sort(pts.begin(), pts.end());
+	pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+	size_t next = 0;
+	int writes = 0;
+
+	Bytes body;
+	auto update = [&](i64 t) {
+		const double f = factor(t);
+		for (size_t i = 0; i < mg.size(); i++)
+		{
+			u16 w = want(i, f);
+			if (w == cur[i]) continue;
+			push_mix_gain(body, v, mg[i].cs, mg[i].ch, w);
+			cur[i] = w; writes++;
+		}
+	};
+	auto points_until = [&](i64 t) { while (next < pts.size() && pts[next] <= t) update(pts[next++]); };
+
+	const u8* d = v.data.data();
+	size_t loop_out = 0;
+	i64 last_t = 0;
+	v.commands([&](const Cmd& c) {
+		points_until(c.t);
+		if (c.op == 0x66) { last_t = c.t; return false; }
+		if (v.loop_ofs && c.p == v.loop_ofs) loop_out = body.size();
+		u8 cs, ch; u16 val;
+		if (mix_gain_cmd(v, d + c.p, cs, ch, val))
+		{
+			auto it = idx.find((cs << 8) | ch);
+			if (it != idx.end())
+			{
+				size_t i = it->second;
+				nominal[i] = val;
+				u16 w = want(i, factor(c.t));
+				push_mix_gain(body, v, cs, ch, w);
+				cur[i] = w;
+				return true;
+			}
+		}
+		i64 w = wait_of(d + c.p, c.op);
+		if (w > 0)
+		{
+			i64 pos = c.t;
+			while (next < pts.size() && pts[next] < c.t + w)
+			{
+				wait_cmd(body, pts[next] - pos);
+				pos = pts[next];
+				update(pts[next++]);
+			}
+			wait_cmd(body, c.t + w - pos);
+			last_t = c.t + w;
+			return true;
+		}
+		body.insert(body.end(), d + c.p, d + c.p + c.len);
+		return true;
+	});
+	points_until(last_t);
+	body.push_back(0x66);
+
+	Bytes out(v.data.begin(), v.data.begin() + v.data_ofs);
+	if (v.loop_ofs) put_le32(&out[0x1C], (u32)(v.data_ofs + loop_out - 0x1C));
+	out.insert(out.end(), body.begin(), body.end());
+	if (v.gd3 && v.gd3 + 12 <= v.data.size())
+	{
+		u32 gd3_len = le32(&v.data[v.gd3 + 8]);
+		size_t e = std::min<size_t>(v.gd3 + 12 + gd3_len, v.data.size());
+		put_le32(&out[0x14], (u32)(out.size() - 0x14));
+		out.insert(out.end(), v.data.begin() + v.gd3, v.data.begin() + e);
+	}
+	else put_le32(&out[0x14], 0);
+	put_le32(&out[0x04], (u32)(out.size() - 4));
+	ui::info(strf("fade%s%s%s: %d mixer gain write(s) added", fin > 0 ? (" in " + ui::secs(fin)).c_str() : "", fin > 0 && fout > 0 ? "," : "",
+	              fout > 0 ? (" out " + ui::secs(fout)).c_str() : "", writes));
+	return out;
+}
+
 // .vgz output is gzip-compressed (level 9, no name/mtime in the gzip header)
 // --append: concatenate captures. The data blocks (0x67) of every file come first (exact duplicates
 // dropped), then the command streams in order: the initial register image of an appended file re-creates
@@ -3176,6 +3353,20 @@ static Bytes merge(std::vector<MergePart>& in)
 	for (const MergePart& m : in) if (m.file.is_wsg) die("--append / --repeat: Namco WSG files are not supported");
 	const bool zsg2 = a.is_zsg2;
 	Bytes blocks, body;
+	// mixer gains of the output stream: at a junction the gains the next part does not set in its init
+	// return to the player's defaults (that part was logged, or cut, with those), so that a fade-out or a
+	// game volume change of a part does not carry over into the next one
+	std::vector<MixGain> rg = mix_gains(a);
+	if (!zsg2 && a.es5506_clock)
+		for (u8 cs : {u8(0), u8(0x80)})
+		{
+			if (cs && !(a.es5506_clock & 0x40000000)) break;
+			for (u8 cc : {0x12, 0x13}) rg.push_back({cs, cc, 0x100, false});
+		}
+	std::map<int, u16> gain_now;
+	for (const MixGain& g : rg) gain_now[(g.cs << 8) | g.ch] = g.def;
+	auto track_gain = [&](const u8* c) { u8 cs, ch; u16 val; if (mix_gain_cmd(a, c, cs, ch, val)) gain_now[(cs << 8) | ch] = val; };
+
 	std::set<Bytes> seen;
 	i64 total = 0, loop_t = -1;
 	size_t loop_body_ofs = 0, loop_part = 0;
@@ -3240,6 +3431,7 @@ static Bytes merge(std::vector<MergePart>& in)
 	auto raw = [&](u8 sub, u8 aa, u16 d) {
 		u8 c[5] = {0xE4, sub, aa, u8(d >> 8), u8(d & 0xFF)};
 		body.insert(body.end(), c, c + 5);
+		track_gain(c);
 		if (zsg2) { model(c); dsp_feed(c); }
 	};
 	// register 0xF low byte: volume ramp code for a release of about 0.1 s from full scale
@@ -3284,6 +3476,25 @@ static Bytes merge(std::vector<MergePart>& in)
 		bool tail[48] = {};      // voices of the previous part still sounding: image deferred, key-offs masked
 		std::vector<std::pair<u16, u16>> deferred[48];
 		int ntails = 0;
+		// the previous part ends faded out (every gain before the DSP at 0): its voices are cut at once,
+		// they would come back with the gains of this part during their release
+		bool faded = false;
+		for (const MixGain& g : rg)
+			if (g.pre && g.cs == 0) { if (gain_now[g.ch] != 0) { faded = false; break; } faded = true; }
+		if (k)
+		{
+			std::set<int> set_by_init;
+			for (size_t i = 0; i < cmds.size() && i < first_wait; i++) { u8 cs, ch; u16 val; if (mix_gain_cmd(v, d + cmds[i].p, cs, ch, val)) set_by_init.insert((cs << 8) | ch); }
+			int resets = 0;
+			for (const MixGain& g : rg)
+			{
+				int key = (g.cs << 8) | g.ch;
+				if (set_by_init.count(key) || gain_now[key] == g.def) continue;
+				if (zsg2) raw(u8(0x06 | g.cs), g.ch, g.def); else push_mix_gain(body, a, g.cs, g.ch, g.def);
+				gain_now[key] = g.def; resets++;
+			}
+			if (resets) ui::info(strf("part %zu: %d mixer gain(s) back to their default at the junction", k + 1, resets));
+		}
 		if (zsg2 && k)
 		{
 			for (int vi = 0; vi < 48; vi++)
@@ -3291,8 +3502,10 @@ static Bytes merge(std::vector<MergePart>& in)
 				if (!st.playing(vi, total)) continue;
 				tail[vi] = true; ntails++;
 				raw(u8(vi >> 4), u8((vi << 4) | 0xE), 0);                                              // volume target 0
-				raw(u8(vi >> 4), u8((vi << 4) | 0xF), u16((st.voice[vi].v[0xF] & 0xFF00) | release_code));   // ramp speed, DSP gain kept
+				if (faded) raw(u8(vi >> 4), u8((vi << 4) | 0xB), 0);                                   // faded out: silent now
+				else raw(u8(vi >> 4), u8((vi << 4) | 0xF), u16((st.voice[vi].v[0xF] & 0xFF00) | release_code));   // ramp speed, DSP gain kept
 			}
+			if (faded && ntails) ui::info(strf("part %zu ends faded out: its %d voice(s) still keyed are silenced at the junction", k, ntails));
 			size_t blk = SIZE_MAX;
 			for (size_t i = 0; i < cmds.size() && i < first_wait; i++)
 				if (cmds[i].op == 0x67 && d[cmds[i].p + 2] == 0x98 && cmds[i].len >= 15) { blk = i; break; }
@@ -3321,7 +3534,8 @@ static Bytes merge(std::vector<MergePart>& in)
 						for (size_t i = 0; i < cmds.size() && i < first_wait; i++)
 							if (cmds[i].op == 0x67 ? d[cmds[i].p + 2] == 0x98 : (cmds[i].op == 0xE4 && ((d[cmds[i].p + 1] & 15) == 7 || (d[cmds[i].p + 1] & 15) == 8)))
 								skip.insert(i);
-						ui::info(strf("part %zu: same DSP program, the DSP runs on across the junction (%d coefficient update(s), %zu init command(s) left out); %d voice(s) of part %zu ring on with a 0.1 s release", k + 1, updates, skip.size(), ntails, k));
+						ui::info(strf("part %zu: same DSP program, the DSP runs on across the junction (%d coefficient update(s), %zu init command(s) left out)%s", k + 1, updates, skip.size(),
+						              faded ? "" : strf("; %d voice(s) of part %zu ring on with a 0.1 s release", ntails, k).c_str()));
 					}
 					else ui::warn(strf("part %zu: its DSP program differs from the running one, its state block is loaded at the junction (the reverb tail of part %zu is cut)", k + 1, k));
 				}
@@ -3372,6 +3586,7 @@ static Bytes merge(std::vector<MergePart>& in)
 				}
 			}
 			body.insert(body.end(), d + c.p, d + c.p + c.len);
+			track_gain(d + c.p);
 			if (zsg2 && c.op == 0xE4) model(d + c.p);
 			if (c.op == 0x67 || c.op == 0xE4) dsp_feed(d + c.p);
 			total += w;
@@ -3412,8 +3627,11 @@ static Bytes merge(std::vector<MergePart>& in)
 	return out;
 }
 
-static void write_output(const std::string& path, const Bytes& out_v1)
+static void write_output(const std::string& path, const Bytes& out_raw)
 {
+	Bytes faded;
+	if (g_fade_in > 0 || g_fade_out > 0) faded = apply_fades(out_raw, g_fade_in, g_fade_out);
+	const Bytes& out_v1 = (g_fade_in > 0 || g_fade_out > 0) ? faded : out_raw;
 	Bytes v3;
 	if (g_v3_output)
 	{
@@ -3572,6 +3790,8 @@ static void usage()
 	        "                         keeps its loop; ZSG-2: voices keyed off at the junction, the DSP runs on (reverb tail kept)\n"
 	        "                         input, loop of the last part that has one; no other processing\n"
 	        "  (no option)            rewrite the input as is (.vgm <-> .vgz, loop kept); files written as VGM 1.73 become 1.72\n"
+	        "  --fade-in P --fade-out P  fade the output in / out over P (mixer gain writes; ES55xx and ZSG-2): applied last, to\n"
+	        "                         the written file (a merge too); a looping file only fades in, within its intro\n"
 	        "  --volume D             set the header volume modifier (VGM 1.60+) from a gain in dB (e.g. +6dB, -3): the player\n"
 	        "                         applies 2^(n/32), n = round(D / 6.02 * 32), range -64..192 (-12 dB..+36 dB); 0 removes it\n"
 	        "  --auto                 split the capture into tracks separated by silence\n"
@@ -3631,6 +3851,13 @@ int main(int argc, char** argv)
 			g_volume_mod = volume_mod_from_db(db);
 			if (g_volume_mod < -64 || g_volume_mod > 192) { fprintf(stderr, "--volume: %s is out of range (-12 dB..+36 dB)\n", v.c_str()); usage(); }
 			fprintf(stderr, "volume modifier %d (%+.2f dB requested, %+.2f dB applied, x%.3f)\n", g_volume_mod, db, volume_db_from_mod(g_volume_mod), std::pow(2.0, g_volume_mod / 32.0));
+		}
+		else if (name == "--fade-in" || name == "--fade-out")
+		{
+			std::string v; value(v);
+			i64 n = parse_pos(v);
+			if (n < 0) usage();
+			(name == "--fade-in" ? g_fade_in : g_fade_out) = n;
 		}
 		else if (name == "--split") value(split);
 		else if (name == "--track") value(track);
